@@ -103,6 +103,7 @@ class ConfidenceEngine:
         final_crossings: pd.DataFrame,
         trajectory: pd.DataFrame,
         track_confidence: pd.DataFrame,
+        fps: float,
     ) -> pd.DataFrame:
 
         if final_crossings.empty:
@@ -218,7 +219,7 @@ class ConfidenceEngine:
 
             gap_sec = (
                 crossing_observations["frame_gap"]
-                / 30.0
+                / fps
             )
 
             temporal_confidence = (
