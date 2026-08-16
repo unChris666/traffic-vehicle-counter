@@ -31,8 +31,10 @@ class CountingResult:
     status: str
     video: dict
     counts: dict[str, int]
+    direction_counts: list[dict]
     total: int
     performance: dict
+
 
 
 class TrafficCountingEngine:
@@ -242,6 +244,58 @@ class TrafficCountingEngine:
             tracks_phase2
         )
 
+        direction_counts_df = (
+            counting_result.final_crossings
+            .groupby(
+                [
+                    "track_class",
+                    "direction",
+                ]
+            )
+            .size()
+            .rename("count")
+            .reset_index()
+        )
+
+        direction_classes = [
+            "bus",
+            "car",
+            "motorcycle",
+            "person",
+            "truck",
+        ]
+
+        direction_values = [
+            "side_+1_to_-1",
+            "side_-1_to_+1",
+        ]
+
+        direction_index = pd.MultiIndex.from_product(
+            [
+                direction_classes,
+                direction_values,
+            ],
+            names=[
+                "track_class",
+                "direction",
+            ],
+        )
+
+        direction_counts_df = (
+            direction_counts_df
+            .set_index(
+                [
+                    "track_class",
+                    "direction",
+                ]
+            )
+            .reindex(
+                direction_index,
+                fill_value=0,
+            )
+            .reset_index()
+        )
+
         phase3_elapsed = (
             time.perf_counter()
             - phase3_start
@@ -266,6 +320,11 @@ class TrafficCountingEngine:
         counting_result.final_crossings.to_csv(
             output_dir
             / "final_vehicle_crossings.csv",
+            index=False,
+        )
+
+        direction_counts_df.to_csv(
+            output_dir / "vehicle_direction_counts.csv",
             index=False,
         )
 
@@ -340,12 +399,28 @@ class TrafficCountingEngine:
             ),
         }
 
+        direction_counts = [
+            {
+                "track_class": row["track_class"],
+                "direction": row["direction"],
+                "count": int(row["count"]),
+            }
+            for _, row in direction_counts_df.iterrows()
+        ]
+
         result_json = {
             "status": "completed",
+
             "video": video_info,
+
             "counts": counting_result.counts,
+
+            "direction_counts": direction_counts,
+
             "total": counting_result.total,
+
             "performance": performance,
+
             "audit": counting_result.audit,
         }
 
@@ -367,3 +442,25 @@ class TrafficCountingEngine:
             total=counting_result.total,
             performance=performance,
         )
+
+        print("\n" + "=" * 70)
+        print("FINAL VEHICLE COUNT")
+        print("=" * 70)
+
+        for class_name, count in counting_result.counts.items():
+            print(f"{class_name:<15}: {count}")
+
+        print("-" * 70)
+        print(f"{'TOTAL VEHICLES':<15}: {counting_result.total}")
+
+
+        print("\n" + "=" * 70)
+        print("COUNT BY DIRECTION")
+        print("=" * 70)
+
+        for row in direction_counts:
+            print(
+                f"{row['track_class']:<12} "
+                f"{row['direction']:<20} "
+                f"{row['count']}"
+            )
