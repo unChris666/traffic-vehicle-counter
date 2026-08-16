@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sympy import fps
 
 
 class ConfidenceEngine:
-    """
-    Phase 6B confidence engine.
+    """Phase 6B quality/confidence scoring.
 
-    Does NOT modify or filter final counts.
-    It only assigns quality/confidence scores.
+    This layer never changes or filters the final count.
+    The scores are internal quality scores, not calibrated probabilities.
     """
 
     def __init__(
@@ -19,35 +17,26 @@ class ConfidenceEngine:
         high_threshold: float = 0.85,
         medium_threshold: float = 0.70,
     ) -> None:
-        self.high_threshold = high_threshold
-        self.medium_threshold = medium_threshold
+        if not 0.0 <= medium_threshold <= 1.0:
+            raise ValueError("medium_threshold must be between 0 and 1")
+        if not 0.0 <= high_threshold <= 1.0:
+            raise ValueError("high_threshold must be between 0 and 1")
+        if medium_threshold > high_threshold:
+            raise ValueError("medium_threshold cannot exceed high_threshold")
 
-    @staticmethod
-    def _flag(score: float | None) -> str:
+        self.high_threshold = float(high_threshold)
+        self.medium_threshold = float(medium_threshold)
+
+    def _flag(self, score: float | None) -> str:
         if score is None:
             return "N/A"
-
-        if score >= 0.85:
+        if score >= self.high_threshold:
             return "HIGH"
-
-        if score >= 0.70:
+        if score >= self.medium_threshold:
             return "MEDIUM"
-
         return "LOW"
 
-    @staticmethod
-    def _clip(value: float) -> float:
-        return float(np.clip(value, 0.0, 1.0))
-
-    # ============================================================
-    # TRACK CONFIDENCE
-    # ============================================================
-
-    def build_track_confidence(
-        self,
-        track_level: pd.DataFrame,
-    ) -> pd.DataFrame:
-
+    def build_track_confidence(self, track_level: pd.DataFrame) -> pd.DataFrame:
         required = {
             "track_id",
             "track_class",
@@ -55,49 +44,24 @@ class ConfidenceEngine:
             "observation_ratio",
             "mean_confidence",
         }
-
         missing = required - set(track_level.columns)
-
         if missing:
             raise ValueError(
-                "track_level missing required columns: "
-                f"{sorted(missing)}"
+                f"track_level missing required columns: {sorted(missing)}"
             )
 
         result = track_level.copy()
+        result["detection_confidence"] = result["mean_confidence"].clip(0.0, 1.0)
+        result["class_confidence"] = result["track_class_ratio"].clip(0.0, 1.0)
+        result["tracking_confidence"] = result["observation_ratio"].clip(0.0, 1.0)
 
-        result["detection_confidence"] = (
-            result["mean_confidence"]
-            .clip(0.0, 1.0)
-        )
-
-        result["class_confidence"] = (
-            result["track_class_ratio"]
-            .clip(0.0, 1.0)
-        )
-
-        result["tracking_confidence"] = (
-            result["observation_ratio"]
-            .clip(0.0, 1.0)
-        )
-
-        # Deliberately transparent weighted score.
         result["track_confidence"] = (
             0.40 * result["detection_confidence"]
             + 0.30 * result["class_confidence"]
             + 0.30 * result["tracking_confidence"]
         )
-
-        result["track_confidence_flag"] = (
-            result["track_confidence"]
-            .apply(self._flag)
-        )
-
+        result["track_confidence_flag"] = result["track_confidence"].apply(self._flag)
         return result
-
-    # ============================================================
-    # CROSSING CONFIDENCE
-    # ============================================================
 
     def build_crossing_confidence(
         self,
@@ -106,28 +70,20 @@ class ConfidenceEngine:
         track_confidence: pd.DataFrame,
         fps: float,
     ) -> pd.DataFrame:
+        """Score accepted crossings using final-crossing metadata.
 
+        `trajectory` remains in the API for compatibility and future diagnostics.
+        The required crossing state is already carried by `final_crossings`.
+        """
         if fps <= 0:
-            raise ValueError(
-                f"fps must be > 0, got {fps}"
-            )
+            raise ValueError(f"fps must be > 0, got {fps}")
 
         if final_crossings.empty:
             result = final_crossings.copy()
-
-            result["geometry_confidence"] = pd.Series(
-                dtype=float
-            )
-            result["temporal_confidence"] = pd.Series(
-                dtype=float
-            )
-            result["crossing_confidence"] = pd.Series(
-                dtype=float
-            )
-            result["crossing_confidence_flag"] = pd.Series(
-                dtype=str
-            )
-
+            result["geometry_confidence"] = pd.Series(dtype=float)
+            result["temporal_confidence"] = pd.Series(dtype=float)
+            result["crossing_confidence"] = pd.Series(dtype=float)
+            result["crossing_confidence_flag"] = pd.Series(dtype=str)
             return result
 
         required_crossing = {
@@ -140,52 +96,38 @@ class ConfidenceEngine:
             "previous_side",
             "frame_gap",
         }
-
-        missing = (
-            required_crossing
-            - set(final_crossings.columns)
-        )
-
+        missing = required_crossing - set(final_crossings.columns)
         if missing:
             raise ValueError(
                 "final_crossings missing required columns: "
                 f"{sorted(missing)}"
             )
 
+        required_track = {
+            "track_id",
+            "track_confidence",
+            "detection_confidence",
+            "class_confidence",
+            "tracking_confidence",
+        }
+        missing = required_track - set(track_confidence.columns)
+        if missing:
+            raise ValueError(
+                "track_confidence missing required columns: "
+                f"{sorted(missing)}"
+            )
+
         result = final_crossings.copy()
 
-        # ------------------------------------------------------------
-        # Geometry confidence
-        #
-        # Larger distance from the counting line's deadband means
-        # stronger evidence that the crossing is real.
-        # ------------------------------------------------------------
-
+        # Farther from the line means stronger geometric evidence.
         result["geometry_confidence"] = (
-            1.0
-            - np.exp(
-                -result["line_distance_px"] / 20.0
-            )
+            1.0 - np.exp(-result["line_distance_px"] / 20.0)
         ).clip(0.0, 1.0)
 
-        # ------------------------------------------------------------
-        # Temporal confidence
-        #
-        # Smaller frame gap = stronger temporal transition.
-        # ------------------------------------------------------------
-
-        gap_sec = (
-            result["frame_gap"]
-            / fps
-        )
-
+        gap_sec = result["frame_gap"] / float(fps)
         result["temporal_confidence"] = (
             1.0 / (1.0 + gap_sec)
         ).clip(0.0, 1.0)
-
-        # ------------------------------------------------------------
-        # Track confidence
-        # ------------------------------------------------------------
 
         result = result.merge(
             track_confidence[
@@ -202,9 +144,18 @@ class ConfidenceEngine:
             validate="many_to_one",
         )
 
-        # ------------------------------------------------------------
-        # Final crossing confidence
-        # ------------------------------------------------------------
+        if result["track_confidence"].isna().any():
+            missing_ids = (
+                result.loc[
+                    result["track_confidence"].isna(),
+                    "track_id",
+                ]
+                .unique()
+                .tolist()
+            )
+            raise ValueError(
+                f"Missing track confidence for track IDs: {missing_ids}"
+            )
 
         result["crossing_confidence"] = (
             0.60 * result["track_confidence"]
@@ -213,87 +164,67 @@ class ConfidenceEngine:
         ).clip(0.0, 1.0)
 
         result["crossing_confidence_flag"] = (
-            result["crossing_confidence"]
-            .apply(self._flag)
+            result["crossing_confidence"].apply(self._flag)
         )
-
         return result
-
-    # ============================================================
-    # CLASS-LEVEL COUNT CONFIDENCE
-    # ============================================================
 
     def build_count_confidence(
         self,
         crossing_confidence: pd.DataFrame,
         final_counts: dict[str, int],
     ) -> list[dict]:
-
         rows: list[dict] = []
 
-        for class_name, quantity in final_counts.items():
-
-            class_events = crossing_confidence[
-                crossing_confidence["track_class"]
-                == class_name
-            ]
-
-            if quantity == 0:
-                rows.append(
-                    {
-                        "class": class_name,
-                        "quantity": 0,
-                        "confidence": None,
-                        "flag": "N/A",
-                    }
+        if not crossing_confidence.empty:
+            required = {"track_class", "crossing_confidence"}
+            missing = required - set(crossing_confidence.columns)
+            if missing:
+                raise ValueError(
+                    "crossing_confidence missing required columns: "
+                    f"{sorted(missing)}"
                 )
+
+        for class_name, quantity in final_counts.items():
+            if quantity == 0:
+                rows.append({
+                    "class": class_name,
+                    "quantity": 0,
+                    "confidence": None,
+                    "flag": "N/A",
+                })
                 continue
 
-            if class_events.empty:
-                score = None
-            else:
-                score = float(
-                    class_events[
-                        "crossing_confidence"
-                    ].mean()
-                )
-
-            rows.append(
-                {
-                    "class": class_name,
-                    "quantity": int(quantity),
-                    "confidence": (
-                        round(score, 4)
-                        if score is not None
-                        else None
-                    ),
-                    "flag": self._flag(score),
-                }
+            class_events = crossing_confidence[
+                crossing_confidence["track_class"] == class_name
+            ]
+            score = (
+                float(class_events["crossing_confidence"].mean())
+                if not class_events.empty
+                else None
             )
 
-        return rows
+            rows.append({
+                "class": class_name,
+                "quantity": int(quantity),
+                "confidence": round(score, 4) if score is not None else None,
+                "flag": self._flag(score),
+            })
 
-    # ============================================================
-    # OVERALL COUNT CONFIDENCE
-    # ============================================================
+        return rows
 
     def build_overall_confidence(
         self,
         crossing_confidence: pd.DataFrame,
     ) -> dict:
-
         if crossing_confidence.empty:
-            return {
-                "confidence": None,
-                "flag": "N/A",
-            }
+            return {"confidence": None, "flag": "N/A"}
 
-        score = float(
-            crossing_confidence[
-                "crossing_confidence"
-            ].mean()
-        )
+        if "crossing_confidence" not in crossing_confidence.columns:
+            raise ValueError(
+                "crossing_confidence missing 'crossing_confidence' column"
+            )
 
+        score = float(crossing_confidence["crossing_confidence"].mean())
         return {
             "confidence": round(score, 4),
             "flag": self._flag(score),
