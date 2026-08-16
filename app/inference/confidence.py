@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from sympy import fps
 
 
 class ConfidenceEngine:
@@ -106,14 +107,27 @@ class ConfidenceEngine:
         fps: float,
     ) -> pd.DataFrame:
 
+        if fps <= 0:
+            raise ValueError(
+                f"fps must be > 0, got {fps}"
+            )
+
         if final_crossings.empty:
             result = final_crossings.copy()
+
+            result["geometry_confidence"] = pd.Series(
+                dtype=float
+            )
+            result["temporal_confidence"] = pd.Series(
+                dtype=float
+            )
             result["crossing_confidence"] = pd.Series(
                 dtype=float
             )
             result["crossing_confidence_flag"] = pd.Series(
                 dtype=str
             )
+
             return result
 
         required_crossing = {
@@ -122,6 +136,9 @@ class ConfidenceEngine:
             "crossing_x",
             "crossing_y",
             "track_class",
+            "line_distance_px",
+            "previous_side",
+            "frame_gap",
         }
 
         missing = (
@@ -135,120 +152,40 @@ class ConfidenceEngine:
                 f"{sorted(missing)}"
             )
 
-        required_trajectory = {
-            "track_id",
-            "frame_id",
-            "line_distance_px",
-            "side",
-            "previous_side",
-            "frame_gap",
-        }
+        result = final_crossings.copy()
 
-        missing = (
-            required_trajectory
-            - set(trajectory.columns)
-        )
-
-        if missing:
-            raise ValueError(
-                "trajectory missing required columns: "
-                f"{sorted(missing)}"
-            )
-
-        # Get the exact observation responsible for crossing.
-        crossing_observations = trajectory.merge(
-            final_crossings[
-                [
-                    "track_id",
-                    "crossing_frame",
-                ]
-            ],
-            left_on=[
-                "track_id",
-                "frame_id",
-            ],
-            right_on=[
-                "track_id",
-                "crossing_frame",
-            ],
-            how="inner",
-        )
-
-        crossing_observations = (
-            crossing_observations
-            .drop_duplicates(
-                [
-                    "track_id",
-                    "crossing_frame",
-                ]
-            )
-        )
-
-        # --------------------------------------------------------
+        # ------------------------------------------------------------
         # Geometry confidence
         #
-        # Farther from deadband = stronger crossing evidence.
-        # The caller can pass line_distance_px already calculated
-        # by Phase 3.
-        # --------------------------------------------------------
+        # Larger distance from the counting line's deadband means
+        # stronger evidence that the crossing is real.
+        # ------------------------------------------------------------
 
-        if not crossing_observations.empty:
-            geometry_confidence = (
-                1.0
-                - np.exp(
-                    -crossing_observations[
-                        "line_distance_px"
-                    ] / 20.0
-                )
+        result["geometry_confidence"] = (
+            1.0
+            - np.exp(
+                -result["line_distance_px"] / 20.0
             )
+        ).clip(0.0, 1.0)
 
-            geometry_confidence = (
-                geometry_confidence
-                .clip(0.0, 1.0)
-            )
+        # ------------------------------------------------------------
+        # Temporal confidence
+        #
+        # Smaller frame gap = stronger temporal transition.
+        # ------------------------------------------------------------
 
-            crossing_observations[
-                "geometry_confidence"
-            ] = geometry_confidence
-
-            # ----------------------------------------------------
-            # Temporal confidence
-            #
-            # Smaller frame gap = stronger transition.
-            # ----------------------------------------------------
-
-            gap_sec = (
-                crossing_observations["frame_gap"]
-                / fps
-            )
-
-            temporal_confidence = (
-                1.0
-                / (1.0 + gap_sec)
-            )
-
-            crossing_observations[
-                "temporal_confidence"
-            ] = temporal_confidence.clip(
-                0.0,
-                1.0,
-            )
-
-        result = final_crossings.merge(
-            crossing_observations[
-                [
-                    "track_id",
-                    "crossing_frame",
-                    "geometry_confidence",
-                    "temporal_confidence",
-                ]
-            ],
-            on=[
-                "track_id",
-                "crossing_frame",
-            ],
-            how="left",
+        gap_sec = (
+            result["frame_gap"]
+            / fps
         )
+
+        result["temporal_confidence"] = (
+            1.0 / (1.0 + gap_sec)
+        ).clip(0.0, 1.0)
+
+        # ------------------------------------------------------------
+        # Track confidence
+        # ------------------------------------------------------------
 
         result = result.merge(
             track_confidence[
@@ -265,15 +202,9 @@ class ConfidenceEngine:
             validate="many_to_one",
         )
 
-        result["geometry_confidence"] = (
-            result["geometry_confidence"]
-            .fillna(0.0)
-        )
-
-        result["temporal_confidence"] = (
-            result["temporal_confidence"]
-            .fillna(0.0)
-        )
+        # ------------------------------------------------------------
+        # Final crossing confidence
+        # ------------------------------------------------------------
 
         result["crossing_confidence"] = (
             0.60 * result["track_confidence"]
