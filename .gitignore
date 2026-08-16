@@ -1,15 +1,21 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
-outputs/
+# Local data / outputs
 data/
+outputs/
 
+# Video files
 *.mp4
 *.avi
 *.mov
 *.mkv
-*.py
-*ipynb
 
+# Model weights
 models/*.pt
+
+# Jupyter
+.ipynb_checkpoints/

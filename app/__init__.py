@@ -1,0 +1,1 @@
+"""Traffic Counter application package."""
