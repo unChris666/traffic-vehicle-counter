@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
 import torch
 from ultralytics import YOLO
+
+
+ProgressCallback = Callable[[float, str], None]
 
 
 class YOLOBoTSORTTracker:
@@ -15,7 +19,25 @@ class YOLOBoTSORTTracker:
 
     Output:
         One row per tracked object observation.
+
+    The detection/tracking behavior remains aligned with the
+    Phase 1 notebook baseline.
     """
+
+    OUTPUT_COLUMNS = [
+        "frame_id",
+        "timestamp_sec",
+        "track_id",
+        "class_id",
+        "class_name",
+        "confidence",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "bottom_center_x",
+        "bottom_center_y",
+    ]
 
     def __init__(
         self,
@@ -28,17 +50,11 @@ class YOLOBoTSORTTracker:
         device: str = "auto",
     ) -> None:
         self.tracker = tracker
-        self.imgsz = imgsz
-        self.conf = conf
-        self.iou = iou
+        self.imgsz = int(imgsz)
+        self.conf = float(conf)
+        self.iou = float(iou)
 
-        self.device = (
-            0
-            if device == "auto" and torch.cuda.is_available()
-            else "cpu"
-            if device == "auto"
-            else device
-        )
+        self.device = self._resolve_device(device)
 
         self.model_path = self._resolve_model_path(
             model_name
@@ -46,11 +62,17 @@ class YOLOBoTSORTTracker:
 
         self.model = YOLO(
             str(self.model_path)
-            if Path(self.model_path).exists()
+            if self.model_path.exists()
             else model_name
         )
 
         self.target_classes = set(target_classes)
+
+        if not isinstance(self.model.names, dict):
+            raise TypeError(
+                "Unexpected model.names type: "
+                f"{type(self.model.names)}"
+            )
 
         self.class_names = self.model.names
 
@@ -68,14 +90,25 @@ class YOLOBoTSORTTracker:
             )
 
     @staticmethod
+    def _resolve_device(device: str):
+        if device == "auto":
+            return (
+                0
+                if torch.cuda.is_available()
+                else "cpu"
+            )
+
+        return device
+
+    @staticmethod
     def _resolve_model_path(
         model_name: str,
     ) -> Path:
         """
-        Prefer project-local models/<model_name> when available.
-
-        Otherwise return the original model name so Ultralytics
-        can resolve/download it.
+        Resolution priority:
+        1. Explicit path.
+        2. models/<filename>.
+        3. Original Ultralytics model name.
         """
 
         configured = Path(model_name)
@@ -93,15 +126,55 @@ class YOLOBoTSORTTracker:
 
         return configured
 
+    @staticmethod
+    def _report_progress(
+        progress_callback: ProgressCallback | None,
+        frame_id: int,
+        total_frames: int | None,
+    ) -> None:
+        if progress_callback is None:
+            return
+
+        if not total_frames:
+            return
+
+        # Do not update UI on every frame.
+        if (
+            frame_id != 1
+            and frame_id != total_frames
+            and frame_id % 30 != 0
+        ):
+            return
+
+        progress = min(
+            1.0,
+            frame_id / total_frames,
+        )
+
+        progress_callback(
+            progress,
+            f"Inference "
+            f"{frame_id:,}/{total_frames:,}",
+        )
+
     def run(
         self,
         video_path: str | Path,
         fps: float,
+        total_frames: int | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> pd.DataFrame:
 
         if fps <= 0:
             raise ValueError(
                 f"fps must be > 0, got {fps}"
+            )
+
+        video_path = Path(video_path)
+
+        if not video_path.exists():
+            raise FileNotFoundError(
+                f"Video not found: {video_path}"
             )
 
         track_records: list[pd.DataFrame] = []
@@ -122,6 +195,12 @@ class YOLOBoTSORTTracker:
             results_stream,
             start=1,
         ):
+            self._report_progress(
+                progress_callback,
+                frame_id,
+                total_frames,
+            )
+
             boxes = result.boxes
 
             if boxes is None or len(boxes) == 0:
@@ -130,21 +209,23 @@ class YOLOBoTSORTTracker:
             if boxes.id is None:
                 continue
 
-            # Move tensors to CPU once.
             xyxy = (
                 boxes.xyxy
+                .detach()
                 .cpu()
                 .numpy()
             )
 
             conf = (
                 boxes.conf
+                .detach()
                 .cpu()
                 .numpy()
             )
 
             cls = (
                 boxes.cls
+                .detach()
                 .cpu()
                 .numpy()
                 .astype(np.int16)
@@ -152,12 +233,12 @@ class YOLOBoTSORTTracker:
 
             track_ids = (
                 boxes.id
+                .detach()
                 .cpu()
                 .numpy()
                 .astype(np.int32)
             )
 
-            # Target class filtering.
             mask = np.isin(
                 cls,
                 list(self.target_class_ids),
@@ -171,18 +252,15 @@ class YOLOBoTSORTTracker:
             cls = cls[mask]
             track_ids = track_ids[mask]
 
-            # BBox extraction.
             x1 = xyxy[:, 0]
             y1 = xyxy[:, 1]
             x2 = xyxy[:, 2]
             y2 = xyxy[:, 3]
 
-            # Exact notebook behavior:
-            # bottom-center = ((x1+x2)/2, y2)
+            # Preserve notebook behavior.
             bottom_center_x = (
                 (x1 + x2) / 2.0
             )
-
             bottom_center_y = y2
 
             timestamp = (
@@ -204,31 +282,25 @@ class YOLOBoTSORTTracker:
                     "y1": y1,
                     "x2": x2,
                     "y2": y2,
-                    "bottom_center_x": bottom_center_x,
-                    "bottom_center_y": bottom_center_y,
+                    "bottom_center_x":
+                        bottom_center_x,
+                    "bottom_center_y":
+                        bottom_center_y,
                 }
             )
 
-            track_records.append(
-                frame_df
-            )
+            track_records.append(frame_df)
 
         if not track_records:
+            if progress_callback is not None:
+                progress_callback(
+                    1.0,
+                    "Inference complete: "
+                    "no target tracks found",
+                )
+
             return pd.DataFrame(
-                columns=[
-                    "frame_id",
-                    "timestamp_sec",
-                    "track_id",
-                    "class_id",
-                    "class_name",
-                    "confidence",
-                    "x1",
-                    "y1",
-                    "x2",
-                    "y2",
-                    "bottom_center_x",
-                    "bottom_center_y",
-                ]
+                columns=self.OUTPUT_COLUMNS
             )
 
         tracks_raw = pd.concat(
@@ -248,5 +320,14 @@ class YOLOBoTSORTTracker:
             drop=True,
             inplace=True,
         )
+
+        if progress_callback is not None:
+            progress_callback(
+                1.0,
+                (
+                    "Inference complete: "
+                    f"{len(tracks_raw):,} observations"
+                ),
+            )
 
         return tracks_raw

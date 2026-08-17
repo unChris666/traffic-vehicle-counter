@@ -4,3 +4,4 @@ numpy
 pandas
 torch
 PyYAML
+gradio>=6,<7
