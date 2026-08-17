@@ -9,26 +9,29 @@ def build_track_level(
     fps: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Phase 2: convert frame-level tracking observations
-    into track-level class and quality information.
+    Convert frame-level tracking observations into robust track-level class.
 
-    Behavior intentionally matches the notebook implementation.
+    Class decision:
+        confidence-weighted voting
+        +
+        temporal consistency support
 
-    Returns
-    -------
-    track_level:
-        One row per track.
+    A short class flip caused by glare/headlight is penalized because
+    detections supported by the same class in adjacent observations
+    receive more voting weight.
 
-    tracks_phase2:
-        Original frame-level observations merged with
-        track-level metadata.
+    The final `track_class` is therefore NOT a single-frame class.
     """
 
     if fps <= 0:
-        raise ValueError(f"fps must be > 0, got {fps}")
+        raise ValueError(
+            f"fps must be > 0, got {fps}"
+        )
 
     if tracks_raw.empty:
-        raise ValueError("tracks_raw is empty")
+        raise ValueError(
+            "tracks_raw is empty"
+        )
 
     required_columns = {
         "track_id",
@@ -37,20 +40,74 @@ def build_track_level(
         "confidence",
     }
 
-    missing = required_columns - set(tracks_raw.columns)
+    missing = (
+        required_columns
+        - set(tracks_raw.columns)
+    )
 
     if missing:
         raise ValueError(
-            f"tracks_raw missing required columns: {sorted(missing)}"
+            "tracks_raw missing required columns: "
+            f"{sorted(missing)}"
         )
 
-    # ============================================================
-    # MAJORITY CLASS COUNT
-    # ============================================================
-
-    class_counts = (
+    df = (
         tracks_raw
-        .groupby(
+        .sort_values(
+            ["track_id", "frame_id"]
+        )
+        .copy()
+    )
+
+    # ------------------------------------------------------------
+    # Temporal neighborhood support per observation
+    # ------------------------------------------------------------
+
+    grouped = df.groupby(
+        "track_id",
+        sort=False,
+    )
+
+    previous_class = (
+        grouped["class_name"]
+        .shift(1)
+    )
+
+    next_class = (
+        grouped["class_name"]
+        .shift(-1)
+    )
+
+    same_as_previous = (
+        df["class_name"] == previous_class
+    ).astype(float)
+
+    same_as_next = (
+        df["class_name"] == next_class
+    ).astype(float)
+
+    # Base = 1.0.
+    # +0.5 if previous observation agrees.
+    # +0.5 if next observation agrees.
+    df["temporal_support"] = (
+        1.0
+        + 0.5 * same_as_previous
+        + 0.5 * same_as_next
+    )
+
+    # Confidence is the main signal.
+    # Temporal support stabilizes against short-lived class flips.
+    df["temporal_weighted_confidence"] = (
+        df["confidence"].clip(0.0, 1.0)
+        * df["temporal_support"]
+    )
+
+    # ------------------------------------------------------------
+    # Majority vote (diagnostic / comparison)
+    # ------------------------------------------------------------
+
+    majority_counts = (
+        df.groupby(
             ["track_id", "class_name"],
             observed=True,
         )
@@ -59,33 +116,25 @@ def build_track_level(
         .reset_index()
     )
 
-    # ============================================================
-    # TOTAL OBSERVATIONS PER TRACK
-    # ============================================================
-
     track_totals = (
-        class_counts
+        majority_counts
         .groupby("track_id")["class_observations"]
         .sum()
         .rename("total_observations")
     )
 
-    class_counts = class_counts.join(
+    majority_counts = majority_counts.join(
         track_totals,
         on="track_id",
     )
 
-    class_counts["class_ratio"] = (
-        class_counts["class_observations"]
-        / class_counts["total_observations"]
+    majority_counts["class_ratio"] = (
+        majority_counts["class_observations"]
+        / majority_counts["total_observations"]
     )
 
-    # ============================================================
-    # MAJORITY CLASS
-    # ============================================================
-
     majority_class = (
-        class_counts
+        majority_counts
         .sort_values(
             [
                 "track_id",
@@ -104,22 +153,18 @@ def build_track_level(
         ]
         .rename(
             columns={
-                "class_name": "track_class",
-                "class_ratio": "track_class_ratio",
+                "class_name": "majority_class",
+                "class_ratio": "majority_class_ratio",
             }
         )
     )
 
-    # ============================================================
-    # CONFIDENCE-WEIGHTED CLASS
-    #
-    # Diagnostic only.
-    # It does NOT replace track_class.
-    # ============================================================
+    # ------------------------------------------------------------
+    # Confidence-weighted vote
+    # ------------------------------------------------------------
 
     weighted_votes = (
-        tracks_raw
-        .groupby(
+        df.groupby(
             ["track_id", "class_name"],
             observed=True,
         )["confidence"]
@@ -142,6 +187,7 @@ def build_track_level(
             [
                 "track_id",
                 "class_name",
+                "weighted_confidence",
             ]
         ]
         .rename(
@@ -151,20 +197,103 @@ def build_track_level(
         )
     )
 
-    # ============================================================
-    # CLASS AMBIGUITY
-    # ============================================================
+    # ------------------------------------------------------------
+    # Confidence + temporal consistency vote (FINAL)
+    # ------------------------------------------------------------
 
-    majority_class["class_ambiguous"] = (
-        majority_class["track_class_ratio"] < 0.70
+    temporal_votes = (
+        df.groupby(
+            ["track_id", "class_name"],
+            observed=True,
+        )["temporal_weighted_confidence"]
+        .sum()
+        .rename("temporal_weighted_vote")
+        .reset_index()
     )
 
-    # ============================================================
-    # MERGE CLASS INFORMATION
-    # ============================================================
+    temporal_class = (
+        temporal_votes
+        .sort_values(
+            [
+                "track_id",
+                "temporal_weighted_vote",
+            ],
+            ascending=[True, False],
+        )
+        .drop_duplicates("track_id")
+        [
+            [
+                "track_id",
+                "class_name",
+                "temporal_weighted_vote",
+            ]
+        ]
+        .rename(
+            columns={
+                "class_name": "track_class",
+            }
+        )
+    )
+
+    # ------------------------------------------------------------
+    # Final class confidence ratio
+    # ------------------------------------------------------------
+
+    total_temporal_vote = (
+        temporal_votes
+        .groupby("track_id")[
+            "temporal_weighted_vote"
+        ]
+        .sum()
+        .rename("total_temporal_vote")
+    )
+
+    temporal_votes = temporal_votes.join(
+        total_temporal_vote,
+        on="track_id",
+    )
+
+    temporal_votes["temporal_class_ratio"] = (
+        temporal_votes["temporal_weighted_vote"]
+        / temporal_votes["total_temporal_vote"]
+    )
+
+    temporal_class_ratio = (
+        temporal_votes
+        .sort_values(
+            [
+                "track_id",
+                "temporal_weighted_vote",
+            ],
+            ascending=[True, False],
+        )
+        .drop_duplicates("track_id")
+        [
+            [
+                "track_id",
+                "temporal_class_ratio",
+            ]
+        ]
+        .rename(
+            columns={
+                "temporal_class_ratio":
+                    "track_class_ratio",
+            }
+        )
+    )
 
     track_level = (
-        majority_class
+        temporal_class
+        .merge(
+            temporal_class_ratio,
+            on="track_id",
+            how="left",
+        )
+        .merge(
+            majority_class,
+            on="track_id",
+            how="left",
+        )
         .merge(
             weighted_class,
             on="track_id",
@@ -172,35 +301,70 @@ def build_track_level(
         )
     )
 
-    # ============================================================
-    # TRACK COVERAGE
-    # ============================================================
+    track_level["class_ambiguous"] = (
+        track_level["track_class_ratio"] < 0.70
+    )
+
+    # ------------------------------------------------------------
+    # Track coverage / confidence
+    # ------------------------------------------------------------
 
     track_frame_stats = (
-        tracks_raw
-        .groupby("track_id")
+        df.groupby("track_id")
         .agg(
             first_frame=("frame_id", "min"),
             last_frame=("frame_id", "max"),
             observed_frames=("frame_id", "nunique"),
             mean_confidence=("confidence", "mean"),
             median_confidence=("confidence", "median"),
+            mean_temporal_support=(
+                "temporal_support",
+                "mean",
+            ),
         )
     )
 
-    track_frame_stats["expected_frames"] = (
-        track_frame_stats["last_frame"]
-        - track_frame_stats["first_frame"]
-        + 1
+    # Source frame ids are preserved, so estimate the actual sampling
+    # interval from each track rather than assuming every source frame
+    # was processed.
+    per_track_median_gap = (
+        df.groupby("track_id")["frame_id"]
+        .diff()
+        .groupby(df["track_id"])
+        .median()
+        .rename("median_source_frame_gap")
     )
+
+    track_frame_stats = track_frame_stats.merge(
+        per_track_median_gap,
+        on="track_id",
+        how="left",
+    )
+
+    track_frame_stats["median_source_frame_gap"] = (
+        track_frame_stats["median_source_frame_gap"]
+        .fillna(1.0)
+        .clip(lower=1.0)
+    )
+
+    track_frame_stats["expected_observations"] = (
+        (
+            track_frame_stats["last_frame"]
+            - track_frame_stats["first_frame"]
+        )
+        / track_frame_stats["median_source_frame_gap"]
+    ).round().astype(int) + 1
 
     track_frame_stats["observation_ratio"] = (
         track_frame_stats["observed_frames"]
-        / track_frame_stats["expected_frames"]
-    )
+        / track_frame_stats["expected_observations"]
+    ).clip(0.0, 1.0)
 
     track_frame_stats["duration_sec"] = (
-        track_frame_stats["expected_frames"]
+        (
+            track_frame_stats["last_frame"]
+            - track_frame_stats["first_frame"]
+        )
         / fps
     )
 
@@ -213,31 +377,28 @@ def build_track_level(
         )
     )
 
-    # ============================================================
-    # GAP ANALYSIS
-    #
-    # Notebook behavior:
-    # gap > 1 sec is diagnostic only.
-    # ============================================================
+    # ------------------------------------------------------------
+    # Gap analysis
+    # ------------------------------------------------------------
 
-    tracks_raw_with_gap = tracks_raw.copy()
+    df_with_gap = df.copy()
 
-    tracks_raw_with_gap["frame_gap"] = (
-        tracks_raw_with_gap
+    df_with_gap["frame_gap"] = (
+        df_with_gap
         .groupby("track_id")["frame_id"]
         .diff()
     )
 
-    tracks_raw_with_gap["gap_sec"] = (
-        tracks_raw_with_gap["frame_gap"] / fps
+    df_with_gap["gap_sec"] = (
+        df_with_gap["frame_gap"] / fps
     )
 
     gap_mask = (
-        tracks_raw_with_gap["gap_sec"] > 1
+        df_with_gap["gap_sec"] > 1.0
     )
 
     gap_summary = (
-        tracks_raw_with_gap.loc[gap_mask]
+        df_with_gap.loc[gap_mask]
         .groupby("track_id")
         .agg(
             gap_events=("gap_sec", "size"),
@@ -255,41 +416,28 @@ def build_track_level(
         )
     )
 
-    track_level[
-        [
-            "gap_events",
-            "max_gap_sec",
-            "total_gap_sec",
-        ]
-    ] = (
-        track_level[
-            [
-                "gap_events",
-                "max_gap_sec",
-                "total_gap_sec",
-            ]
-        ]
-        .fillna(0)
-    )
+    for column in [
+        "gap_events",
+        "max_gap_sec",
+        "total_gap_sec",
+    ]:
+        track_level[column] = (
+            track_level[column]
+            .fillna(0)
+        )
 
-    # ============================================================
-    # TRACK QUALITY
-    # ============================================================
+    # ------------------------------------------------------------
+    # Quality score
+    # ------------------------------------------------------------
 
     track_level["quality_score"] = (
         0.35
         * track_level["track_class_ratio"]
-        +
-        0.30
+        + 0.30
         * track_level["observation_ratio"].clip(0, 1)
-        +
-        0.35
+        + 0.35
         * track_level["mean_confidence"].clip(0, 1)
     )
-
-    # ============================================================
-    # QUALITY LEVEL
-    # ============================================================
 
     track_level["quality_level"] = pd.cut(
         track_level["quality_score"],
@@ -309,12 +457,12 @@ def build_track_level(
         right=False,
     )
 
-    # ============================================================
-    # MERGE TRACK-LEVEL DATA BACK TO OBSERVATIONS
-    # ============================================================
+    # ------------------------------------------------------------
+    # Merge track-level decision back to every frame observation
+    # ------------------------------------------------------------
 
     tracks_phase2 = (
-        tracks_raw
+        df
         .merge(
             track_level[
                 [
@@ -332,4 +480,7 @@ def build_track_level(
         )
     )
 
-    return track_level, tracks_phase2
+    return (
+        track_level,
+        tracks_phase2,
+    )

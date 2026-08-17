@@ -14,14 +14,22 @@ ProgressCallback = Callable[[float, str], None]
 
 class YOLOBoTSORTTracker:
     """
-    Phase 1:
-    YOLO26m detection + BoT-SORT tracking.
+    Production detection + tracking.
 
-    Output:
-        One row per tracked object observation.
+    Pipeline:
+        TensorRT YOLO26m FP16
+            ↓
+        BoT-SORT
+            ↓
+        frame-level tracked observations
 
-    The detection/tracking behavior remains aligned with the
-    Phase 1 notebook baseline.
+    Important:
+        vid_stride=2 means only every 2nd source frame is inferred.
+        We preserve the ORIGINAL source frame id:
+            1, 3, 5, 7, ...
+        instead of renumbering processed frames as:
+            1, 2, 3, 4, ...
+        This keeps crossing geometry and timestamps tied to the source video.
     """
 
     OUTPUT_COLUMNS = [
@@ -41,29 +49,46 @@ class YOLOBoTSORTTracker:
 
     def __init__(
         self,
+        *,
         model_name: str,
         tracker: str,
         imgsz: int,
         conf: float,
         iou: float,
+        vid_stride: int,
         target_classes: set[str],
         device: str = "auto",
     ) -> None:
+        if imgsz <= 0:
+            raise ValueError(
+                f"imgsz must be > 0, got {imgsz}"
+            )
+
+        if vid_stride < 1:
+            raise ValueError(
+                f"vid_stride must be >= 1, got {vid_stride}"
+            )
+
         self.tracker = tracker
         self.imgsz = int(imgsz)
         self.conf = float(conf)
         self.iou = float(iou)
-
+        self.vid_stride = int(vid_stride)
         self.device = self._resolve_device(device)
 
-        self.model_path = self._resolve_model_path(
-            model_name
-        )
+        self.model_path = self._resolve_model_path(model_name)
 
+        if not self.model_path.exists():
+            raise FileNotFoundError(
+                "TensorRT/model file not found: "
+                f"{self.model_path}\n"
+                "Export YOLO26m to TensorRT first."
+            )
+
+        # TensorRT engines are loaded directly by Ultralytics.
         self.model = YOLO(
-            str(self.model_path)
-            if self.model_path.exists()
-            else model_name
+            str(self.model_path),
+            task="detect",
         )
 
         self.target_classes = set(target_classes)
@@ -78,8 +103,7 @@ class YOLOBoTSORTTracker:
 
         self.target_class_ids = {
             int(class_id)
-            for class_id, class_name
-            in self.class_names.items()
+            for class_id, class_name in self.class_names.items()
             if class_name in self.target_classes
         }
 
@@ -89,28 +113,22 @@ class YOLOBoTSORTTracker:
                 f"Requested: {sorted(self.target_classes)}"
             )
 
+        self._processed_frames = 0
+
     @staticmethod
     def _resolve_device(device: str):
         if device == "auto":
-            return (
-                0
-                if torch.cuda.is_available()
-                else "cpu"
-            )
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA GPU is required for the production TensorRT engine, "
+                    "but torch.cuda.is_available() is False."
+                )
+            return 0
 
         return device
 
     @staticmethod
-    def _resolve_model_path(
-        model_name: str,
-    ) -> Path:
-        """
-        Resolution priority:
-        1. Explicit path.
-        2. models/<filename>.
-        3. Original Ultralytics model name.
-        """
-
+    def _resolve_model_path(model_name: str) -> Path:
         configured = Path(model_name)
 
         if configured.exists():
@@ -129,32 +147,29 @@ class YOLOBoTSORTTracker:
     @staticmethod
     def _report_progress(
         progress_callback: ProgressCallback | None,
-        frame_id: int,
+        source_frame_id: int,
         total_frames: int | None,
     ) -> None:
-        if progress_callback is None:
+        if progress_callback is None or not total_frames:
             return
 
-        if not total_frames:
-            return
-
-        # Do not update UI on every frame.
+        # Avoid UI updates on every processed frame.
         if (
-            frame_id != 1
-            and frame_id != total_frames
-            and frame_id % 30 != 0
+            source_frame_id != 1
+            and source_frame_id != total_frames
+            and source_frame_id % 60 != 0
         ):
             return
 
         progress = min(
             1.0,
-            frame_id / total_frames,
+            source_frame_id / total_frames,
         )
 
         progress_callback(
             progress,
-            f"Inference "
-            f"{frame_id:,}/{total_frames:,}",
+            f"Inference source frame "
+            f"{source_frame_id:,}/{total_frames:,}",
         )
 
     def run(
@@ -164,7 +179,6 @@ class YOLOBoTSORTTracker:
         total_frames: int | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> pd.DataFrame:
-
         if fps <= 0:
             raise ValueError(
                 f"fps must be > 0, got {fps}"
@@ -178,7 +192,9 @@ class YOLOBoTSORTTracker:
             )
 
         track_records: list[pd.DataFrame] = []
+        self._processed_frames = 0
 
+        # Ultralytics supports vid_stride directly for video inputs.
         results_stream = self.model.track(
             source=str(video_path),
             tracker=self.tracker,
@@ -186,18 +202,26 @@ class YOLOBoTSORTTracker:
             conf=self.conf,
             iou=self.iou,
             device=self.device,
+            vid_stride=self.vid_stride,
             stream=True,
             persist=True,
             verbose=False,
         )
 
-        for frame_id, result in enumerate(
+        for processed_idx, result in enumerate(
             results_stream,
-            start=1,
+            start=0,
         ):
+            self._processed_frames += 1
+
+            # Convert processed-result index into ORIGINAL source frame id.
+            source_frame_id = (
+                1 + processed_idx * self.vid_stride
+            )
+
             self._report_progress(
                 progress_callback,
-                frame_id,
+                source_frame_id,
                 total_frames,
             )
 
@@ -257,19 +281,18 @@ class YOLOBoTSORTTracker:
             x2 = xyxy[:, 2]
             y2 = xyxy[:, 3]
 
-            # Preserve notebook behavior.
             bottom_center_x = (
-                (x1 + x2) / 2.0
-            )
+                x1 + x2
+            ) / 2.0
             bottom_center_y = y2
 
             timestamp = (
-                (frame_id - 1) / fps
+                (source_frame_id - 1) / fps
             )
 
             frame_df = pd.DataFrame(
                 {
-                    "frame_id": frame_id,
+                    "frame_id": source_frame_id,
                     "timestamp_sec": timestamp,
                     "track_id": track_ids,
                     "class_id": cls,
@@ -282,10 +305,8 @@ class YOLOBoTSORTTracker:
                     "y1": y1,
                     "x2": x2,
                     "y2": y2,
-                    "bottom_center_x":
-                        bottom_center_x,
-                    "bottom_center_y":
-                        bottom_center_y,
+                    "bottom_center_x": bottom_center_x,
+                    "bottom_center_y": bottom_center_y,
                 }
             )
 
@@ -295,8 +316,7 @@ class YOLOBoTSORTTracker:
             if progress_callback is not None:
                 progress_callback(
                     1.0,
-                    "Inference complete: "
-                    "no target tracks found",
+                    "Inference complete: no target tracks found",
                 )
 
             return pd.DataFrame(
@@ -324,10 +344,9 @@ class YOLOBoTSORTTracker:
         if progress_callback is not None:
             progress_callback(
                 1.0,
-                (
-                    "Inference complete: "
-                    f"{len(tracks_raw):,} observations"
-                ),
+                "Inference complete: "
+                f"{len(tracks_raw):,} observations "
+                f"from {self._processed_frames:,} processed frames",
             )
 
         return tracks_raw
