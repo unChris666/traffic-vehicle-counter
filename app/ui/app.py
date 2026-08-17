@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import gradio as gr
@@ -17,77 +18,82 @@ def process_video(
 ):
     if not video_path:
         raise gr.Error(
-            "Please upload a video first."
+            "Please upload a traffic video."
         )
 
-    progress(
-        0.01,
-        desc="Validating video...",
-    )
+    try:
+        result = engine.process(
+            video_path,
+            render_video=True,
+            progress_callback=progress,
+        )
 
-    result = engine.process(
-        video_path,
-        render_video=True,
-        progress_callback=progress,
-    )
+        counts_df = pd.DataFrame(
+            [
+                {
+                    "CLASS": class_name,
+                    "QUANTITY": quantity,
+                }
+                for class_name, quantity
+                in result.counts.items()
+            ]
+        )
 
-    rows = [
-        {
-            "CLASS": class_name.title(),
-            "QUANTITY": quantity,
-        }
-        for class_name, quantity
-        in result.counts.items()
-    ]
+        confidence_df = pd.DataFrame(
+            result.count_confidence
+        )
 
-    result_table = pd.DataFrame(
-        rows
-    )
+        output_dir = (
+            Path(engine.config.output_dir)
+            / Path(video_path).stem
+        )
 
-    json_path = (
-        Path(engine.config.output_dir)
-        / Path(video_path).stem
-        / "result.json"
-    )
+        result_json = (
+            output_dir / "result.json"
+        )
 
-    csv_path = (
-        Path(engine.config.output_dir)
-        / Path(video_path).stem
-        / "final_vehicle_counts.csv"
-    )
+        csv_path = (
+            output_dir
+            / "final_vehicle_counts.csv"
+        )
 
-    video_output = (
-        Path(engine.config.output_dir)
-        / Path(video_path).stem
-        / "annotated_video.mp4"
-    )
+        annotated_video = (
+            output_dir
+            / "annotated_video.mp4"
+        )
 
-    confidence_rows = pd.DataFrame(
-        result.count_confidence
-    )
+        return (
+            counts_df,
+            confidence_df,
+            result.total,
+            result.overall_confidence[
+                "confidence"
+            ],
+            result.overall_confidence[
+                "flag"
+            ],
+            str(annotated_video),
+            str(csv_path),
+            str(result_json),
+        )
 
-    return (
-        result_table,
-        confidence_rows,
-        result.total,
-        result.overall_confidence["confidence"],
-        result.overall_confidence["flag"],
-        str(video_output),
-        str(csv_path),
-        str(json_path),
-    )
+    except Exception as exc:
+        raise gr.Error(
+            f"Processing failed: {exc}"
+        ) from exc
 
 
 with gr.Blocks(
-    title="Traffic Counter"
+    title="Traffic Counter",
 ) as demo:
 
     gr.Markdown(
         """
         # Traffic Counter
 
-        Upload a fixed-camera traffic video to count
-        vehicles crossing the configured counting line.
+        Upload a fixed-camera traffic video
+        to count vehicles crossing the configured
+        counting line.
         """
     )
 
@@ -112,15 +118,15 @@ with gr.Blocks(
     with gr.Row():
 
         total_output = gr.Number(
-            label="Total Vehicles"
+            label="Total Vehicles",
         )
 
-        overall_confidence = gr.Number(
-            label="Overall Confidence"
+        confidence_output = gr.Number(
+            label="Overall Confidence",
         )
 
-        overall_flag = gr.Textbox(
-            label="Confidence Flag"
+        confidence_flag = gr.Textbox(
+            label="Confidence Flag",
         )
 
     result_table = gr.Dataframe(
@@ -128,6 +134,10 @@ with gr.Blocks(
         headers=[
             "CLASS",
             "QUANTITY",
+        ],
+        datatype=[
+            "str",
+            "number",
         ],
         interactive=False,
     )
@@ -140,11 +150,11 @@ with gr.Blocks(
     with gr.Row():
 
         csv_output = gr.File(
-            label="Download CSV"
+            label="Download CSV",
         )
 
         json_output = gr.File(
-            label="Download JSON"
+            label="Download JSON",
         )
 
     process_button.click(
@@ -156,8 +166,8 @@ with gr.Blocks(
             result_table,
             confidence_table,
             total_output,
-            overall_confidence,
-            overall_flag,
+            confidence_output,
+            confidence_flag,
             video_output,
             csv_output,
             json_output,
