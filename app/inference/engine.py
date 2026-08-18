@@ -186,7 +186,7 @@ class TrafficCountingEngine:
             - phase1_start
         )
 
-        tracks_raw = tracker.run(
+        tracks_raw = self.tracker.run(
             video_path,
             fps=metadata.fps,
             total_frames=metadata.frame_count,
