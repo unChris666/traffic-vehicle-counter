@@ -46,12 +46,22 @@ def main() -> None:
     # ---------------------------------------------------------
     # Export TensorRT
     # ---------------------------------------------------------
+    # exported_path = model.export(
+    #     format="engine",
+    #     imgsz=512,
+    #     dynamic=False,
+    #     batch=1,
+    #     quantize=16,
+    #     device=0,
+    #     verbose=False,
+    # )
+
     exported_path = model.export(
         format="engine",
         imgsz=512,
         dynamic=False,
         batch=1,
-        quantize=16,
+        half=True,
         device=0,
         verbose=False,
     )
