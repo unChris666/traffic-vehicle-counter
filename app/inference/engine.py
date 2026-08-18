@@ -62,6 +62,17 @@ class TrafficCountingEngine:
         config: AppConfig | None = None,
     ) -> None:
         self.config = config or build_config()
+        # UPDATE TRACKER
+        self.tracker = YOLOBoTSORTTracker(
+            model_name=self.config.detection.model_name,
+            tracker=self.config.detection.tracker,
+            imgsz=self.config.detection.imgsz,
+            conf=self.config.detection.conf_threshold,
+            iou=self.config.detection.iou_threshold,
+            vid_stride=self.config.detection.vid_stride,
+            target_classes=set(self.config.target_classes),
+            device=self.config.detection.device,
+        )
 
     def validate(
         self,
@@ -144,17 +155,35 @@ class TrafficCountingEngine:
             ),
         )
 
-        tracker = YOLOBoTSORTTracker(
-            model_name=self.config.detection.model_name,
-            tracker=self.config.detection.tracker,
-            imgsz=self.config.detection.imgsz,
-            conf=self.config.detection.conf_threshold,
-            iou=self.config.detection.iou_threshold,
-            vid_stride=self.config.detection.vid_stride,
-            target_classes=set(
-                self.config.target_classes
+        # tracker = YOLOBoTSORTTracker(
+        #     model_name=self.config.detection.model_name,
+        #     tracker=self.config.detection.tracker,
+        #     imgsz=self.config.detection.imgsz,
+        #     conf=self.config.detection.conf_threshold,
+        #     iou=self.config.detection.iou_threshold,
+        #     vid_stride=self.config.detection.vid_stride,
+        #     target_classes=set(
+        #         self.config.target_classes
+        #     ),
+        #     device=self.config.detection.device,
+        # )
+
+        tracks_raw = self.tracker.run(
+            video_path,
+            fps=metadata.fps,
+            total_frames=metadata.frame_count,
+            progress_callback=(
+                lambda p, d: self._report(
+                    progress_callback,
+                    0.08 + p * 0.66,
+                    d,
+                )
             ),
-            device=self.config.detection.device,
+        )
+
+        phase1_elapsed = (
+            time.perf_counter()
+            - phase1_start
         )
 
         tracks_raw = tracker.run(
