@@ -34,15 +34,18 @@ class CountingConfig:
     line_x2_ratio: float = 0.05
     line_y2_ratio: float = 0.95
 
-    line_deadband_px: float = 8.0
+    line_deadband_px: float = 12.0
 
     # With vid_stride=2, two processed observations are ~2/fps apart.
     # 1.5 s leaves generous room for temporary detector gaps.
-    max_trajectory_gap_sec: float = 1.5
+    # max_trajectory_gap_sec: float = 1.5
+    max_trajectory_gap_sec: float = 5.0
 
     # Existing motorcycle fragmentation protection.
-    moto_dedup_time_sec: float = 1.20
-    moto_dedup_distance_px: float = 90.0
+    # moto_dedup_time_sec: float = 1.20
+    moto_dedup_time_sec: float = 0.25
+    # moto_dedup_distance_px: float = 90.0
+    moto_dedup_distance_px: float = 30.0
 
 
 @dataclass(frozen=True)
