@@ -18,7 +18,7 @@ new_track_thresh: 0.20
 track_buffer: 90
 
 # Association threshold
-match_thresh: 0.85
+match_thresh: 0.80
 
 # Fuse detection confidence with IoU distance
 fuse_score: True
@@ -27,7 +27,7 @@ fuse_score: True
 gmc_method: sparseOptFlow
 
 # Disable ReID for first experiment
-with_reid: False
+with_reid: True
 
 # Required by current Ultralytics BoT-SORT API
 model: auto
