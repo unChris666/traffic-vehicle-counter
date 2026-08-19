@@ -1390,68 +1390,81 @@ class CrossingIdentityEngine:
                 continue
 
             crossing_rows.append(
-                {
-                    "crossing_id": (
-                        identity.crossing_id
-                    ),
-
-                    # IMPORTANT:
-                    # Keep one raw track_id for compatibility
-                    # with existing confidence engine.
-                    "track_id": (
-                        identity.crossing_track_id
-                    ),
-
-                    "track_ids": ",".join(
-                        map(
-                            str,
-                            identity.track_ids,
-                        )
-                    ),
-
-                    "crossing_frame": (
-                        identity.crossing_frame
-                    ),
-
-                    "crossing_time_sec": (
-                        identity.crossing_time_sec
-                    ),
-
-                    "crossing_x": (
-                        identity.crossing_x
-                    ),
-
-                    "crossing_y": (
-                        identity.crossing_y
-                    ),
-
-                    "direction": (
-                        identity.direction
-                    ),
-
-                    "track_class": (
-                        identity.vehicle_class
-                    ),
-
-                    "track_class_ratio": (
-                        identity.class_ratio
-                    ),
-
-                    "class_ambiguous": (
-                        identity.class_ambiguous
-                    ),
-
-                    "state": (
-                        identity.state.value
-                    ),
-
-                    "num_track_fragments": (
-                        len(
-                            identity.track_ids
-                        )
-                    ),
-                }
-            )
+            {
+                "crossing_id": (
+                    identity.crossing_id
+                ),
+        
+                "track_id": (
+                    identity.crossing_track_id
+                ),
+        
+                "track_ids": ",".join(
+                    map(
+                        str,
+                        identity.track_ids,
+                    )
+                ),
+        
+                # ----------------------------------------------
+                # Fields required by ConfidenceEngine
+                # ----------------------------------------------
+        
+                "frame_gap": (
+                    identity.crossing_frame_gap
+                ),
+        
+                "line_distance_px": (
+                    identity.crossing_line_distance_px
+                ),
+        
+                "previous_side": (
+                    identity.crossing_previous_side
+                ),
+        
+                "crossing_frame": (
+                    identity.crossing_frame
+                ),
+        
+                "crossing_time_sec": (
+                    identity.crossing_time_sec
+                ),
+        
+                "crossing_x": (
+                    identity.crossing_x
+                ),
+        
+                "crossing_y": (
+                    identity.crossing_y
+                ),
+        
+                "direction": (
+                    identity.direction
+                ),
+        
+                "track_class": (
+                    identity.vehicle_class
+                ),
+        
+                "track_class_ratio": (
+                    identity.class_ratio
+                ),
+        
+                "class_ambiguous": (
+                    identity.class_ambiguous
+                ),
+        
+                "state": (
+                    identity.state.value
+                ),
+        
+                "num_track_fragments": (
+                    len(
+                        identity.track_ids
+                    )
+                ),
+            }
+        )
 
         crossing_events = pd.DataFrame(
             crossing_rows
@@ -1464,6 +1477,11 @@ class CrossingIdentityEngine:
                     "crossing_id",
                     "track_id",
                     "track_ids",
+        
+                    "frame_gap",
+                    "line_distance_px",
+                    "previous_side",
+        
                     "crossing_frame",
                     "crossing_time_sec",
                     "crossing_x",
