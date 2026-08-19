@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import shutil
-import subprocess
-import time
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import Callable
 
 import cv2
 import numpy as np
@@ -13,11 +10,17 @@ import pandas as pd
 
 class VideoRenderer:
     """
-    Render Phase 3 tracking/counting result into annotated CFR MP4.
+    Render:
+    - bounding box
+    - track ID
+    - class
+    - detection confidence
+    - bottom-center point
+    - trajectory line
+    - counting line
 
-    No YOLO.
-    No tracking.
-    No counting.
+    Tracking data comes from the already-computed YOLO26 + BoT-SORT
+    observations.
     """
 
     def __init__(
@@ -27,22 +30,69 @@ class VideoRenderer:
         line_y1: float,
         line_x2: float,
         line_y2: float,
+        trajectory_length: int = 45,
     ) -> None:
+
         self.line_x1 = int(round(line_x1))
         self.line_y1 = int(round(line_y1))
         self.line_x2 = int(round(line_x2))
         self.line_y2 = int(round(line_y2))
 
+        self.trajectory_length = trajectory_length
+
     @staticmethod
-    def _require_ffmpeg() -> str:
-        ffmpeg = shutil.which("ffmpeg")
+    def _draw_label(
+        frame,
+        text: str,
+        x: int,
+        y: int,
+    ) -> None:
 
-        if ffmpeg is None:
-            raise RuntimeError(
-                "FFmpeg was not found in PATH."
-            )
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.45
+        thickness = 1
 
-        return ffmpeg
+        (tw, th), baseline = cv2.getTextSize(
+            text,
+            font,
+            scale,
+            thickness,
+        )
+
+        y1 = max(0, y - th - baseline - 4)
+        y2 = y
+
+        cv2.rectangle(
+            frame,
+            (x, y1),
+            (x + tw + 6, y2),
+            (0, 0, 0),
+            -1,
+        )
+
+        cv2.putText(
+            frame,
+            text,
+            (x + 3, y - 3),
+            font,
+            scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    @staticmethod
+    def _color_from_track_id(track_id: int):
+        """
+        Deterministic color per track ID.
+        """
+        rng = np.random.default_rng(track_id)
+
+        return (
+            int(rng.integers(60, 255)),
+            int(rng.integers(60, 255)),
+            int(rng.integers(60, 255)),
+        )
 
     def render(
         self,
@@ -55,11 +105,8 @@ class VideoRenderer:
         total_frames: int,
         tracks_phase2: pd.DataFrame,
         final_crossings: pd.DataFrame,
-        progress_callback: Callable[[float, str], None]
-        | None = None,
+        progress_callback=None,
     ) -> Path:
-
-        ffmpeg = self._require_ffmpeg()
 
         input_path = Path(input_path)
         output_path = Path(output_path)
@@ -69,129 +116,90 @@ class VideoRenderer:
             exist_ok=True,
         )
 
-        render_df = tracks_phase2[
-            [
-                "frame_id",
-                "track_id",
-                "x1",
-                "y1",
-                "x2",
-                "y2",
-                "track_class",
-                "track_class_ratio",
-                "class_ambiguous",
-            ]
-        ].copy()
+        required_columns = {
+            "frame_id",
+            "track_id",
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+            "bottom_center_x",
+            "bottom_center_y",
+            "track_class",
+            "confidence",
+        }
 
-        render_df["frame_id"] = (
-            render_df["frame_id"].astype(np.int32)
+        missing = required_columns - set(
+            tracks_phase2.columns
         )
+
+        if missing:
+            raise ValueError(
+                f"tracks_phase2 missing required columns: "
+                f"{sorted(missing)}"
+            )
+
+        # -------------------------------------------------
+        # Prepare frame lookup
+        # -------------------------------------------------
 
         frame_groups = {
             frame_id: group
             for frame_id, group
-            in render_df.groupby(
-                "frame_id",
-                sort=False,
-            )
+            in tracks_phase2.groupby("frame_id")
         }
 
-        crossing_frame_groups = {
-            frame_id: group
-            for frame_id, group
-            in final_crossings.groupby(
-                "crossing_frame",
-                sort=False,
+        # -------------------------------------------------
+        # Track history
+        # -------------------------------------------------
+
+        track_history = defaultdict(
+            lambda: deque(
+                maxlen=self.trajectory_length
             )
-        }
-
-        crossing_frame_counts = (
-            final_crossings["crossing_frame"]
-            .value_counts()
-            .sort_index()
         )
 
-        cumulative_count = (
-            crossing_frame_counts
-            .reindex(
-                range(1, total_frames + 1),
-                fill_value=0,
-            )
-            .cumsum()
-            .astype(int)
-            .to_numpy()
-        )
-
-        ffmpeg_cmd = [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-
-            "-f",
-            "rawvideo",
-
-            "-pixel_format",
-            "bgr24",
-
-            "-video_size",
-            f"{width}x{height}",
-
-            "-framerate",
-            f"{fps:.12f}",
-
-            "-i",
-            "pipe:0",
-
-            "-an",
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "medium",
-
-            "-crf",
-            "18",
-
-            "-pix_fmt",
-            "yuv420p",
-
-            "-vsync",
-            "cfr",
-
-            "-movflags",
-            "+faststart",
-
-            str(output_path),
-        ]
-
-        process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
+        # -------------------------------------------------
+        # Video input
+        # -------------------------------------------------
 
         cap = cv2.VideoCapture(
             str(input_path)
         )
 
         if not cap.isOpened():
-            process.kill()
             raise RuntimeError(
-                f"Cannot open input video: {input_path}"
+                f"Unable to open video: {input_path}"
+            )
+
+        # -------------------------------------------------
+        # Output writer
+        # -------------------------------------------------
+
+        fourcc = cv2.VideoWriter_fourcc(
+            *"mp4v"
+        )
+
+        writer = cv2.VideoWriter(
+            str(output_path),
+            fourcc,
+            fps,
+            (width, height),
+        )
+
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(
+                f"Unable to create output video: "
+                f"{output_path}"
             )
 
         frame_id = 0
-        render_error: str | None = None
-
-        start = time.perf_counter()
 
         try:
+
             while True:
+
                 success, frame = cap.read()
 
                 if not success:
@@ -199,17 +207,10 @@ class VideoRenderer:
 
                 frame_id += 1
 
-                if frame.shape != (
-                    height,
-                    width,
-                    3,
-                ):
-                    raise RuntimeError(
-                        f"Unexpected frame shape at "
-                        f"frame {frame_id}: {frame.shape}"
-                    )
+                # -------------------------------------------------
+                # Draw counting line
+                # -------------------------------------------------
 
-                # Counting line.
                 cv2.line(
                     frame,
                     (
@@ -221,237 +222,203 @@ class VideoRenderer:
                         self.line_y2,
                     ),
                     (0, 255, 255),
-                    4,
+                    3,
                     cv2.LINE_AA,
                 )
 
-                group = frame_groups.get(
+                # -------------------------------------------------
+                # Current frame detections
+                # -------------------------------------------------
+
+                current_tracks = frame_groups.get(
                     frame_id
                 )
 
-                if group is not None:
-                    for row in group.itertuples(
-                        index=False
-                    ):
-                        x1 = int(row.x1)
-                        y1 = int(row.y1)
-                        x2 = int(row.x2)
-                        y2 = int(row.y2)
+                if current_tracks is not None:
 
-                        label = (
-                            f"ID {int(row.track_id)} | "
-                            f"{str(row.track_class).upper()} | "
-                            f"{float(row.track_class_ratio):.0%}"
+                    for _, row in current_tracks.iterrows():
+
+                        track_id = int(
+                            row["track_id"]
                         )
 
-                        if bool(row.class_ambiguous):
-                            label += " | AMBIG"
+                        x1 = int(
+                            round(row["x1"])
+                        )
+
+                        y1 = int(
+                            round(row["y1"])
+                        )
+
+                        x2 = int(
+                            round(row["x2"])
+                        )
+
+                        y2 = int(
+                            round(row["y2"])
+                        )
+
+                        cx = int(
+                            round(
+                                row[
+                                    "bottom_center_x"
+                                ]
+                            )
+                        )
+
+                        cy = int(
+                            round(
+                                row[
+                                    "bottom_center_y"
+                                ]
+                            )
+                        )
+
+                        cls_name = str(
+                            row["track_class"]
+                        )
+
+                        confidence = float(
+                            row["confidence"]
+                        )
+
+                        color = (
+                            self._color_from_track_id(
+                                track_id
+                            )
+                        )
+
+                        # -------------------------------------------------
+                        # Update trajectory
+                        # -------------------------------------------------
+
+                        track_history[
+                            track_id
+                        ].append(
+                            (cx, cy)
+                        )
+
+                        # -------------------------------------------------
+                        # Draw trajectory
+                        # -------------------------------------------------
+
+                        points = np.array(
+                            track_history[
+                                track_id
+                            ],
+                            dtype=np.int32,
+                        )
+
+                        if len(points) >= 2:
+
+                            cv2.polylines(
+                                frame,
+                                [points],
+                                isClosed=False,
+                                color=color,
+                                thickness=2,
+                                lineType=cv2.LINE_AA,
+                            )
+
+                        # -------------------------------------------------
+                        # Draw bounding box
+                        # -------------------------------------------------
 
                         cv2.rectangle(
                             frame,
                             (x1, y1),
                             (x2, y2),
-                            (0, 255, 0),
+                            color,
                             2,
                         )
 
-                        cv2.putText(
+                        # -------------------------------------------------
+                        # Draw bottom-center point
+                        # -------------------------------------------------
+
+                        cv2.circle(
                             frame,
-                            label,
-                            (
-                                x1,
-                                max(y1 - 8, 18),
-                            ),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.45,
+                            (cx, cy),
+                            5,
+                            color,
+                            -1,
+                            cv2.LINE_AA,
+                        )
+
+                        # Outer ring to make point obvious
+                        cv2.circle(
+                            frame,
+                            (cx, cy),
+                            7,
                             (255, 255, 255),
                             1,
                             cv2.LINE_AA,
                         )
 
-                # Cumulative final vehicle count.
-                current_count = int(
-                    cumulative_count[
-                        frame_id - 1
-                    ]
-                )
+                        # -------------------------------------------------
+                        # Label
+                        # -------------------------------------------------
 
-                cv2.rectangle(
-                    frame,
-                    (15, 10),
-                    (370, 80),
-                    (0, 0, 0),
-                    -1,
-                )
+                        label = (
+                            f"ID {track_id} | "
+                            f"{cls_name.upper()} | "
+                            f"{confidence:.0%}"
+                        )
+
+                        self._draw_label(
+                            frame,
+                            label,
+                            x1,
+                            y1,
+                        )
+
+                # -------------------------------------------------
+                # Frame number
+                # -------------------------------------------------
 
                 cv2.putText(
                     frame,
-                    f"VEHICLE COUNT: {current_count}",
-                    (25, 40),
+                    f"Frame: {frame_id:,}",
+                    (width - 220, 35),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
+                    0.7,
                     (255, 255, 255),
                     2,
                     cv2.LINE_AA,
                 )
 
-                cv2.putText(
-                    frame,
-                    "MOTORCYCLE + RIDER = 1",
-                    (25, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.38,
-                    (200, 200, 200),
-                    1,
-                    cv2.LINE_AA,
-                )
+                writer.write(frame)
 
-                # Crossing events.
-                events = crossing_frame_groups.get(
-                    frame_id
-                )
+                # -------------------------------------------------
+                # Progress
+                # -------------------------------------------------
 
-                if events is not None:
-                    max_events = max(
-                        1,
-                        int(
-                            (height - 40) / 25
-                        ),
-                    )
+                if progress_callback is not None:
 
-                    for offset, event in enumerate(
-                        events.itertuples(
-                            index=False
-                        )
-                    ):
-                        if offset >= max_events:
-                            break
-
-                        event_text = (
-                            "COUNTED: "
-                            f"{str(event.track_class).upper()} "
-                            f"| ID {int(event.track_id)} "
-                            f"| {event.direction}"
-                        )
-
-                        cv2.putText(
-                            frame,
-                            event_text,
-                            (
-                                20,
-                                height
-                                - 25
-                                - offset * 24,
-                            ),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.48,
-                            (0, 255, 255),
-                            2,
-                            cv2.LINE_AA,
-                        )
-
-                cv2.putText(
-                    frame,
-                    f"Frame: {frame_id:,}",
-                    (
-                        max(
-                            10,
-                            width - 180,
-                        ),
-                        30,
-                    ),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
-
-                if process.stdin is None:
-                    raise RuntimeError(
-                        "FFmpeg stdin is unavailable."
-                    )
-
-                process.stdin.write(
-                    frame.tobytes()
-                )
-
-                if (
-                    progress_callback is not None
-                    and (
-                        frame_id == 1
-                        or frame_id % 30 == 0
+                    if (
+                        frame_id % 30 == 0
                         or frame_id == total_frames
-                    )
-                ):
-                    progress_callback(
-                        frame_id / total_frames,
-                        f"Rendering video "
-                        f"{frame_id:,}/{total_frames:,}",
-                    )
+                    ):
 
-        except (
-            BrokenPipeError,
-            OSError,
-            RuntimeError,
-        ) as exc:
-            render_error = str(exc)
+                        progress_callback(
+                            min(
+                                1.0,
+                                frame_id
+                                / max(
+                                    total_frames,
+                                    1,
+                                ),
+                            ),
+                            (
+                                f"Rendering "
+                                f"{frame_id:,}/"
+                                f"{total_frames:,}"
+                            ),
+                        )
 
         finally:
+
             cap.release()
-
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except Exception:
-                    pass
-
-        stderr = (
-            process.stderr.read().decode(
-                "utf-8",
-                errors="replace",
-            )
-            if process.stderr is not None
-            else ""
-        )
-
-        return_code = process.wait()
-
-        if render_error is not None:
-            raise RuntimeError(
-                f"Video rendering failed: "
-                f"{render_error}"
-            )
-
-        if return_code != 0:
-            raise RuntimeError(
-                "FFmpeg rendering failed:\n"
-                f"{stderr}"
-            )
-
-        if frame_id != total_frames:
-            raise RuntimeError(
-                "Rendered frame count mismatch: "
-                f"{frame_id}/{total_frames}"
-            )
-
-        if (
-            not output_path.exists()
-            or output_path.stat().st_size <= 0
-        ):
-            raise RuntimeError(
-                "Rendered output video is missing or empty."
-            )
-
-        if progress_callback is not None:
-            elapsed = (
-                time.perf_counter() - start
-            )
-
-            progress_callback(
-                1.0,
-                f"Rendering complete "
-                f"({elapsed:.1f}s)",
-            )
+            writer.release()
 
         return output_path
