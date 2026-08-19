@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -9,19 +10,6 @@ import pandas as pd
 
 
 class VideoRenderer:
-    """
-    Render:
-    - bounding box
-    - track ID
-    - class
-    - detection confidence
-    - bottom-center point
-    - trajectory line
-    - counting line
-
-    Tracking data comes from the already-computed YOLO26 + BoT-SORT
-    observations.
-    """
 
     def __init__(
         self,
@@ -60,12 +48,11 @@ class VideoRenderer:
         )
 
         y1 = max(0, y - th - baseline - 4)
-        y2 = y
 
         cv2.rectangle(
             frame,
             (x, y1),
-            (x + tw + 6, y2),
+            (x + tw + 6, y),
             (0, 0, 0),
             -1,
         )
@@ -83,9 +70,6 @@ class VideoRenderer:
 
     @staticmethod
     def _color_from_track_id(track_id: int):
-        """
-        Deterministic color per track ID.
-        """
         rng = np.random.default_rng(track_id)
 
         return (
@@ -93,6 +77,63 @@ class VideoRenderer:
             int(rng.integers(60, 255)),
             int(rng.integers(60, 255)),
         )
+
+    @staticmethod
+    def _encode_h264(
+        input_path: Path,
+        output_path: Path,
+        fps: float,
+    ) -> None:
+
+        command = [
+            "ffmpeg",
+            "-y",
+
+            "-i",
+            str(input_path),
+
+            # H.264
+            "-c:v",
+            "libx264",
+
+            # Browser compatible pixel format
+            "-pix_fmt",
+            "yuv420p",
+
+            # Force constant frame rate
+            "-r",
+            f"{fps:.6f}",
+
+            # Good visual quality
+            "-crf",
+            "20",
+
+            # Reasonable Kaggle processing speed
+            "-preset",
+            "fast",
+
+            # Important for browser streaming
+            "-movflags",
+            "+faststart",
+
+            # Tracking output has no audio
+            "-an",
+
+            str(output_path),
+        ]
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                "FFmpeg H.264 encoding failed:\n"
+                + result.stderr[-4000:]
+            )
 
     def render(
         self,
@@ -139,9 +180,9 @@ class VideoRenderer:
                 f"{sorted(missing)}"
             )
 
-        # -------------------------------------------------
-        # Prepare frame lookup
-        # -------------------------------------------------
+        # ------------------------------------------
+        # Frame lookup
+        # ------------------------------------------
 
         frame_groups = {
             frame_id: group
@@ -149,19 +190,15 @@ class VideoRenderer:
             in tracks_phase2.groupby("frame_id")
         }
 
-        # -------------------------------------------------
-        # Track history
-        # -------------------------------------------------
-
         track_history = defaultdict(
             lambda: deque(
                 maxlen=self.trajectory_length
             )
         )
 
-        # -------------------------------------------------
-        # Video input
-        # -------------------------------------------------
+        # ------------------------------------------
+        # Input video
+        # ------------------------------------------
 
         cap = cv2.VideoCapture(
             str(input_path)
@@ -172,16 +209,22 @@ class VideoRenderer:
                 f"Unable to open video: {input_path}"
             )
 
-        # -------------------------------------------------
-        # Output writer
-        # -------------------------------------------------
+        # ------------------------------------------
+        # Temporary rendering file
+        # ------------------------------------------
 
+        temp_path = (
+            output_path.parent
+            / f"{output_path.stem}_opencv_temp.mp4"
+        )
+
+        # OpenCV -> MPEG-4 temporary
         fourcc = cv2.VideoWriter_fourcc(
             *"mp4v"
         )
 
         writer = cv2.VideoWriter(
-            str(output_path),
+            str(temp_path),
             fourcc,
             fps,
             (width, height),
@@ -189,9 +232,10 @@ class VideoRenderer:
 
         if not writer.isOpened():
             cap.release()
+
             raise RuntimeError(
-                f"Unable to create output video: "
-                f"{output_path}"
+                f"Unable to create temporary video: "
+                f"{temp_path}"
             )
 
         frame_id = 0
@@ -207,9 +251,9 @@ class VideoRenderer:
 
                 frame_id += 1
 
-                # -------------------------------------------------
-                # Draw counting line
-                # -------------------------------------------------
+                # ----------------------------------
+                # Counting line
+                # ----------------------------------
 
                 cv2.line(
                     frame,
@@ -226,9 +270,9 @@ class VideoRenderer:
                     cv2.LINE_AA,
                 )
 
-                # -------------------------------------------------
-                # Current frame detections
-                # -------------------------------------------------
+                # ----------------------------------
+                # Current frame tracks
+                # ----------------------------------
 
                 current_tracks = frame_groups.get(
                     frame_id
@@ -245,15 +289,12 @@ class VideoRenderer:
                         x1 = int(
                             round(row["x1"])
                         )
-
                         y1 = int(
                             round(row["y1"])
                         )
-
                         x2 = int(
                             round(row["x2"])
                         )
-
                         y2 = int(
                             round(row["y2"])
                         )
@@ -288,19 +329,15 @@ class VideoRenderer:
                             )
                         )
 
-                        # -------------------------------------------------
-                        # Update trajectory
-                        # -------------------------------------------------
+                        # ----------------------------------
+                        # Track history
+                        # ----------------------------------
 
                         track_history[
                             track_id
                         ].append(
                             (cx, cy)
                         )
-
-                        # -------------------------------------------------
-                        # Draw trajectory
-                        # -------------------------------------------------
 
                         points = np.array(
                             track_history[
@@ -309,20 +346,24 @@ class VideoRenderer:
                             dtype=np.int32,
                         )
 
+                        # ----------------------------------
+                        # Trajectory
+                        # ----------------------------------
+
                         if len(points) >= 2:
 
                             cv2.polylines(
                                 frame,
                                 [points],
-                                isClosed=False,
-                                color=color,
-                                thickness=2,
-                                lineType=cv2.LINE_AA,
+                                False,
+                                color,
+                                2,
+                                cv2.LINE_AA,
                             )
 
-                        # -------------------------------------------------
-                        # Draw bounding box
-                        # -------------------------------------------------
+                        # ----------------------------------
+                        # Bounding box
+                        # ----------------------------------
 
                         cv2.rectangle(
                             frame,
@@ -332,32 +373,31 @@ class VideoRenderer:
                             2,
                         )
 
-                        # -------------------------------------------------
-                        # Draw bottom-center point
-                        # -------------------------------------------------
+                        # ----------------------------------
+                        # Bottom-center point
+                        # ----------------------------------
 
                         cv2.circle(
                             frame,
                             (cx, cy),
-                            5,
+                            6,
                             color,
                             -1,
                             cv2.LINE_AA,
                         )
 
-                        # Outer ring to make point obvious
                         cv2.circle(
                             frame,
                             (cx, cy),
-                            7,
+                            8,
                             (255, 255, 255),
                             1,
                             cv2.LINE_AA,
                         )
 
-                        # -------------------------------------------------
+                        # ----------------------------------
                         # Label
-                        # -------------------------------------------------
+                        # ----------------------------------
 
                         label = (
                             f"ID {track_id} | "
@@ -372,14 +412,14 @@ class VideoRenderer:
                             y1,
                         )
 
-                # -------------------------------------------------
+                # ----------------------------------
                 # Frame number
-                # -------------------------------------------------
+                # ----------------------------------
 
                 cv2.putText(
                     frame,
                     f"Frame: {frame_id:,}",
-                    (width - 220, 35),
+                    (20, 35),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     (255, 255, 255),
@@ -388,10 +428,6 @@ class VideoRenderer:
                 )
 
                 writer.write(frame)
-
-                # -------------------------------------------------
-                # Progress
-                # -------------------------------------------------
 
                 if progress_callback is not None:
 
@@ -420,5 +456,22 @@ class VideoRenderer:
 
             cap.release()
             writer.release()
+
+        # ------------------------------------------
+        # H.264 conversion
+        # ------------------------------------------
+
+        self._encode_h264(
+            input_path=temp_path,
+            output_path=output_path,
+            fps=fps,
+        )
+
+        # ------------------------------------------
+        # Remove temporary file
+        # ------------------------------------------
+
+        if temp_path.exists():
+            temp_path.unlink()
 
         return output_path
