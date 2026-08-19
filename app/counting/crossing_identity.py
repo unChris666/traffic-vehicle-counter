@@ -59,13 +59,6 @@ class TrackFragment:
 
 @dataclass
 class CrossingIdentity:
-    """
-    Physical-vehicle identity near the counting zone.
-
-    A single crossing identity can contain multiple
-    track_ids if BoT-SORT fragmented the track.
-    """
-
     crossing_id: int
 
     track_ids: list[int] = field(
@@ -106,10 +99,14 @@ class CrossingIdentity:
 
     crossing_track_id: int | None = None
 
+    # Required by existing confidence.py
+    crossing_line_distance_px: float | None = None
+    crossing_previous_side: int | None = None
+    crossing_frame_gap: int | None = None
+
     direction: str | None = None
 
     counted: bool = False
-
 
 class CrossingIdentityEngine:
     """
