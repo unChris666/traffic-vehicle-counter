@@ -53,18 +53,18 @@ from pathlib import Path
 @dataclass(frozen=True)
 class DetectionConfig:
     model_name: str = "yolo26m.pt"
-    tracker: str = "botsort.yaml"
 
-    # Higher resolution for small/far vehicles
+    tracker: str = "configs/botsort_phone.yaml"
+
+    # Native-width inference
     imgsz: int = 1280
 
-    # Recall-first tracking
+    # Recall-first
     conf_threshold: float = 0.15
 
     iou_threshold: float = 0.50
 
     device: str = "auto"
-
 
 @dataclass(frozen=True)
 class CountingConfig:
