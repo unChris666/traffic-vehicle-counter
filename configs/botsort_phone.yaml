@@ -1,0 +1,31 @@
+# ============================================
+# BoT-SORT for handheld smartphone traffic video
+# ============================================
+
+tracker_type: botsort
+
+# Detection -> track association
+track_high_thresh: 0.15
+track_low_thresh: 0.05
+
+# Allow weak but plausible vehicles to initialize
+new_track_thresh: 0.15
+
+# Keep tracks alive during short detection failures
+track_buffer: 60
+
+# Association tolerance
+match_thresh: 0.80
+
+# Stabilize association using detection confidence
+fuse_score: True
+
+# IMPORTANT for shaky smartphone camera
+gmc_method: sparseOptFlow
+
+# ReID disabled initially:
+# keep the first experiment focused on detector + motion + GMC
+with_reid: False
+
+proximity_thresh: 0.5
+appearance_thresh: 0.80
