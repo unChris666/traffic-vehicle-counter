@@ -15,10 +15,10 @@ track_low_thresh: 0.10
 new_track_thresh: 0.20
 
 # Keep temporarily lost objects alive
-track_buffer: 45
+track_buffer: 90
 
 # Association threshold
-match_thresh: 0.80
+match_thresh: 0.85
 
 # Fuse detection confidence with IoU distance
 fuse_score: True
