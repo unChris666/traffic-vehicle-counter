@@ -5,16 +5,10 @@
 model:
   name: yolo26m.pt
 
-  # Use a custom BoT-SORT configuration
-  # adapted for handheld smartphone footage.
   tracker: configs/botsort_phone.yaml
 
-  # Video is 1280x720.
-  # Higher inference resolution improves recall
-  # for small/far vehicles.
   imgsz: 1280
 
-  # Recall-first detection threshold.
   conf_threshold: 0.20
 
   iou_threshold: 0.50
@@ -23,29 +17,58 @@ model:
 
 
 counting:
+
   line:
     x1_ratio: 0.95
     y1_ratio: 0.20
+
     x2_ratio: 0.05
     y2_ratio: 0.95
 
-  # 8 px is too sensitive to jitter for
-  # handheld footage.
+  # Handheld smartphone footage
   line_deadband_px: 20.0
 
-  # Diagnostic for now.
+
+  # Existing diagnostics
   min_track_observations: 5
 
-  # Short tracking interruptions can happen
-  # because of blur/compression.
   max_trajectory_gap_sec: 1.0
 
+
+  # ==========================================
+  # PHASE 1
+  # CROSSING IDENTITY
+  # ==========================================
+
+  pre_crossing_distance_px: 100.0
+
+  max_identity_reconnect_gap_sec: 1.0
+
+  max_identity_reconnect_distance_px: 100.0
+
+  identity_match_threshold: 0.82
+
+  identity_match_margin: 0.08
+
+  velocity_gate_px_per_frame: 30.0
+
+  min_pre_crossing_observations: 3
+
+
+  # ==========================================
+  # PHASE 2
+  # Crossing-event dedup
+  # NOT USED YET
+  # ==========================================
+
   motorcycle_dedup:
-    time_sec: 1.00
-    distance_px: 50.0
+    time_sec: 1.50
+
+    distance_px: 80.0
 
 
 classes:
+
   target:
     - person
     - motorcycle
