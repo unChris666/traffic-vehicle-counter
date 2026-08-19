@@ -1,31 +1,46 @@
 # ============================================
-# BoT-SORT for handheld smartphone traffic video
+# BoT-SORT - Handheld Smartphone Traffic Video
 # ============================================
 
 tracker_type: botsort
 
-# Detection -> track association
+# --------------------------------------------
+# Detection / association thresholds
+# --------------------------------------------
+
 track_high_thresh: 0.15
 track_low_thresh: 0.05
-
-# Allow weak but plausible vehicles to initialize
 new_track_thresh: 0.15
 
-# Keep tracks alive during short detection failures
+# Keep lost tracks alive during short
+# detection failures caused by camera shake,
+# compression, blur, and partial occlusion.
 track_buffer: 60
 
-# Association tolerance
+# More permissive association
 match_thresh: 0.80
 
-# Stabilize association using detection confidence
+# Fuse detection confidence with IoU distance
 fuse_score: True
 
-# IMPORTANT for shaky smartphone camera
+# --------------------------------------------
+# Global Motion Compensation
+# --------------------------------------------
+
+# Important for handheld smartphone footage.
 gmc_method: sparseOptFlow
 
-# ReID disabled initially:
-# keep the first experiment focused on detector + motion + GMC
+# --------------------------------------------
+# Re-identification
+# --------------------------------------------
+
+# Keep ReID disabled for the first experiment.
 with_reid: False
 
-proximity_thresh: 0.5
+# Required by current Ultralytics BoT-SORT API
+# even when ReID is disabled.
+model: auto
+
+# ReID parameters
+proximity_thresh: 0.50
 appearance_thresh: 0.80
