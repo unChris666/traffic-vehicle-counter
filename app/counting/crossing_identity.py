@@ -1118,33 +1118,51 @@ class CrossingIdentityEngine:
                 and identity.last_side != 0
                 and side != identity.last_side
             ):
-
+            
                 identity.state = (
                     CrossingState.CROSSING
                 )
-
+            
                 identity.crossing_frame = (
                     frame_id
                 )
-
+            
                 identity.crossing_time_sec = (
                     timestamp_sec
                 )
-
+            
                 identity.crossing_x = x
                 identity.crossing_y = y
-
+            
                 identity.crossing_track_id = (
                     int(row["track_id"])
                 )
-
+            
+                # --------------------------------------------------
+                # Compatibility with existing ConfidenceEngine
+                # --------------------------------------------------
+            
+                identity.crossing_line_distance_px = (
+                    distance_px
+                )
+            
+                identity.crossing_previous_side = (
+                    identity.last_side
+                )
+            
+                identity.crossing_frame_gap = (
+                    frame_id - previous_frame
+                    if previous_frame is not None
+                    else 1
+                )
+            
                 identity.direction = (
                     f"side_{identity.last_side:+d}"
                     f"_to_{side:+d}"
                 )
-
+            
                 identity.counted = True
-
+            
                 identity.state = (
                     CrossingState.POST_CROSSING
                 )
