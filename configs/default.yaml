@@ -1,11 +1,26 @@
+# ==========================================
 # Phase 6A production configuration
+# ==========================================
+
 model:
   name: yolo26m.pt
-  tracker: botsort.yaml
-  imgsz: 960
-  conf_threshold: 0.25
+
+  # Use a custom BoT-SORT configuration
+  # adapted for handheld smartphone footage.
+  tracker: configs/botsort_phone.yaml
+
+  # Video is 1280x720.
+  # Higher inference resolution improves recall
+  # for small/far vehicles.
+  imgsz: 1280
+
+  # Recall-first detection threshold.
+  conf_threshold: 0.20
+
   iou_threshold: 0.50
+
   device: auto
+
 
 counting:
   line:
@@ -13,12 +28,22 @@ counting:
     y1_ratio: 0.20
     x2_ratio: 0.05
     y2_ratio: 0.95
-  line_deadband_px: 8.0
+
+  # 8 px is too sensitive to jitter for
+  # handheld footage.
+  line_deadband_px: 20.0
+
+  # Diagnostic for now.
   min_track_observations: 5
-  max_trajectory_gap_sec: 1.5
+
+  # Short tracking interruptions can happen
+  # because of blur/compression.
+  max_trajectory_gap_sec: 1.0
+
   motorcycle_dedup:
-    time_sec: 1.50
-    distance_px: 80.0
+    time_sec: 1.00
+    distance_px: 50.0
+
 
 classes:
   target:
@@ -27,11 +52,13 @@ classes:
     - car
     - truck
     - bus
+
   vehicles:
     - motorcycle
     - car
     - truck
     - bus
+
 
 output:
   directory: outputs
