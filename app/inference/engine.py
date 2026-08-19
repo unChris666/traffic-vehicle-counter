@@ -340,29 +340,72 @@ class TrafficCountingEngine:
             line_y1=line_y1,
             line_x2=line_x2,
             line_y2=line_y2,
+        
             line_deadband_px=(
                 self.config.counting
                 .line_deadband_px
             ),
+        
             max_trajectory_gap_sec=(
                 self.config.counting
                 .max_trajectory_gap_sec
             ),
+        
             moto_dedup_time_sec=(
                 self.config.counting
                 .moto_dedup_time_sec
             ),
+        
             moto_dedup_distance_px=(
                 self.config.counting
                 .moto_dedup_distance_px
             ),
+        
             vehicle_classes=set(
-                self.config
-                .vehicle_classes
+                self.config.vehicle_classes
             ),
+        
             fps=metadata.fps,
+        
+            # ----------------------------------------------
+            # PHASE 1: CROSSING IDENTITY
+            # ----------------------------------------------
+        
+            pre_crossing_distance_px=(
+                self.config.counting
+                .pre_crossing_distance_px
+            ),
+        
+            max_identity_reconnect_gap_sec=(
+                self.config.counting
+                .max_identity_reconnect_gap_sec
+            ),
+        
+            max_identity_reconnect_distance_px=(
+                self.config.counting
+                .max_identity_reconnect_distance_px
+            ),
+        
+            identity_match_threshold=(
+                self.config.counting
+                .identity_match_threshold
+            ),
+        
+            identity_match_margin=(
+                self.config.counting
+                .identity_match_margin
+            ),
+        
+            velocity_gate_px_per_frame=(
+                self.config.counting
+                .velocity_gate_px_per_frame
+            ),
+        
+            min_pre_crossing_observations=(
+                self.config.counting
+                .min_pre_crossing_observations
+            ),
         )
-
         counting_result = (
             counter.count(
                 tracks_phase2
