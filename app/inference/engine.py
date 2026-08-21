@@ -8,30 +8,15 @@ from typing import Callable
 
 import pandas as pd
 
-from app.core.config import (
-    AppConfig,
-    build_config,
-)
+from app.core.config import AppConfig, build_config
 from app.counting.counter import TrafficCounter
-from app.counting.track_classifier import (
-    build_track_level,
-)
-from app.inference.confidence import (
-    ConfidenceEngine,
-)
-from app.inference.detector_tracker import (
-    YOLOBoTSORTTracker,
-)
-from app.video.validator import (
-    VideoMetadata,
-    read_video_metadata,
-)
+from app.counting.track_classifier import build_track_level
+from app.inference.confidence import ConfidenceEngine
+from app.inference.detector_tracker import YOLOBoTSORTTracker
+from app.video.validator import VideoMetadata, read_video_metadata
 
 
-ProgressCallback = Callable[
-    [float, str],
-    None,
-]
+ProgressCallback = Callable[[float, str], None]
 
 
 @dataclass(frozen=True)
@@ -49,619 +34,267 @@ class CountingResult:
 
 class TrafficCountingEngine:
     """
-    Production orchestration layer.
+    Production orchestration layer for the robust branch.
 
-    Pipeline:
+    Pipeline
+    --------
+    Video validation
+        ↓
+    Phase 1 — YOLO26m + existing BoT-SORT adapter
+        ↓
+    Phase 2 — track-level class assignment
+        ↓
+    Phase 3 — RobustCrossing/TrafficCounter
+        ↓
+    Phase 6B — confidence
+        ↓
+    Optional Phase 6C — annotated video
 
-        Video validation
-            ↓
-        Phase 1 — YOLO26m + BoT-SORT
-            ↓
-        Phase 2 — Track-level class
-            ↓
-        Phase 3 — Robust crossing/counting
-            ↓
-        Phase 6B — Confidence
-            ↓
-        Optional Phase 6C — Video rendering
+    Compatibility rule
+    ------------------
+    This engine intentionally does NOT pass `vid_stride` to
+    YOLOBoTSORTTracker because the tracker constructor currently
+    used by the robust branch does not accept that keyword.
 
-    IMPORTANT
-    ---------
-    The currently active detector_tracker.py constructor does
-    NOT accept vid_stride.
-
-    Therefore this engine deliberately does NOT pass:
-        vid_stride=...
-
-    The configuration keeps vid_stride available for the future
-    tracker implementation that supports it.
+    `vid_stride` remains in config for future tracker integration,
+    but it is not silently sent to an incompatible constructor.
     """
 
-    def __init__(
-        self,
-        config: AppConfig | None = None,
-    ) -> None:
+    def __init__(self, config: AppConfig | None = None) -> None:
+        self.config = config or build_config()
 
-        self.config = (
-            config
-            or build_config()
-        )
-
-    # ========================================================
-    # VIDEO VALIDATION
-    # ========================================================
-
-    def validate(
-        self,
-        video_path: str | Path,
-    ) -> VideoMetadata:
-
-        return read_video_metadata(
-            video_path
-        )
-
-    # ========================================================
-    # PROGRESS
-    # ========================================================
+    def validate(self, video_path: str | Path) -> VideoMetadata:
+        return read_video_metadata(video_path)
 
     @staticmethod
     def _report(
-        progress_callback: (
-            ProgressCallback | None
-        ),
+        progress_callback: ProgressCallback | None,
         progress: float,
         description: str,
     ) -> None:
-
         if progress_callback is None:
             return
-
         progress_callback(
-            max(
-                0.0,
-                min(
-                    1.0,
-                    progress,
-                ),
-            ),
+            max(0.0, min(1.0, float(progress))),
             description,
         )
 
-    # ========================================================
-    # SAFE DIRECTION COUNTS
-    # ========================================================
-
     @staticmethod
-    def _build_direction_counts(
+    def _safe_direction_counts(
         final_crossings: pd.DataFrame,
     ) -> pd.DataFrame:
-
-        columns = [
-            "track_class",
-            "direction",
-            "count",
-        ]
-
+        columns = ["track_class", "direction", "count"]
         if final_crossings.empty:
-            return pd.DataFrame(
-                columns=columns
-            )
+            return pd.DataFrame(columns=columns)
 
-        required = {
-            "track_class",
-            "direction",
-        }
-
-        missing = (
-            required
-            -
-            set(
-                final_crossings.columns
-            )
-        )
-
+        required = {"track_class", "direction"}
+        missing = required - set(final_crossings.columns)
         if missing:
             raise ValueError(
-                "final_crossings missing "
-                "direction columns: "
+                "final_crossings missing direction columns: "
                 f"{sorted(missing)}"
             )
 
         return (
             final_crossings
-            .groupby(
-                [
-                    "track_class",
-                    "direction",
-                ],
-                dropna=False,
-            )
+            .groupby(["track_class", "direction"], dropna=False)
             .size()
             .rename("count")
             .reset_index()
         )
-
-    # ========================================================
-    # TRACK AUDIT
-    # ========================================================
 
     @staticmethod
     def _save_track_audit(
         counting_result,
         output_dir: Path,
     ) -> Path | None:
-
-        track_audit = getattr(
-            counting_result,
-            "track_audit",
-            None,
-        )
-
-        if (
-            track_audit is None
-            or
-            not isinstance(
-                track_audit,
-                pd.DataFrame,
-            )
-        ):
+        track_audit = getattr(counting_result, "track_audit", None)
+        if track_audit is None or not isinstance(track_audit, pd.DataFrame):
             return None
 
-        path = (
-            output_dir
-            /
-            "track_crossing_audit.csv"
-        )
-
-        track_audit.to_csv(
-            path,
-            index=False,
-        )
-
+        path = output_dir / "track_crossing_audit.csv"
+        track_audit.to_csv(path, index=False)
         return path
-
-    # ========================================================
-    # PROCESS
-    # ========================================================
 
     def process(
         self,
         video_path: str | Path,
         *,
         render_video: bool = False,
-        progress_callback: (
-            ProgressCallback | None
-        ) = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> CountingResult:
-
-        video_path = Path(
-            video_path
-        )
-
+        video_path = Path(video_path)
         if not video_path.exists():
-            raise FileNotFoundError(
-                f"Video not found: "
-                f"{video_path}"
-            )
+            raise FileNotFoundError(f"Video not found: {video_path}")
 
-        total_start = (
-            time.perf_counter()
-        )
+        total_start = time.perf_counter()
 
-        # ====================================================
+        # =====================================================
         # VIDEO VALIDATION
-        # ====================================================
-
-        self._report(
-            progress_callback,
-            0.01,
-            "Validating video...",
-        )
-
-        metadata = self.validate(
-            video_path
-        )
+        # =====================================================
+        self._report(progress_callback, 0.01, "Validating video...")
+        metadata = self.validate(video_path)
 
         if metadata.fps <= 0:
+            raise ValueError(f"Invalid FPS: {metadata.fps}")
+        if metadata.width <= 0 or metadata.height <= 0:
             raise ValueError(
-                f"Invalid FPS: "
-                f"{metadata.fps}"
-            )
-
-        if (
-            metadata.width <= 0
-            or
-            metadata.height <= 0
-        ):
-            raise ValueError(
-                "Invalid video dimensions: "
-                f"{metadata.width}x"
-                f"{metadata.height}"
+                f"Invalid video dimensions: {metadata.width}x{metadata.height}"
             )
 
         self._report(
             progress_callback,
             0.05,
             (
-                f"Video validated: "
-                f"{metadata.width}x"
-                f"{metadata.height}, "
-                f"{metadata.fps:.2f} FPS, "
-                f"{metadata.frame_count:,} frames"
+                f"Video validated: {metadata.width}x{metadata.height}, "
+                f"{metadata.fps:.2f} FPS, {metadata.frame_count:,} frames"
             ),
         )
 
-        # ====================================================
+        # =====================================================
         # OUTPUT DIRECTORY
-        # ====================================================
+        # =====================================================
+        output_dir = Path(self.config.output_dir) / video_path.stem
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        output_dir = (
-            Path(
-                self.config.output_dir
-            )
-            /
-            video_path.stem
-        )
-
-        output_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        # ====================================================
-        # PHASE 1
-        # YOLO26m + BoT-SORT
-        # ====================================================
-
-        phase1_start = (
-            time.perf_counter()
-        )
-
+        # =====================================================
+        # PHASE 1 — DETECTION + TRACKING
+        # =====================================================
+        phase1_start = time.perf_counter()
         self._report(
             progress_callback,
             0.08,
-            (
-                "Starting YOLO26m "
-                "+ BoT-SORT..."
-            ),
+            "Starting YOLO26m + BoT-SORT...",
         )
 
-        # ----------------------------------------------------
-        # IMPORTANT
-        #
-        # Do NOT pass vid_stride here.
-        #
-        # Current detector_tracker.py does not accept it.
-        # ----------------------------------------------------
-
+        # IMPORTANT: do not pass vid_stride here.
+        # The currently active detector_tracker.py constructor
+        # accepts model_name/tracker/imgsz/conf/iou/target_classes/device.
         tracker = YOLOBoTSORTTracker(
-
-            model_name=(
-                self.config
-                .detection
-                .model_name
-            ),
-
-            tracker=(
-                self.config
-                .detection
-                .tracker
-            ),
-
-            imgsz=(
-                self.config
-                .detection
-                .imgsz
-            ),
-
-            conf=(
-                self.config
-                .detection
-                .conf_threshold
-            ),
-
-            iou=(
-                self.config
-                .detection
-                .iou_threshold
-            ),
-
-            target_classes=set(
-                self.config
-                .target_classes
-            ),
-
-            device=(
-                self.config
-                .detection
-                .device
-            ),
+            model_name=self.config.detection.model_name,
+            tracker=self.config.detection.tracker,
+            imgsz=self.config.detection.imgsz,
+            conf=self.config.detection.conf_threshold,
+            iou=self.config.detection.iou_threshold,
+            target_classes=set(self.config.target_classes),
+            device=self.config.detection.device,
         )
 
         tracks_raw = tracker.run(
             video_path,
             fps=metadata.fps,
-            total_frames=(
-                metadata.frame_count
-            ),
+            total_frames=metadata.frame_count,
             progress_callback=(
-                lambda p, d:
-                self._report(
+                lambda p, d: self._report(
                     progress_callback,
-                    0.08
-                    +
-                    (
-                        p * 0.67
-                    ),
+                    0.08 + p * 0.67,
                     d,
                 )
             ),
         )
 
-        phase1_elapsed = (
-            time.perf_counter()
-            -
-            phase1_start
-        )
+        phase1_elapsed = time.perf_counter() - phase1_start
 
         if tracks_raw.empty:
             raise RuntimeError(
-                "No target objects were "
-                "tracked in the input video."
+                "No target objects were tracked in the input video."
             )
 
-        tracks_raw.to_csv(
-            output_dir
-            /
-            "tracks_raw.csv",
-            index=False,
-        )
+        tracks_raw.to_csv(output_dir / "tracks_raw.csv", index=False)
 
-        # ====================================================
-        # PHASE 2
-        # TRACK-LEVEL CLASS
-        # ====================================================
-
-        phase2_start = (
-            time.perf_counter()
-        )
-
+        # =====================================================
+        # PHASE 2 — TRACK-LEVEL CLASSIFICATION
+        # =====================================================
+        phase2_start = time.perf_counter()
         self._report(
             progress_callback,
             0.77,
-            (
-                "Building track-level "
-                "classes..."
-            ),
+            "Building track-level classes...",
         )
 
-        (
-            track_level,
-            tracks_phase2,
-        ) = build_track_level(
+        track_level, tracks_phase2 = build_track_level(
             tracks_raw,
             fps=metadata.fps,
         )
 
-        phase2_elapsed = (
-            time.perf_counter()
-            -
-            phase2_start
-        )
+        phase2_elapsed = time.perf_counter() - phase2_start
 
         track_level.to_csv(
-            output_dir
-            /
-            "track_quality_summary.csv",
+            output_dir / "track_quality_summary.csv",
             index=False,
         )
-
         tracks_phase2.to_csv(
-            output_dir
-            /
-            "tracks_with_track_class.csv",
+            output_dir / "tracks_with_track_class.csv",
             index=False,
         )
 
-        # ====================================================
-        # PHASE 3
-        # ROBUST CROSSING
-        # ====================================================
-
-        phase3_start = (
-            time.perf_counter()
-        )
-
+        # =====================================================
+        # PHASE 3 — ROBUST COUNTING
+        # =====================================================
+        phase3_start = time.perf_counter()
         self._report(
             progress_callback,
             0.83,
-            (
-                "Running robust "
-                "crossing engine..."
-            ),
+            "Running robust vehicle crossing engine...",
         )
 
-        # ----------------------------------------------------
-        # Counting line
-        # ----------------------------------------------------
+        line_x1 = metadata.width * self.config.counting.line_x1_ratio
+        line_y1 = metadata.height * self.config.counting.line_y1_ratio
+        line_x2 = metadata.width * self.config.counting.line_x2_ratio
+        line_y2 = metadata.height * self.config.counting.line_y2_ratio
 
-        line_x1 = (
-            metadata.width
-            *
-            self.config
-            .counting
-            .line_x1_ratio
-        )
-
-        line_y1 = (
-            metadata.height
-            *
-            self.config
-            .counting
-            .line_y1_ratio
-        )
-
-        line_x2 = (
-            metadata.width
-            *
-            self.config
-            .counting
-            .line_x2_ratio
-        )
-
-        line_y2 = (
-            metadata.height
-            *
-            self.config
-            .counting
-            .line_y2_ratio
-        )
-
-        # ----------------------------------------------------
-        # TrafficCounter
-        #
-        # These arguments exactly match the robust counter
-        # constructor currently being used.
-        # ----------------------------------------------------
-
+        # These are the parameters supported by the current
+        # robust TrafficCounter implementation.
         counter = TrafficCounter(
-
             line_x1=line_x1,
-
             line_y1=line_y1,
-
             line_x2=line_x2,
-
             line_y2=line_y2,
-
-            line_deadband_px=(
-                self.config
-                .counting
-                .line_deadband_px
-            ),
-
-            max_trajectory_gap_sec=(
-                self.config
-                .counting
-                .max_trajectory_gap_sec
-            ),
-
-            moto_dedup_time_sec=(
-                self.config
-                .counting
-                .moto_dedup_time_sec
-            ),
-
-            moto_dedup_distance_px=(
-                self.config
-                .counting
-                .moto_dedup_distance_px
-            ),
-
-            vehicle_classes=set(
-                self.config
-                .vehicle_classes
-            ),
-
+            line_deadband_px=self.config.counting.line_deadband_px,
+            max_trajectory_gap_sec=self.config.counting.max_trajectory_gap_sec,
+            moto_dedup_time_sec=self.config.counting.moto_dedup_time_sec,
+            moto_dedup_distance_px=self.config.counting.moto_dedup_distance_px,
+            vehicle_classes=set(self.config.vehicle_classes),
             fps=metadata.fps,
-
-            # ------------------------------------------------
-            # Robust crossing
-            # ------------------------------------------------
-
-            crossing_corridor_px=(
-                self.config
-                .counting
-                .crossing_corridor_px
-            ),
-
+            crossing_corridor_px=self.config.counting.crossing_corridor_px,
             min_direction_displacement_px=(
-                self.config
-                .counting
-                .min_direction_displacement_px
+                self.config.counting.min_direction_displacement_px
             ),
-
-            direction_window=(
-                self.config
-                .counting
-                .direction_window
-            ),
-
-            # ------------------------------------------------
-            # Conservative final dedup
-            # ------------------------------------------------
-
-            duplicate_time_sec=(
-                self.config
-                .counting
-                .duplicate_time_sec
-            ),
-
-            duplicate_distance_px=(
-                self.config
-                .counting
-                .duplicate_distance_px
-            ),
+            direction_window=self.config.counting.direction_window,
+            duplicate_time_sec=self.config.counting.duplicate_time_sec,
+            duplicate_distance_px=self.config.counting.duplicate_distance_px,
         )
 
-        counting_result = (
-            counter.count(
-                tracks_phase2
-            )
-        )
+        counting_result = counter.count(tracks_phase2)
+        phase3_elapsed = time.perf_counter() - phase3_start
 
-        phase3_elapsed = (
-            time.perf_counter()
-            -
-            phase3_start
-        )
-
-        # ====================================================
+        # =====================================================
         # SAVE PHASE 3 ARTIFACTS
-        # ====================================================
-
+        # =====================================================
         counting_result.crossing_events.to_csv(
-            output_dir
-            /
-            "crossing_events.csv",
+            output_dir / "crossing_events.csv",
             index=False,
         )
-
         counting_result.vehicle_events.to_csv(
-            output_dir
-            /
-            "vehicle_events.csv",
+            output_dir / "vehicle_events.csv",
             index=False,
         )
-
         counting_result.final_crossings.to_csv(
-            output_dir
-            /
-            "final_vehicle_crossings.csv",
+            output_dir / "final_vehicle_crossings.csv",
             index=False,
         )
 
-        direction_counts_df = (
-            self
-            ._build_direction_counts(
-                counting_result
-                .final_crossings
-            )
+        direction_counts_df = self._safe_direction_counts(
+            counting_result.final_crossings
         )
-
         direction_counts_df.to_csv(
-            output_dir
-            /
-            "vehicle_direction_counts.csv",
+            output_dir / "vehicle_direction_counts.csv",
             index=False,
         )
 
-        track_audit_path = (
-            self
-            ._save_track_audit(
-                counting_result,
-                output_dir,
-            )
+        track_audit_path = self._save_track_audit(
+            counting_result,
+            output_dir,
         )
 
         final_counts_df = pd.DataFrame(
@@ -670,34 +303,19 @@ class TrafficCountingEngine:
                     "class": class_name,
                     "quantity": quantity,
                 }
-
-                for (
-                    class_name,
-                    quantity,
-                )
-                in (
-                    counting_result
-                    .counts
-                    .items()
-                )
+                for class_name, quantity in counting_result.counts.items()
             ]
         )
-
         final_counts_df.to_csv(
-            output_dir
-            /
-            "final_vehicle_counts.csv",
+            output_dir / "final_vehicle_counts.csv",
             index=False,
         )
 
         with open(
-            output_dir
-            /
-            "phase3_audit.json",
+            output_dir / "phase3_audit.json",
             "w",
             encoding="utf-8",
         ) as f:
-
             json.dump(
                 counting_result.audit,
                 f,
@@ -706,131 +324,68 @@ class TrafficCountingEngine:
                 default=str,
             )
 
-        # ====================================================
-        # PHASE 6B
-        # CONFIDENCE
-        # ====================================================
-
-        confidence_start = (
-            time.perf_counter()
-        )
-
+        # =====================================================
+        # PHASE 6B — CONFIDENCE
+        # =====================================================
+        confidence_start = time.perf_counter()
         self._report(
             progress_callback,
             0.88,
             "Calculating confidence...",
         )
 
-        confidence_engine = (
-            ConfidenceEngine()
+        confidence_engine = ConfidenceEngine()
+
+        track_confidence = confidence_engine.build_track_confidence(
+            track_level
         )
 
-        track_confidence = (
-            confidence_engine
-            .build_track_confidence(
-                track_level
-            )
+        crossing_confidence = confidence_engine.build_crossing_confidence(
+            final_crossings=counting_result.final_crossings,
+            trajectory=counting_result.trajectory,
+            track_confidence=track_confidence,
+            fps=metadata.fps,
         )
 
-        crossing_confidence = (
-            confidence_engine
-            .build_crossing_confidence(
-                final_crossings=(
-                    counting_result
-                    .final_crossings
-                ),
-
-                trajectory=(
-                    counting_result
-                    .trajectory
-                ),
-
-                track_confidence=(
-                    track_confidence
-                ),
-
-                fps=metadata.fps,
-            )
+        count_confidence = confidence_engine.build_count_confidence(
+            crossing_confidence=crossing_confidence,
+            final_counts=counting_result.counts,
         )
 
-        count_confidence = (
-            confidence_engine
-            .build_count_confidence(
-                crossing_confidence=(
-                    crossing_confidence
-                ),
-
-                final_counts=(
-                    counting_result
-                    .counts
-                ),
-            )
+        overall_confidence = confidence_engine.build_overall_confidence(
+            crossing_confidence
         )
 
-        overall_confidence = (
-            confidence_engine
-            .build_overall_confidence(
-                crossing_confidence
-            )
-        )
-
-        confidence_elapsed = (
-            time.perf_counter()
-            -
-            confidence_start
-        )
-
-        # ----------------------------------------------------
-        # Save confidence artifacts
-        # ----------------------------------------------------
+        confidence_elapsed = time.perf_counter() - confidence_start
 
         track_confidence.to_csv(
-            output_dir
-            /
-            "track_confidence.csv",
+            output_dir / "track_confidence.csv",
             index=False,
         )
-
         crossing_confidence.to_csv(
-            output_dir
-            /
-            "crossing_confidence.csv",
+            output_dir / "crossing_confidence.csv",
+            index=False,
+        )
+        pd.DataFrame(count_confidence).to_csv(
+            output_dir / "count_confidence.csv",
             index=False,
         )
 
-        pd.DataFrame(
-            count_confidence
-        ).to_csv(
-            output_dir
-            /
-            "count_confidence.csv",
-            index=False,
-        )
-
-        # ====================================================
-        # OPTIONAL PHASE 6C
-        # VIDEO RENDERING
-        # ====================================================
-
-        annotated_video_path = None
-
+        # =====================================================
+        # OPTIONAL PHASE 6C — RENDERING
+        # =====================================================
+        annotated_video_path: Path | None = None
         rendering_elapsed = 0.0
 
         if render_video:
-
             self._report(
                 progress_callback,
                 0.94,
                 "Rendering annotated video...",
             )
+            render_start = time.perf_counter()
 
-            render_start = (
-                time.perf_counter()
-            )
-
-            from app.video.renderer import (
-                VideoRenderer,
-            )
+            from app.video.renderer import VideoRenderer
 
             renderer = VideoRenderer(
                 line_x1=line_x1,
@@ -839,296 +394,114 @@ class TrafficCountingEngine:
                 line_y2=line_y2,
             )
 
-            annotated_video_path = (
-                renderer.render(
-                    input_path=video_path,
-
-                    output_path=(
-                        output_dir
-                        /
-                        "annotated_video.mp4"
-                    ),
-
-                    fps=metadata.fps,
-
-                    width=metadata.width,
-
-                    height=metadata.height,
-
-                    total_frames=(
-                        metadata.frame_count
-                    ),
-
-                    tracks_phase2=(
-                        tracks_phase2
-                    ),
-
-                    final_crossings=(
-                        counting_result
-                        .final_crossings
-                    ),
-
-                    progress_callback=(
-                        lambda p, d:
-                        self._report(
-                            progress_callback,
-                            0.94
-                            +
-                            (
-                                p * 0.05
-                            ),
-                            d,
-                        )
-                    ),
-                )
+            annotated_video_path = renderer.render(
+                input_path=video_path,
+                output_path=output_dir / "annotated_video.mp4",
+                fps=metadata.fps,
+                width=metadata.width,
+                height=metadata.height,
+                total_frames=metadata.frame_count,
+                tracks_phase2=tracks_phase2,
+                final_crossings=counting_result.final_crossings,
+                progress_callback=(
+                    lambda p, d: self._report(
+                        progress_callback,
+                        0.94 + p * 0.05,
+                        d,
+                    )
+                ),
             )
 
-            rendering_elapsed = (
-                time.perf_counter()
-                -
-                render_start
-            )
+            rendering_elapsed = time.perf_counter() - render_start
 
-        # ====================================================
-        # FINAL METRICS
-        # ====================================================
-
-        total_elapsed = (
-            time.perf_counter()
-            -
-            total_start
-        )
-
+        # =====================================================
+        # FINAL RESULT
+        # =====================================================
+        total_elapsed = time.perf_counter() - total_start
         processing_fps = (
-            metadata.frame_count
-            /
-            total_elapsed
+            metadata.frame_count / total_elapsed
             if total_elapsed > 0
             else None
         )
 
         video_info = {
-            "filename":
-                metadata.filename,
-
-            "width":
-                metadata.width,
-
-            "height":
-                metadata.height,
-
-            "fps":
-                metadata.fps,
-
-            "frame_count":
-                metadata.frame_count,
-
-            "duration_sec":
-                metadata.duration_sec,
+            "filename": metadata.filename,
+            "width": metadata.width,
+            "height": metadata.height,
+            "fps": metadata.fps,
+            "frame_count": metadata.frame_count,
+            "duration_sec": metadata.duration_sec,
         }
 
         artifacts = {
-            "result_json": str(
-                output_dir
-                /
-                "result.json"
-            ),
-
-            "count_csv": str(
-                output_dir
-                /
-                "final_vehicle_counts.csv"
-            ),
-
-            "direction_csv": str(
-                output_dir
-                /
-                "vehicle_direction_counts.csv"
-            ),
-
-            "count_confidence_csv": str(
-                output_dir
-                /
-                "count_confidence.csv"
-            ),
-
-            "crossing_events_csv": str(
-                output_dir
-                /
-                "crossing_events.csv"
-            ),
-
-            "vehicle_events_csv": str(
-                output_dir
-                /
-                "vehicle_events.csv"
-            ),
-
+            "result_json": str(output_dir / "result.json"),
+            "count_csv": str(output_dir / "final_vehicle_counts.csv"),
+            "direction_csv": str(output_dir / "vehicle_direction_counts.csv"),
+            "count_confidence_csv": str(output_dir / "count_confidence.csv"),
+            "crossing_events_csv": str(output_dir / "crossing_events.csv"),
+            "vehicle_events_csv": str(output_dir / "vehicle_events.csv"),
             "final_crossings_csv": str(
-                output_dir
-                /
-                "final_vehicle_crossings.csv"
+                output_dir / "final_vehicle_crossings.csv"
             ),
-
             "track_crossing_audit_csv": (
-                str(
-                    track_audit_path
-                )
-                if track_audit_path
-                is not None
+                str(track_audit_path)
+                if track_audit_path is not None
                 else None
             ),
-
             "annotated_video": (
-                str(
-                    annotated_video_path
-                )
-                if annotated_video_path
-                is not None
+                str(annotated_video_path)
+                if annotated_video_path is not None
                 else None
             ),
         }
 
         performance = {
-
-            "total_processing_time_sec":
-                total_elapsed,
-
-            "processing_fps":
-                processing_fps,
-
-            "phase1_inference_time_sec":
-                phase1_elapsed,
-
-            "phase2_classification_time_sec":
-                phase2_elapsed,
-
-            "phase3_counting_time_sec":
-                phase3_elapsed,
-
-            "phase6b_confidence_time_sec":
-                confidence_elapsed,
-
-            "rendering_time_sec":
-                rendering_elapsed,
-
-            "model":
-                self.config
-                .detection
-                .model_name,
-
-            "tracker":
-                self.config
-                .detection
-                .tracker,
-
-            "imgsz":
-                self.config
-                .detection
-                .imgsz,
-
-            "configured_vid_stride":
-                self.config
-                .detection
-                .vid_stride,
-
-            "conf_threshold":
-                self.config
-                .detection
-                .conf_threshold,
-
-            "iou_threshold":
-                self.config
-                .detection
-                .iou_threshold,
-
-            "line_deadband_px":
-                self.config
-                .counting
-                .line_deadband_px,
-
-            "crossing_corridor_px":
-                self.config
-                .counting
-                .crossing_corridor_px,
-
-            "duplicate_time_sec":
-                self.config
-                .counting
-                .duplicate_time_sec,
-
-            "duplicate_distance_px":
-                self.config
-                .counting
-                .duplicate_distance_px,
+            "total_processing_time_sec": total_elapsed,
+            "processing_fps": processing_fps,
+            "phase1_inference_time_sec": phase1_elapsed,
+            "phase2_classification_time_sec": phase2_elapsed,
+            "phase3_counting_time_sec": phase3_elapsed,
+            "phase6b_confidence_time_sec": confidence_elapsed,
+            "rendering_time_sec": rendering_elapsed,
+            "model": self.config.detection.model_name,
+            "tracker": self.config.detection.tracker,
+            "imgsz": self.config.detection.imgsz,
+            "configured_vid_stride": self.config.detection.vid_stride,
+            "configured_conf_threshold": self.config.detection.conf_threshold,
+            "configured_iou_threshold": self.config.detection.iou_threshold,
+            "crossing_corridor_px": self.config.counting.crossing_corridor_px,
+            "line_deadband_px": self.config.counting.line_deadband_px,
+            "duplicate_time_sec": self.config.counting.duplicate_time_sec,
+            "duplicate_distance_px": self.config.counting.duplicate_distance_px,
         }
 
         direction_counts = [
             {
-                "track_class":
-                    row[
-                        "track_class"
-                    ],
-
-                "direction":
-                    row[
-                        "direction"
-                    ],
-
-                "count":
-                    int(
-                        row["count"]
-                    ),
+                "track_class": row["track_class"],
+                "direction": row["direction"],
+                "count": int(row["count"]),
             }
-
-            for _, row
-            in (
-                direction_counts_df
-                .iterrows()
-            )
+            for _, row in direction_counts_df.iterrows()
         ]
 
         result_json = {
-
-            "status":
-                "completed",
-
-            "video":
-                video_info,
-
-            "counts":
-                counting_result.counts,
-
-            "count_confidence":
-                count_confidence,
-
-            "overall_confidence":
-                overall_confidence,
-
-            "direction_counts":
-                direction_counts,
-
-            "total":
-                counting_result.total,
-
-            "performance":
-                performance,
-
-            "audit":
-                counting_result.audit,
-
-            "artifacts":
-                artifacts,
+            "status": "completed",
+            "video": video_info,
+            "counts": counting_result.counts,
+            "count_confidence": count_confidence,
+            "overall_confidence": overall_confidence,
+            "direction_counts": direction_counts,
+            "total": counting_result.total,
+            "performance": performance,
+            "audit": counting_result.audit,
+            "artifacts": artifacts,
         }
 
         with open(
-            output_dir
-            /
-            "result.json",
+            output_dir / "result.json",
             "w",
             encoding="utf-8",
         ) as f:
-
             json.dump(
                 result_json,
                 f,
@@ -1137,107 +510,47 @@ class TrafficCountingEngine:
                 default=str,
             )
 
-        # ====================================================
-        # COMPLETE
-        # ====================================================
-
         self._report(
             progress_callback,
             1.0,
             "Processing complete.",
         )
 
-        # ====================================================
-        # CLI REPORT
-        # ====================================================
+        # =====================================================
+        # CONSOLE REPORT
+        # =====================================================
+        print("\n" + "=" * 70)
+        print("FINAL VEHICLE COUNT")
+        print("=" * 70)
 
-        print(
-            "\n"
-            +
-            "=" * 70
-        )
+        for class_name, count in counting_result.counts.items():
+            print(f"{class_name:<15}: {count}")
 
-        print(
-            "FINAL VEHICLE COUNT"
-        )
+        print("-" * 70)
+        print(f"{'TOTAL VEHICLES':<15}: {counting_result.total}")
 
-        print(
-            "=" * 70
-        )
-
-        for (
-            class_name,
-            count,
-        ) in (
-            counting_result
-            .counts
-            .items()
-        ):
-
-            print(
-                f"{class_name:<15}: "
-                f"{count}"
-            )
-
-        print(
-            "-" * 70
-        )
-
-        print(
-            f"{'TOTAL VEHICLES':<15}: "
-            f"{counting_result.total}"
-        )
-
-        print(
-            "\n"
-            +
-            "=" * 70
-        )
-
-        print(
-            "COUNT CONFIDENCE"
-        )
-
-        print(
-            "=" * 70
-        )
+        print("\n" + "=" * 70)
+        print("COUNT CONFIDENCE")
+        print("=" * 70)
 
         for row in count_confidence:
-
-            confidence = (
-                row.get(
-                    "confidence"
-                )
-            )
-
+            confidence = row.get("confidence")
             confidence_text = (
                 f"{confidence:.4f}"
                 if confidence is not None
                 else "N/A"
             )
-
             print(
                 f"{row['class']:<15}: "
                 f"{confidence_text:<8} "
                 f"{row.get('flag', '')}"
             )
 
-        print(
-            "\n"
-            +
-            "=" * 70
-        )
-
-        print(
-            "COUNT BY DIRECTION"
-        )
-
-        print(
-            "=" * 70
-        )
+        print("\n" + "=" * 70)
+        print("COUNT BY DIRECTION")
+        print("=" * 70)
 
         for row in direction_counts:
-
             print(
                 f"{str(row['track_class']):<12} "
                 f"{str(row['direction']):<20} "
@@ -1245,48 +558,16 @@ class TrafficCountingEngine:
             )
 
         if track_audit_path is not None:
-
-            print(
-                "\nTrack audit:"
-            )
-
-            print(
-                track_audit_path
-            )
+            print(f"\nTrack audit: {track_audit_path}")
 
         return CountingResult(
-
             status="completed",
-
             video=video_info,
-
-            counts=(
-                counting_result
-                .counts
-            ),
-
-            direction_counts=(
-                direction_counts
-            ),
-
-            count_confidence=(
-                count_confidence
-            ),
-
-            overall_confidence=(
-                overall_confidence
-            ),
-
-            total=(
-                counting_result
-                .total
-            ),
-
-            performance=(
-                performance
-            ),
-
-            artifacts=(
-                artifacts
-            ),
+            counts=counting_result.counts,
+            direction_counts=direction_counts,
+            count_confidence=count_confidence,
+            overall_confidence=overall_confidence,
+            total=counting_result.total,
+            performance=performance,
+            artifacts=artifacts,
         )
