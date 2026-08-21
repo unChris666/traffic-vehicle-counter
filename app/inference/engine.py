@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import time
 from dataclasses import dataclass
@@ -52,12 +53,9 @@ class TrafficCountingEngine:
 
     Compatibility rule
     ------------------
-    This engine intentionally does NOT pass `vid_stride` to
-    YOLOBoTSORTTracker because the tracker constructor currently
-    used by the robust branch does not accept that keyword.
-
-    `vid_stride` remains in config for future tracker integration,
-    but it is not silently sent to an incompatible constructor.
+    The robust branch detector_tracker.py exposes a compatible
+    `vid_stride` parameter. The robust config keeps vid_stride=1
+    so Phase 1 remains baseline-like while Phase 3 is changed.
     """
 
     def __init__(self, config: AppConfig | None = None) -> None:
@@ -116,6 +114,163 @@ class TrafficCountingEngine:
         track_audit.to_csv(path, index=False)
         return path
 
+    def _build_counter(
+        self,
+        *,
+        metadata: VideoMetadata,
+    ) -> TrafficCounter:
+        """
+        Build TrafficCounter using only parameters supported by the
+        runtime counter.py.
+
+        This protects the orchestration layer from stale/mismatched
+        counter implementations while still enforcing the required
+        baseline counting interface.
+        """
+
+        line_x1 = (
+            metadata.width
+            * self.config.counting.line_x1_ratio
+        )
+
+        line_y1 = (
+            metadata.height
+            * self.config.counting.line_y1_ratio
+        )
+
+        line_x2 = (
+            metadata.width
+            * self.config.counting.line_x2_ratio
+        )
+
+        line_y2 = (
+            metadata.height
+            * self.config.counting.line_y2_ratio
+        )
+
+        candidate_kwargs = {
+            "line_x1": line_x1,
+            "line_y1": line_y1,
+            "line_x2": line_x2,
+            "line_y2": line_y2,
+            "line_deadband_px": (
+                self.config.counting.line_deadband_px
+            ),
+            "max_trajectory_gap_sec": (
+                self.config.counting.max_trajectory_gap_sec
+            ),
+            "moto_dedup_time_sec": (
+                self.config.counting.moto_dedup_time_sec
+            ),
+            "moto_dedup_distance_px": (
+                self.config.counting.moto_dedup_distance_px
+            ),
+            "vehicle_classes": set(
+                self.config.vehicle_classes
+            ),
+            "fps": metadata.fps,
+
+            # Robust crossing geometry.
+            "crossing_corridor_px": (
+                self.config.counting.crossing_corridor_px
+            ),
+            "min_direction_displacement_px": (
+                self.config.counting.min_direction_displacement_px
+            ),
+            "direction_window": (
+                self.config.counting.direction_window
+            ),
+
+            # Conservative final duplicate suppression.
+            "duplicate_time_sec": (
+                self.config.counting.duplicate_time_sec
+            ),
+            "duplicate_distance_px": (
+                self.config.counting.duplicate_distance_px
+            ),
+        }
+
+        signature = inspect.signature(
+            TrafficCounter.__init__
+        )
+
+        supported_parameters = {
+            name
+            for name in signature.parameters
+            if name != "self"
+        }
+
+        kwargs = {
+            key: value
+            for key, value in candidate_kwargs.items()
+            if key in supported_parameters
+        }
+
+        required_parameters = {
+            "line_x1",
+            "line_y1",
+            "line_x2",
+            "line_y2",
+            "line_deadband_px",
+            "max_trajectory_gap_sec",
+            "moto_dedup_time_sec",
+            "moto_dedup_distance_px",
+            "vehicle_classes",
+            "fps",
+        }
+
+        missing_required = (
+            required_parameters
+            - set(kwargs)
+        )
+
+        if missing_required:
+            raise RuntimeError(
+                "Runtime TrafficCounter interface is incompatible.\n\n"
+                f"Missing required parameters: "
+                f"{sorted(missing_required)}\n\n"
+                f"Actual signature:\n{signature}"
+            )
+
+        optional_robust = {
+            "crossing_corridor_px",
+            "min_direction_displacement_px",
+            "direction_window",
+            "duplicate_time_sec",
+            "duplicate_distance_px",
+        }
+
+        missing_robust = (
+            optional_robust
+            - set(kwargs)
+        )
+
+        print()
+        print("=" * 80)
+        print("TRAFFIC COUNTER RUNTIME INTERFACE")
+        print("=" * 80)
+        print(
+            f"Module: {TrafficCounter.__module__}"
+        )
+        print(
+            f"Signature: {signature}"
+        )
+
+        if missing_robust:
+            print(
+                "WARNING: runtime TrafficCounter is missing "
+                "robust parameters:"
+            )
+            for name in sorted(missing_robust):
+                print(f"  - {name}")
+
+        print("=" * 80)
+        print()
+
+        return TrafficCounter(
+            **kwargs
+        )
+
     def process(
         self,
         video_path: str | Path,
@@ -167,9 +322,9 @@ class TrafficCountingEngine:
             "Starting YOLO26m + BoT-SORT...",
         )
 
-        # The robust branch keeps baseline temporal sampling.
-        # vid_stride is configurable, but should remain 1 for a
-        # clean Phase-3 experiment against the baseline.
+        # Robust-branch detector_tracker.py accepts vid_stride.
+        # Keep it at the configured baseline value (robust branch:
+        # vid_stride=1) so Phase 1 remains baseline-compatible.
         tracker = YOLOBoTSORTTracker(
             model_name=self.config.detection.model_name,
             tracker=self.config.detection.tracker,
@@ -246,27 +401,13 @@ class TrafficCountingEngine:
 
         # These are the parameters supported by the current
         # robust TrafficCounter implementation.
-        counter = TrafficCounter(
-            line_x1=line_x1,
-            line_y1=line_y1,
-            line_x2=line_x2,
-            line_y2=line_y2,
-            line_deadband_px=self.config.counting.line_deadband_px,
-            max_trajectory_gap_sec=self.config.counting.max_trajectory_gap_sec,
-            moto_dedup_time_sec=self.config.counting.moto_dedup_time_sec,
-            moto_dedup_distance_px=self.config.counting.moto_dedup_distance_px,
-            vehicle_classes=set(self.config.vehicle_classes),
-            fps=metadata.fps,
-            crossing_corridor_px=self.config.counting.crossing_corridor_px,
-            min_direction_displacement_px=(
-                self.config.counting.min_direction_displacement_px
-            ),
-            direction_window=self.config.counting.direction_window,
-            duplicate_time_sec=self.config.counting.duplicate_time_sec,
-            duplicate_distance_px=self.config.counting.duplicate_distance_px,
+        counter = self._build_counter(
+            metadata=metadata
         )
 
-        counting_result = counter.count(tracks_phase2)
+        counting_result = counter.count(
+            tracks_phase2
+        )
         phase3_elapsed = time.perf_counter() - phase3_start
 
         # =====================================================
