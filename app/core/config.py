@@ -12,6 +12,11 @@ from pathlib import Path
 class DetectionConfig:
     """
     YOLO26m + BoT-SORT configuration.
+
+    The robust branch uses:
+        YOLO26m TensorRT FP16
+        BoT-SORT
+        vid_stride=2
     """
 
     # --------------------------------------------------------
@@ -37,14 +42,18 @@ class DetectionConfig:
     iou_threshold: float = 0.70
 
     # --------------------------------------------------------
-    # Reserved for the tracker implementation that supports
-    # vid_stride.
+    # Process every 2nd source frame.
     #
     # IMPORTANT:
-    # Current robust branch detector_tracker.py does NOT
-    # accept this argument yet.
+    # detector_tracker.py expects this parameter.
     #
-    # Therefore engine.py intentionally does not pass it.
+    # Source frame IDs are preserved, so:
+    #
+    # 1, 3, 5, 7, ...
+    #
+    # rather than:
+    #
+    # 1, 2, 3, 4, ...
     # --------------------------------------------------------
 
     vid_stride: int = 2
@@ -65,91 +74,168 @@ class CountingConfig:
     """
     Robust Phase 3 counting configuration.
 
-    Pipeline:
-
-        counting line
-            ↓
-        robust crossing geometry
-            ↓
-        direction validation
-            ↓
-        duplicate protection
-            ↓
-        final vehicle count
+    Counting line
+        ↓
+    Crossing geometry
+        ↓
+    Crossing identity
+        ↓
+    Physical vehicle counting
     """
 
     # ========================================================
     # COUNTING LINE
     # ========================================================
 
-    # Current project line for 1280x720:
+    # Current project line:
     #
     # (1216, 144)
     #      ↓
     # (64, 684)
+    #
+    # for a 1280x720 video.
 
     line_x1_ratio: float = 0.95
+
     line_y1_ratio: float = 0.20
 
     line_x2_ratio: float = 0.05
+
     line_y2_ratio: float = 0.95
 
-    # ========================================================
-    # LINE GEOMETRY
-    # ========================================================
+    # --------------------------------------------------------
+    # Deadband around counting line.
+    # --------------------------------------------------------
 
-    # Small deadband around the counting line.
     line_deadband_px: float = 8.0
 
     # ========================================================
-    # TRACK TRAJECTORY
+    # TRAJECTORY
     # ========================================================
 
-    # Maximum allowed gap between consecutive observations
-    # used by the robust crossing detector.
+    # Because vid_stride=2:
+    #
+    # two observations are approximately:
+    #
+    # 2 / FPS seconds apart.
+    #
+    # 1.5 sec is intentionally generous for temporary
+    # detector/tracker gaps.
+
     max_trajectory_gap_sec: float = 1.50
 
     # ========================================================
     # MOTORCYCLE FRAGMENTATION
     # ========================================================
 
-    # Existing configuration retained for compatibility.
+    # Legacy compatibility.
+    #
+    # These are still passed into TrafficCounter.
+    #
+    # The robust identity engine should be responsible for
+    # physical identity matching.
+
     moto_dedup_time_sec: float = 1.20
+
     moto_dedup_distance_px: float = 90.0
+
+    # ========================================================
+    # CROSSING IDENTITY
+    # ========================================================
+
+    # --------------------------------------------------------
+    # Distance at which a track becomes relevant to crossing.
+    #
+    # This is NOT the counting corridor.
+    #
+    # It is used for identity/reconnection logic.
+    # --------------------------------------------------------
+
+    pre_crossing_distance_px: float = 120.0
+
+    # --------------------------------------------------------
+    # Maximum time gap between fragments that may belong to
+    # the same physical vehicle.
+    # --------------------------------------------------------
+
+    max_identity_reconnect_gap_sec: float = 0.75
+
+    # --------------------------------------------------------
+    # Maximum spatial distance between the end of an old
+    # fragment and the beginning of a new fragment.
+    # --------------------------------------------------------
+
+    max_identity_reconnect_distance_px: float = 75.0
+
+    # --------------------------------------------------------
+    # Identity matching score threshold.
+    # --------------------------------------------------------
+
+    identity_match_threshold: float = 0.82
+
+    # --------------------------------------------------------
+    # Required margin between best and second-best identity.
+    #
+    # This is VERY important for your:
+    #
+    # "2 motorcycles enter simultaneously"
+    #
+    # scenario.
+    #
+    # If two identities have similar scores, the new fragment
+    # should NOT automatically be merged.
+    # --------------------------------------------------------
+
+    identity_match_margin: float = 0.08
+
+    # --------------------------------------------------------
+    # Velocity gate.
+    #
+    # Maximum expected position discrepancy per source frame.
+    # --------------------------------------------------------
+
+    velocity_gate_px_per_frame: float = 30.0
+
+    # --------------------------------------------------------
+    # Minimum observations before considering a fragment a
+    # reliable pre-crossing identity.
+    # --------------------------------------------------------
+
+    min_pre_crossing_observations: int = 3
 
     # ========================================================
     # ROBUST CROSSING GEOMETRY
     # ========================================================
 
-    # Corridor around counting line.
-    #
-    # This helps when a fast vehicle has only a few useful
-    # observations around the line.
+    # Additional corridor around the counting line.
+
     crossing_corridor_px: float = 45.0
 
-    # Minimum displacement required to infer direction from
-    # motion.
+    # Minimum trajectory displacement required to infer
+    # direction from motion.
+
     min_direction_displacement_px: float = 8.0
 
-    # Number of observations before/after crossing used for
-    # direction estimation.
+    # Number of observations around crossing used for
+    # directional validation.
+
     direction_window: int = 3
 
     # ========================================================
-    # DUPLICATE SUPPRESSION
+    # FINAL DUPLICATE SUPPRESSION
     # ========================================================
 
     # IMPORTANT:
     #
     # Keep these conservative.
     #
-    # Two real motorcycles crossing together must NOT be
-    # collapsed into one just because they are close in time.
+    # Two motorcycles crossing at approximately the same time
+    # must NOT accidentally collapse into one.
     #
-    # The robust branch therefore starts with a very small
-    # final dedup window.
+    # Identity matching should happen before final counting.
 
     duplicate_time_sec: float = 0.50
+
     duplicate_distance_px: float = 35.0
 
 
@@ -167,7 +253,7 @@ class AppConfig:
     output_dir: str = "outputs"
 
     # --------------------------------------------------------
-    # Nested configuration
+    # Nested configs
     # --------------------------------------------------------
 
     detection: DetectionConfig = field(
@@ -179,7 +265,7 @@ class AppConfig:
     )
 
     # ========================================================
-    # DETECTION TARGETS
+    # TARGET CLASSES
     # ========================================================
 
     target_classes: tuple[str, ...] = (
@@ -191,7 +277,7 @@ class AppConfig:
     )
 
     # ========================================================
-    # FINAL VEHICLE CLASSES
+    # VEHICLES
     # ========================================================
 
     vehicle_classes: tuple[str, ...] = (
