@@ -170,6 +170,29 @@ class TrafficCountingEngine:
             ),
             "fps": metadata.fps,
 
+            # Crossing identity / fragmentation.
+            "pre_crossing_distance_px": (
+                self.config.counting.pre_crossing_distance_px
+            ),
+            "max_identity_reconnect_gap_sec": (
+                self.config.counting.max_identity_reconnect_gap_sec
+            ),
+            "max_identity_reconnect_distance_px": (
+                self.config.counting.max_identity_reconnect_distance_px
+            ),
+            "identity_match_threshold": (
+                self.config.counting.identity_match_threshold
+            ),
+            "identity_match_margin": (
+                self.config.counting.identity_match_margin
+            ),
+            "velocity_gate_px_per_frame": (
+                self.config.counting.velocity_gate_px_per_frame
+            ),
+            "min_pre_crossing_observations": (
+                self.config.counting.min_pre_crossing_observations
+            ),
+
             # Robust crossing geometry.
             "crossing_corridor_px": (
                 self.config.counting.crossing_corridor_px
@@ -233,11 +256,16 @@ class TrafficCountingEngine:
             )
 
         optional_robust = {
+            "pre_crossing_distance_px",
+            "max_identity_reconnect_gap_sec",
+            "max_identity_reconnect_distance_px",
+            "identity_match_threshold",
+            "identity_match_margin",
+            "velocity_gate_px_per_frame",
+            "min_pre_crossing_observations",
             "crossing_corridor_px",
             "min_direction_displacement_px",
             "direction_window",
-            "duplicate_time_sec",
-            "duplicate_distance_px",
         }
 
         missing_robust = (
@@ -270,6 +298,57 @@ class TrafficCountingEngine:
         return TrafficCounter(
             **kwargs
         )
+
+    @staticmethod
+    def _normalize_confidence_inputs(
+        final_crossings: pd.DataFrame,
+        trajectory: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Normalize Phase-3 numeric columns before Phase-6B confidence
+        scoring so pandas nullable/object values never reach NumPy ufuncs.
+        """
+        final_crossings = final_crossings.copy()
+        trajectory = trajectory.copy()
+
+        crossing_numeric = [
+            "crossing_frame",
+            "crossing_time_sec",
+            "crossing_x",
+            "crossing_y",
+            "line_distance_px",
+            "frame_gap",
+            "track_class_ratio",
+        ]
+
+        for column in crossing_numeric:
+            if column in final_crossings.columns:
+                final_crossings[column] = pd.to_numeric(
+                    final_crossings[column],
+                    errors="coerce",
+                )
+
+        trajectory_numeric = [
+            "frame_id",
+            "timestamp_sec",
+            "bottom_center_x",
+            "bottom_center_y",
+            "line_value",
+            "line_distance_px",
+            "dx",
+            "dy",
+            "frame_delta",
+            "time_delta_sec",
+        ]
+
+        for column in trajectory_numeric:
+            if column in trajectory.columns:
+                trajectory[column] = pd.to_numeric(
+                    trajectory[column],
+                    errors="coerce",
+                )
+
+        return final_crossings, trajectory
 
     def process(
         self,
@@ -408,6 +487,15 @@ class TrafficCountingEngine:
         counting_result = counter.count(
             tracks_phase2
         )
+
+        (
+            final_crossings_for_confidence,
+            trajectory_for_confidence,
+        ) = self._normalize_confidence_inputs(
+            counting_result.final_crossings,
+            counting_result.trajectory,
+        )
+
         phase3_elapsed = time.perf_counter() - phase3_start
 
         # =====================================================
@@ -483,8 +571,8 @@ class TrafficCountingEngine:
         )
 
         crossing_confidence = confidence_engine.build_crossing_confidence(
-            final_crossings=counting_result.final_crossings,
-            trajectory=counting_result.trajectory,
+            final_crossings=final_crossings_for_confidence,
+            trajectory=trajectory_for_confidence,
             track_confidence=track_confidence,
             fps=metadata.fps,
         )
