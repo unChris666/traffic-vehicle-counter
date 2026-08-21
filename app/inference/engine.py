@@ -171,13 +171,57 @@ class TrafficCountingEngine:
         # The currently active detector_tracker.py constructor
         # accepts model_name/tracker/imgsz/conf/iou/target_classes/device.
         tracker = YOLOBoTSORTTracker(
-            model_name=self.config.detection.model_name,
-            tracker=self.config.detection.tracker,
-            imgsz=self.config.detection.imgsz,
-            conf=self.config.detection.conf_threshold,
-            iou=self.config.detection.iou_threshold,
-            target_classes=set(self.config.target_classes),
-            device=self.config.detection.device,
+            model_name=(
+                self.config
+                .detection
+                .model_name
+            ),
+        
+            tracker=(
+                self.config
+                .detection
+                .tracker
+            ),
+        
+            imgsz=(
+                self.config
+                .detection
+                .imgsz
+            ),
+        
+            conf=(
+                self.config
+                .detection
+                .conf_threshold
+            ),
+        
+            iou=(
+                self.config
+                .detection
+                .iou_threshold
+            ),
+        
+            # ========================================================
+            # IMPORTANT
+            # detector_tracker.py requires vid_stride.
+            # ========================================================
+        
+            vid_stride=(
+                self.config
+                .detection
+                .vid_stride
+            ),
+        
+            target_classes=set(
+                self.config
+                .target_classes
+            ),
+        
+            device=(
+                self.config
+                .detection
+                .device
+            ),
         )
 
         tracks_raw = tracker.run(
