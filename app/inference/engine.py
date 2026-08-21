@@ -167,61 +167,18 @@ class TrafficCountingEngine:
             "Starting YOLO26m + BoT-SORT...",
         )
 
-        # IMPORTANT: do not pass vid_stride here.
-        # The currently active detector_tracker.py constructor
-        # accepts model_name/tracker/imgsz/conf/iou/target_classes/device.
+        # The robust branch keeps baseline temporal sampling.
+        # vid_stride is configurable, but should remain 1 for a
+        # clean Phase-3 experiment against the baseline.
         tracker = YOLOBoTSORTTracker(
-            model_name=(
-                self.config
-                .detection
-                .model_name
-            ),
-        
-            tracker=(
-                self.config
-                .detection
-                .tracker
-            ),
-        
-            imgsz=(
-                self.config
-                .detection
-                .imgsz
-            ),
-        
-            conf=(
-                self.config
-                .detection
-                .conf_threshold
-            ),
-        
-            iou=(
-                self.config
-                .detection
-                .iou_threshold
-            ),
-        
-            # ========================================================
-            # IMPORTANT
-            # detector_tracker.py requires vid_stride.
-            # ========================================================
-        
-            vid_stride=(
-                self.config
-                .detection
-                .vid_stride
-            ),
-        
-            target_classes=set(
-                self.config
-                .target_classes
-            ),
-        
-            device=(
-                self.config
-                .detection
-                .device
-            ),
+            model_name=self.config.detection.model_name,
+            tracker=self.config.detection.tracker,
+            imgsz=self.config.detection.imgsz,
+            conf=self.config.detection.conf_threshold,
+            iou=self.config.detection.iou_threshold,
+            vid_stride=self.config.detection.vid_stride,
+            target_classes=set(self.config.target_classes),
+            device=self.config.detection.device,
         )
 
         tracks_raw = tracker.run(
