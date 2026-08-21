@@ -11,39 +11,56 @@ from pathlib import Path
 @dataclass(frozen=True)
 class DetectionConfig:
     """
-    YOLO26m + BoT-SORT configuration.
+    BASELINE detection configuration.
+
+    IMPORTANT:
+        Robust branch changes Phase 3 counting logic only.
+
+        Phase 1 should remain aligned with baseline:
+            YOLO26m .pt
+            BoT-SORT
+            existing inference settings
     """
 
     # --------------------------------------------------------
-    # Model
+    # YOLO26m pretrained weights
+    #
+    # Do NOT use TensorRT on robust branch.
     # --------------------------------------------------------
 
-    model_name: str = (
-        "models/yolo26m_512_fp16.engine"
-    )
-
-    tracker: str = (
-        "botsort.yaml"
-    )
+    model_name: str = "yolo26m.pt"
 
     # --------------------------------------------------------
-    # Inference
+    # Tracker
     # --------------------------------------------------------
 
-    imgsz: int = 512
+    tracker: str = "botsort.yaml"
+
+    # --------------------------------------------------------
+    # Baseline inference size
+    # --------------------------------------------------------
+
+    imgsz: int = 640
+
+    # --------------------------------------------------------
+    # Detection confidence
+    # --------------------------------------------------------
 
     conf_threshold: float = 0.20
+
+    # --------------------------------------------------------
+    # IoU
+    # --------------------------------------------------------
 
     iou_threshold: float = 0.70
 
     # --------------------------------------------------------
-    # Temporal sampling
+    # Baseline processes the source video normally.
     #
-    # Every 2nd source frame is processed.
-    # Source frame IDs remain tied to the original video.
+    # We are NOT changing temporal sampling in this branch.
     # --------------------------------------------------------
 
-    vid_stride: int = 2
+    vid_stride: int = 1
 
     # --------------------------------------------------------
     # Device
@@ -61,26 +78,19 @@ class CountingConfig:
     """
     Robust Phase 3 configuration.
 
-    Detection
-        ↓
-    Tracking
-        ↓
-    Track-level class
-        ↓
-    Robust crossing
-        ↓
-    Final vehicle count
+    Phase 1 / Phase 2 remain baseline.
+
+    Only Phase 3 crossing/counting is changed.
     """
 
     # ========================================================
     # COUNTING LINE
     # ========================================================
 
-    # 1280x720:
+    # Current project line:
+    # (1216, 144) -> (64, 684)
     #
-    # (1216, 144)
-    #      ↓
-    # (64, 684)
+    # Designed for 1280x720.
 
     line_x1_ratio: float = 0.95
     line_y1_ratio: float = 0.20
@@ -89,53 +99,59 @@ class CountingConfig:
     line_y2_ratio: float = 0.95
 
     # ========================================================
-    # LINE DEADZONE
+    # LINE DEADBAND
     # ========================================================
 
     line_deadband_px: float = 8.0
 
     # ========================================================
-    # TRAJECTORY
+    # TRACK TRAJECTORY
     # ========================================================
 
+    # Keep this reasonably permissive because temporary
+    # tracking gaps can occur during occlusion.
     max_trajectory_gap_sec: float = 1.50
 
     # ========================================================
     # LEGACY MOTORCYCLE FRAGMENTATION
     # ========================================================
 
-    moto_dedup_time_sec: float = 1.20
-
-    moto_dedup_distance_px: float = 90.0
+    # These remain for compatibility with TrafficCounter.
+    moto_dedup_time_sec: float = 0.25
+    moto_dedup_distance_px: float = 30.0
 
     # ========================================================
-    # ROBUST CROSSING
+    # ROBUST CROSSING GEOMETRY
     # ========================================================
 
+    # Wider corridor helps fast vehicles that may have sparse
+    # observations around the line.
     crossing_corridor_px: float = 45.0
 
+    # Minimum movement before direction is trusted.
     min_direction_displacement_px: float = 8.0
 
+    # Observations around crossing used for direction estimate.
     direction_window: int = 3
 
     # ========================================================
-    # FINAL DEDUP
-    # ========================================================
-    #
-    # Conservative values.
-    #
-    # IMPORTANT:
-    # Two real motorcycles crossing together must not collapse
-    # into one.
+    # FINAL DUPLICATE SUPPRESSION
     # ========================================================
 
-    duplicate_time_sec: float = 0.50
+    # VERY conservative.
+    #
+    # Goal:
+    #   two real motorcycles close together = 2
+    #
+    # Fragmentation should primarily be resolved by track
+    # continuity / identity, not by an enormous spatial window.
 
-    duplicate_distance_px: float = 35.0
+    duplicate_time_sec: float = 0.30
+    duplicate_distance_px: float = 25.0
 
 
 # ============================================================
-# APP CONFIG
+# APPLICATION CONFIG
 # ============================================================
 
 @dataclass(frozen=True)
@@ -164,7 +180,7 @@ class AppConfig:
     )
 
     # ========================================================
-    # VEHICLE CLASSES
+    # VEHICLES
     # ========================================================
 
     vehicle_classes: tuple[str, ...] = (
