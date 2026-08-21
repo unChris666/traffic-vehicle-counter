@@ -41,31 +41,85 @@ class YOLOBoTSORTTracker:
 
     def __init__(
         self,
+        *,
         model_name: str,
         tracker: str,
         imgsz: int,
         conf: float,
         iou: float,
+        vid_stride: int,
         target_classes: set[str],
         device: str = "auto",
     ) -> None:
+    
+        if imgsz <= 0:
+            raise ValueError(
+                f"imgsz must be > 0, got {imgsz}"
+            )
+    
+        if vid_stride < 1:
+            raise ValueError(
+                f"vid_stride must be >= 1, got {vid_stride}"
+            )
+    
         self.tracker = tracker
         self.imgsz = int(imgsz)
         self.conf = float(conf)
         self.iou = float(iou)
-
-        self.device = self._resolve_device(device)
-
+        self.vid_stride = int(vid_stride)
+    
+        self.device = self._resolve_device(
+            device
+        )
+    
         self.model_path = self._resolve_model_path(
             model_name
         )
-
+    
+        if not self.model_path.exists():
+            raise FileNotFoundError(
+                "TensorRT/model file not found: "
+                f"{self.model_path}\n"
+                "Export YOLO26m to TensorRT first."
+            )
+    
         self.model = YOLO(
-            str(self.model_path)
-            if self.model_path.exists()
-            else model_name
+            str(self.model_path),
+            task="detect",
         )
-
+    
+        self.target_classes = set(
+            target_classes
+        )
+    
+        if not isinstance(
+            self.model.names,
+            dict,
+        ):
+            raise TypeError(
+                "Unexpected model.names type: "
+                f"{type(self.model.names)}"
+            )
+    
+        self.class_names = self.model.names
+    
+        self.target_class_ids = {
+            int(class_id)
+            for class_id, class_name
+            in self.class_names.items()
+            if class_name in self.target_classes
+        }
+    
+        if not self.target_class_ids:
+            raise ValueError(
+                "No target classes were found "
+                "in model.names. "
+                f"Requested: "
+                f"{sorted(self.target_classes)}"
+            )
+    
+        self._processed_frames = 0
+    
         self.target_classes = set(target_classes)
 
         if not isinstance(self.model.names, dict):
