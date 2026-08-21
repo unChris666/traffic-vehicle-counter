@@ -51,9 +51,48 @@ class ConfidenceEngine:
             )
 
         result = track_level.copy()
-        result["detection_confidence"] = result["mean_confidence"].clip(0.0, 1.0)
-        result["class_confidence"] = result["track_class_ratio"].clip(0.0, 1.0)
-        result["tracking_confidence"] = result["observation_ratio"].clip(0.0, 1.0)
+
+        mean_confidence = (
+            pd.to_numeric(
+                result["mean_confidence"],
+                errors="coerce",
+            )
+            .fillna(0.0)
+        )
+
+        track_class_ratio = (
+            pd.to_numeric(
+                result["track_class_ratio"],
+                errors="coerce",
+            )
+            .fillna(0.0)
+        )
+
+        observation_ratio = (
+            pd.to_numeric(
+                result["observation_ratio"],
+                errors="coerce",
+            )
+            .fillna(0.0)
+        )
+
+        result["detection_confidence"] = (
+            mean_confidence
+            .clip(0.0, 1.0)
+            .astype("float64")
+        )
+
+        result["class_confidence"] = (
+            track_class_ratio
+            .clip(0.0, 1.0)
+            .astype("float64")
+        )
+
+        result["tracking_confidence"] = (
+            observation_ratio
+            .clip(0.0, 1.0)
+            .astype("float64")
+        )
 
         result["track_confidence"] = (
             0.40 * result["detection_confidence"]
@@ -119,14 +158,42 @@ class ConfidenceEngine:
 
         result = final_crossings.copy()
 
+        # Normalize nullable/mixed pandas values before NumPy math.
+        line_distance = (
+            pd.to_numeric(
+                result["line_distance_px"],
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .clip(lower=0.0)
+            .to_numpy(dtype=np.float64)
+        )
+
+        frame_gap = (
+            pd.to_numeric(
+                result["frame_gap"],
+                errors="coerce",
+            )
+            .fillna(np.inf)
+            .clip(lower=0.0)
+            .to_numpy(dtype=np.float64)
+        )
+
         # Farther from the line means stronger geometric evidence.
-        result["geometry_confidence"] = (
-            1.0 - np.exp(-result["line_distance_px"] / 20.0)
+        result["geometry_confidence"] = pd.Series(
+            1.0 - np.exp(
+                -line_distance / 20.0
+            ),
+            index=result.index,
+            dtype="float64",
         ).clip(0.0, 1.0)
 
-        gap_sec = result["frame_gap"] / float(fps)
-        result["temporal_confidence"] = (
-            1.0 / (1.0 + gap_sec)
+        gap_sec = frame_gap / float(fps)
+
+        result["temporal_confidence"] = pd.Series(
+            1.0 / (1.0 + gap_sec),
+            index=result.index,
+            dtype="float64",
         ).clip(0.0, 1.0)
 
         result = result.merge(
@@ -197,9 +264,14 @@ class ConfidenceEngine:
             class_events = crossing_confidence[
                 crossing_confidence["track_class"] == class_name
             ]
+            numeric_scores = pd.to_numeric(
+                class_events["crossing_confidence"],
+                errors="coerce",
+            ).dropna()
+
             score = (
-                float(class_events["crossing_confidence"].mean())
-                if not class_events.empty
+                float(numeric_scores.mean())
+                if not numeric_scores.empty
                 else None
             )
 
@@ -224,7 +296,15 @@ class ConfidenceEngine:
                 "crossing_confidence missing 'crossing_confidence' column"
             )
 
-        score = float(crossing_confidence["crossing_confidence"].mean())
+        numeric_scores = pd.to_numeric(
+            crossing_confidence["crossing_confidence"],
+            errors="coerce",
+        ).dropna()
+
+        if numeric_scores.empty:
+            return {"confidence": None, "flag": "N/A"}
+
+        score = float(numeric_scores.mean())
         return {
             "confidence": round(score, 4),
             "flag": self._flag(score),
