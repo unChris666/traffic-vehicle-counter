@@ -1,124 +1,261 @@
-# from dataclasses import dataclass, field
-# from pathlib import Path
-
-
-# @dataclass(frozen=True)
-# class DetectionConfig:
-#     model_name: str = "yolo26m.pt"
-#     tracker: str = "botsort.yaml"
-#     imgsz: int = 960
-#     conf_threshold: float = 0.25
-#     iou_threshold: float = 0.50
-#     device: str = "auto"
-
-
-# @dataclass(frozen=True)
-# class CountingConfig:
-#     line_x1_ratio: float = 0.95
-#     line_y1_ratio: float = 0.20
-#     line_x2_ratio: float = 0.05
-#     line_y2_ratio: float = 0.95
-#     line_deadband_px: float = 8.0
-#     # Defined in notebook baseline.
-#     # Currently diagnostic/config metadata only;
-#     # not used to exclude tracks from counting.
-#     min_track_observations: int = 5
-#     max_trajectory_gap_sec: float = 1.5
-#     moto_dedup_time_sec: float = 1.50
-#     moto_dedup_distance_px: float = 80.0
-
-
-# @dataclass(frozen=True)
-# class AppConfig:
-#     detection: DetectionConfig = field(default_factory=DetectionConfig)
-#     counting: CountingConfig = field(default_factory=CountingConfig)
-#     target_classes: tuple[str, ...] = (
-#         "person", "motorcycle", "car", "truck", "bus"
-#     )
-#     vehicle_classes: tuple[str, ...] = (
-#         "motorcycle", "car", "truck", "bus"
-#     )
-#     output_dir: Path = Path("outputs")
-
-
-# def build_config(output_dir: str | Path = "outputs") -> AppConfig:
-#     return AppConfig(output_dir=Path(output_dir))
-
-
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# ============================================================
+# DETECTION CONFIG
+# ============================================================
+
 @dataclass(frozen=True)
 class DetectionConfig:
-    model_name: str = "yolo26m.pt"
+    """
+    YOLO26m + BoT-SORT configuration.
 
-    tracker: str = "configs/botsort_phone.yaml"
+    The robust branch uses:
+        YOLO26m TensorRT FP16
+        BoT-SORT
+        vid_stride=2
+    """
 
-    # Native-width inference
-    imgsz: int = 1280
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
 
-    # Recall-first
-    conf_threshold: float = 0.15
+    model_name: str = (
+        "models/yolo26m_512_fp16.engine"
+    )
 
-    iou_threshold: float = 0.50
+    tracker: str = (
+        "botsort.yaml"
+    )
+
+    # --------------------------------------------------------
+    # Inference
+    # --------------------------------------------------------
+
+    imgsz: int = 512
+
+    conf_threshold: float = 0.20
+
+    iou_threshold: float = 0.70
+
+    # --------------------------------------------------------
+    # Process every 2nd source frame.
+    #
+    # IMPORTANT:
+    # detector_tracker.py expects this parameter.
+    #
+    # Source frame IDs are preserved, so:
+    #
+    # 1, 3, 5, 7, ...
+    #
+    # rather than:
+    #
+    # 1, 2, 3, 4, ...
+    # --------------------------------------------------------
+
+    vid_stride: int = 2
+
+    # --------------------------------------------------------
+    # Device
+    # --------------------------------------------------------
 
     device: str = "auto"
 
+
+# ============================================================
+# COUNTING CONFIG
+# ============================================================
+
 @dataclass(frozen=True)
 class CountingConfig:
+    """
+    Robust Phase 3 counting configuration.
 
-    # ------------------------------------------------------
-    # Counting line
-    # ------------------------------------------------------
+    Counting line
+        ↓
+    Crossing geometry
+        ↓
+    Crossing identity
+        ↓
+    Physical vehicle counting
+    """
+
+    # ========================================================
+    # COUNTING LINE
+    # ========================================================
+
+    # Current project line:
+    #
+    # (1216, 144)
+    #      ↓
+    # (64, 684)
+    #
+    # for a 1280x720 video.
 
     line_x1_ratio: float = 0.95
+
     line_y1_ratio: float = 0.20
 
     line_x2_ratio: float = 0.05
+
     line_y2_ratio: float = 0.95
 
-    line_deadband_px: float = 20.0
+    # --------------------------------------------------------
+    # Deadband around counting line.
+    # --------------------------------------------------------
 
-    # ------------------------------------------------------
-    # Existing track diagnostics
-    # ------------------------------------------------------
+    line_deadband_px: float = 8.0
 
-    min_track_observations: int = 5
+    # ========================================================
+    # TRAJECTORY
+    # ========================================================
 
-    max_trajectory_gap_sec: float = 1.0
+    # Because vid_stride=2:
+    #
+    # two observations are approximately:
+    #
+    # 2 / FPS seconds apart.
+    #
+    # 1.5 sec is intentionally generous for temporary
+    # detector/tracker gaps.
 
-    # ------------------------------------------------------
-    # Phase 1: Crossing Identity
-    # ------------------------------------------------------
+    max_trajectory_gap_sec: float = 1.50
 
-    pre_crossing_distance_px: float = 100.0
+    # ========================================================
+    # MOTORCYCLE FRAGMENTATION
+    # ========================================================
 
-    max_identity_reconnect_gap_sec: float = 1.0
+    # Legacy compatibility.
+    #
+    # These are still passed into TrafficCounter.
+    #
+    # The robust identity engine should be responsible for
+    # physical identity matching.
 
-    max_identity_reconnect_distance_px: float = 100.0
+    moto_dedup_time_sec: float = 1.20
+
+    moto_dedup_distance_px: float = 90.0
+
+    # ========================================================
+    # CROSSING IDENTITY
+    # ========================================================
+
+    # --------------------------------------------------------
+    # Distance at which a track becomes relevant to crossing.
+    #
+    # This is NOT the counting corridor.
+    #
+    # It is used for identity/reconnection logic.
+    # --------------------------------------------------------
+
+    pre_crossing_distance_px: float = 120.0
+
+    # --------------------------------------------------------
+    # Maximum time gap between fragments that may belong to
+    # the same physical vehicle.
+    # --------------------------------------------------------
+
+    max_identity_reconnect_gap_sec: float = 0.75
+
+    # --------------------------------------------------------
+    # Maximum spatial distance between the end of an old
+    # fragment and the beginning of a new fragment.
+    # --------------------------------------------------------
+
+    max_identity_reconnect_distance_px: float = 75.0
+
+    # --------------------------------------------------------
+    # Identity matching score threshold.
+    # --------------------------------------------------------
 
     identity_match_threshold: float = 0.82
 
+    # --------------------------------------------------------
+    # Required margin between best and second-best identity.
+    #
+    # This is VERY important for your:
+    #
+    # "2 motorcycles enter simultaneously"
+    #
+    # scenario.
+    #
+    # If two identities have similar scores, the new fragment
+    # should NOT automatically be merged.
+    # --------------------------------------------------------
+
     identity_match_margin: float = 0.08
+
+    # --------------------------------------------------------
+    # Velocity gate.
+    #
+    # Maximum expected position discrepancy per source frame.
+    # --------------------------------------------------------
 
     velocity_gate_px_per_frame: float = 30.0
 
+    # --------------------------------------------------------
+    # Minimum observations before considering a fragment a
+    # reliable pre-crossing identity.
+    # --------------------------------------------------------
+
     min_pre_crossing_observations: int = 3
 
-    # ------------------------------------------------------
-    # Deprecated for Phase 1.
-    # Keep for backward compatibility.
-    # ------------------------------------------------------
+    # ========================================================
+    # ROBUST CROSSING GEOMETRY
+    # ========================================================
 
-    moto_dedup_time_sec: float = 1.50
+    # Additional corridor around the counting line.
 
-    moto_dedup_distance_px: float = 80.0
+    crossing_corridor_px: float = 45.0
 
+    # Minimum trajectory displacement required to infer
+    # direction from motion.
+
+    min_direction_displacement_px: float = 8.0
+
+    # Number of observations around crossing used for
+    # directional validation.
+
+    direction_window: int = 3
+
+    # ========================================================
+    # FINAL DUPLICATE SUPPRESSION
+    # ========================================================
+
+    # IMPORTANT:
+    #
+    # Keep these conservative.
+    #
+    # Two motorcycles crossing at approximately the same time
+    # must NOT accidentally collapse into one.
+    #
+    # Identity matching should happen before final counting.
+
+    duplicate_time_sec: float = 0.50
+
+    duplicate_distance_px: float = 35.0
+
+
+# ============================================================
+# APPLICATION CONFIG
+# ============================================================
 
 @dataclass(frozen=True)
 class AppConfig:
+
+    # --------------------------------------------------------
+    # Output
+    # --------------------------------------------------------
+
+    output_dir: str = "outputs"
+
+    # --------------------------------------------------------
+    # Nested configs
+    # --------------------------------------------------------
+
     detection: DetectionConfig = field(
         default_factory=DetectionConfig
     )
@@ -127,13 +264,21 @@ class AppConfig:
         default_factory=CountingConfig
     )
 
+    # ========================================================
+    # TARGET CLASSES
+    # ========================================================
+
     target_classes: tuple[str, ...] = (
         "person",
         "motorcycle",
         "car",
-        "truck",
         "bus",
+        "truck",
     )
+
+    # ========================================================
+    # VEHICLES
+    # ========================================================
 
     vehicle_classes: tuple[str, ...] = (
         "motorcycle",
@@ -142,13 +287,20 @@ class AppConfig:
         "bus",
     )
 
-    output_dir: Path = Path("outputs")
 
+# ============================================================
+# BUILD CONFIG
+# ============================================================
 
-def build_config(
-    output_dir: str | Path = "outputs"
-) -> AppConfig:
+def build_config() -> AppConfig:
 
-    return AppConfig(
-        output_dir=Path(output_dir)
+    config = AppConfig()
+
+    Path(
+        config.output_dir
+    ).mkdir(
+        parents=True,
+        exist_ok=True,
     )
+
+    return config
