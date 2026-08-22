@@ -204,6 +204,31 @@ class TrafficCountingEngine:
                 self.config.counting.direction_window
             ),
 
+            # Phase 1 — trajectory engine.
+            "trajectory_smoothing_alpha": (
+                self.config.counting.trajectory_smoothing_alpha
+            ),
+            "trajectory_velocity_window": (
+                self.config.counting.trajectory_velocity_window
+            ),
+            "max_velocity_px_per_frame": (
+                self.config.counting.max_velocity_px_per_frame
+            ),
+
+            # Phase 2 — crossing corridor.
+            "min_pre_zone_observations": (
+                self.config.counting.min_pre_zone_observations
+            ),
+            "min_corridor_observations": (
+                self.config.counting.min_corridor_observations
+            ),
+            "min_post_zone_observations": (
+                self.config.counting.min_post_zone_observations
+            ),
+            "require_post_zone": (
+                self.config.counting.require_post_zone
+            ),
+
             # Conservative final duplicate suppression.
             "duplicate_time_sec": (
                 self.config.counting.duplicate_time_sec
@@ -514,6 +539,39 @@ class TrafficCountingEngine:
             index=False,
         )
 
+        # =====================================================
+        # PHASE 1/2 DIAGNOSTIC ARTIFACTS
+        # =====================================================
+        phase12_trajectory_path = output_dir / "phase12_trajectory.csv"
+        phase12_audit_path = output_dir / "phase12_crossing_corridor_audit.csv"
+
+        phase12_trajectory = getattr(
+            counting_result,
+            "phase12_trajectory",
+            None,
+        )
+        phase12_audit = getattr(
+            counting_result,
+            "phase12_audit",
+            None,
+        )
+
+        if isinstance(phase12_trajectory, pd.DataFrame):
+            phase12_trajectory.to_csv(
+                phase12_trajectory_path,
+                index=False,
+            )
+        else:
+            phase12_trajectory_path = None
+
+        if isinstance(phase12_audit, pd.DataFrame):
+            phase12_audit.to_csv(
+                phase12_audit_path,
+                index=False,
+            )
+        else:
+            phase12_audit_path = None
+
         direction_counts_df = self._safe_direction_counts(
             counting_result.final_crossings
         )
@@ -673,6 +731,16 @@ class TrafficCountingEngine:
             "final_crossings_csv": str(
                 output_dir / "final_vehicle_crossings.csv"
             ),
+            "phase12_trajectory_csv": (
+                str(phase12_trajectory_path)
+                if phase12_trajectory_path is not None
+                else None
+            ),
+            "phase12_crossing_corridor_audit_csv": (
+                str(phase12_audit_path)
+                if phase12_audit_path is not None
+                else None
+            ),
             "track_crossing_audit_csv": (
                 str(track_audit_path)
                 if track_audit_path is not None
@@ -749,6 +817,45 @@ class TrafficCountingEngine:
         # =====================================================
         # CONSOLE REPORT
         # =====================================================
+        if isinstance(phase12_trajectory, pd.DataFrame) and isinstance(phase12_audit, pd.DataFrame):
+            print("\n" + "=" * 70)
+            print("PHASE 1/2 TRAJECTORY + CROSSING CORRIDOR AUDIT")
+            print("=" * 70)
+            print(
+                f"Tracks analyzed      : {len(phase12_audit):,}"
+            )
+            print(
+                f"Phase 1 PASS         : {int((phase12_audit['phase1_status'] == 'PASS').sum()):,}"
+            )
+            print(
+                f"Phase 1 REVIEW       : {int((phase12_audit['phase1_status'] == 'REVIEW').sum()):,}"
+            )
+            print(
+                f"Phase 1 FAIL         : {int((phase12_audit['phase1_status'] == 'FAIL').sum()):,}"
+            )
+            print(
+                f"Phase 2 PASS         : {int((phase12_audit['phase2_status'] == 'PASS').sum()):,}"
+            )
+            print(
+                f"Phase 2 REVIEW       : {int((phase12_audit['phase2_status'] == 'REVIEW').sum()):,}"
+            )
+            print(
+                f"Phase 2 FAIL         : {int((phase12_audit['phase2_status'] == 'FAIL').sum()):,}"
+            )
+            print(
+                f"P1 + P2 PASS         : {int(phase12_audit['counted'].sum()):,}"
+            )
+            print("\nZone path examples:")
+            print(
+                phase12_audit["zone_path"]
+                .value_counts()
+                .head(10)
+                .to_string()
+            )
+            print(
+                f"\nPhase 1/2 audit: {phase12_audit_path}"
+            )
+
         print("\n" + "=" * 70)
         print("FINAL VEHICLE COUNT")
         print("=" * 70)

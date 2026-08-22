@@ -135,6 +135,33 @@ class CountingConfig:
     direction_window: int = 3
 
     # ========================================================
+    # PHASE 1 — TRAJECTORY ENGINE
+    # ========================================================
+
+    # Causal EMA used for trajectory analysis. Zone membership still uses
+    # the raw observed bbox position to avoid smoothing latency.
+    trajectory_smoothing_alpha: float = 0.35
+
+    # Velocity samples used internally by downstream phases when needed.
+    trajectory_velocity_window: int = 5
+
+    # Maximum image-space speed considered reasonable for trajectory
+    # quality diagnostics. This is not a detector confidence threshold.
+    max_velocity_px_per_frame: float = 80.0
+
+    # ========================================================
+    # PHASE 2 — CROSSING CORRIDOR
+    # ========================================================
+
+    min_pre_zone_observations: int = 2
+    min_corridor_observations: int = 1
+    min_post_zone_observations: int = 1
+
+    # Require evidence that the object actually reaches the post-zone
+    # before Phase 2 can be considered PASS.
+    require_post_zone: bool = True
+
+    # ========================================================
     # FINAL DUPLICATE SUPPRESSION
     # ========================================================
 

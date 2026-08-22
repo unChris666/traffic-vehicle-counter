@@ -22,6 +22,12 @@ class CountingResult:
 
     trajectory: pd.DataFrame
 
+    # Phase 1/2 diagnostics. These are not used to calculate counts;
+    # they are exposed so notebook/Gradio users can audit trajectory and
+    # corridor behavior before moving to the state-machine phase.
+    phase12_trajectory: pd.DataFrame
+    phase12_audit: pd.DataFrame
+
     crossing_candidates: pd.DataFrame
     crossing_events: pd.DataFrame
 
@@ -90,6 +96,17 @@ class TrafficCounter:
         crossing_corridor_px: float = 45.0,
         min_direction_displacement_px: float = 8.0,
         direction_window: int = 3,
+
+        # Phase 1 — trajectory engine
+        trajectory_smoothing_alpha: float = 0.35,
+        trajectory_velocity_window: int = 5,
+        max_velocity_px_per_frame: float = 80.0,
+
+        # Phase 2 — crossing corridor
+        min_pre_zone_observations: int = 2,
+        min_corridor_observations: int = 1,
+        min_post_zone_observations: int = 1,
+        require_post_zone: bool = True,
 
     ) -> None:
 
@@ -210,6 +227,27 @@ class TrafficCounter:
                         self.direction_window
                     ),
                     min_track_observations=2,
+                    smoothing_alpha=(
+                        trajectory_smoothing_alpha
+                    ),
+                    velocity_window=(
+                        trajectory_velocity_window
+                    ),
+                    max_velocity_px_per_frame=(
+                        max_velocity_px_per_frame
+                    ),
+                    min_pre_zone_observations=(
+                        min_pre_zone_observations
+                    ),
+                    min_corridor_observations=(
+                        min_corridor_observations
+                    ),
+                    min_post_zone_observations=(
+                        min_post_zone_observations
+                    ),
+                    require_post_zone=(
+                        require_post_zone
+                    ),
                     vehicle_classes=tuple(
                         sorted(self.vehicle_classes)
                     ),
@@ -521,6 +559,8 @@ class TrafficCounter:
                 },
                 total=0,
                 trajectory=tracks_phase2.copy(),
+                phase12_trajectory=tracks_phase2.copy(),
+                phase12_audit=self._empty_track_audit(),
                 crossing_candidates=empty.copy(),
                 crossing_events=empty.copy(),
                 crossing_vehicle=empty.copy(),
@@ -574,11 +614,21 @@ class TrafficCounter:
         # causing simultaneous independent motorcycles to merge.
         # ==========================================================
 
-        events_df, _ = (
-            self.crossing_engine.process(
-                trajectory,
-                identity_column="crossing_id",
-            )
+        (
+            events_df,
+            phase12_audit,
+            phase12_trajectory,
+        ) = self.crossing_engine.process(
+            trajectory,
+            identity_column="crossing_id",
+            return_diagnostics=True,
+        )
+
+        # Print a human-readable Phase 1/2 report in the Kaggle/Gradio
+        # backend logs. This does not modify the count.
+        self.crossing_engine.print_phase_report(
+            events_df,
+            phase12_audit,
         )
 
         if events_df.empty:
@@ -814,6 +864,8 @@ class TrafficCounter:
             counts=counts,
             total=total,
             trajectory=trajectory,
+            phase12_trajectory=phase12_trajectory,
+            phase12_audit=phase12_audit,
             crossing_candidates=(
                 crossing_events.copy()
             ),
