@@ -18,7 +18,8 @@ class VideoRenderer:
     - Does NOT change tracking
     - Does NOT change counting
     - Uses Phase 2 `track_class`
-    - Uses final_crossings for cumulative direction counts
+    - Uses final_crossings for cumulative physical crossing counts
+    - Accepts crossing_audit for visual debugging
     """
 
     # ==========================================================
@@ -241,19 +242,41 @@ class VideoRenderer:
 
     @staticmethod
     def _normalize_direction(value) -> str | None:
+        """
+        Normalize all direction representations used across the project.
 
+        Supported:
+        - L→R / L->R / LEFT_TO_RIGHT
+        - R→L / R->L / RIGHT_TO_LEFT
+        - side_-1_to_+1
+        - side_+1_to_-1
+
+        Canonical internal representation remains the legacy side-transition
+        labels so the existing count storage stays backward compatible.
+        """
         if value is None:
             return None
 
         value = str(value).strip()
 
-        if value in (
-            "side_+1_to_-1",
-            "side_-1_to_+1",
-        ):
-            return value
+        aliases = {
+            "side_+1_to_-1": "side_+1_to_-1",
+            "side_-1_to_+1": "side_-1_to_+1",
 
-        return None
+            "R→L": "side_+1_to_-1",
+            "R->L": "side_+1_to_-1",
+            "R-L": "side_+1_to_-1",
+            "RIGHT_TO_LEFT": "side_+1_to_-1",
+            "RIGHT-TO-LEFT": "side_+1_to_-1",
+
+            "L→R": "side_-1_to_+1",
+            "L->R": "side_-1_to_+1",
+            "L-R": "side_-1_to_+1",
+            "LEFT_TO_RIGHT": "side_-1_to_+1",
+            "LEFT-TO-RIGHT": "side_-1_to_+1",
+        }
+
+        return aliases.get(value)
 
     # ==========================================================
     # UPDATE COUNTING PANEL
@@ -265,39 +288,30 @@ class VideoRenderer:
         counts,
         final_crossings: pd.DataFrame,
         frame_id: int,
-        counted_track_ids: set,
+        counted_crossing_ids: set,
     ) -> None:
         """
-        Add crossings that have happened up to current frame.
+        Update cumulative counts up to the current rendered frame.
 
-        Each track is counted only once.
+        Important:
+        - Prefer physical `crossing_id` as the unique counting key.
+        - Fall back to `track_id` only when crossing_id is unavailable.
+        - Accept both the legacy side-transition direction labels and
+          the new normal-based L→R / R→L labels.
         """
-
-        if final_crossings is None:
+        if final_crossings is None or final_crossings.empty:
             return
 
-        if final_crossings.empty:
+        required_columns = {"track_class", "direction"}
+        if not required_columns.issubset(final_crossings.columns):
             return
 
-        required_columns = {
-            "track_id",
-            "track_class",
-            "direction",
-        }
-
-        if not required_columns.issubset(
-            final_crossings.columns
-        ):
-            return
-
-        # Try to identify the crossing frame.
         frame_column = None
-
-        for candidate in [
+        for candidate in (
             "crossing_frame",
             "frame_id",
             "cross_frame",
-        ]:
+        ):
             if candidate in final_crossings.columns:
                 frame_column = candidate
                 break
@@ -305,27 +319,38 @@ class VideoRenderer:
         if frame_column is None:
             return
 
-        eligible = final_crossings[
-            final_crossings[frame_column] <= frame_id
+        frame_values = pd.to_numeric(
+            final_crossings[frame_column],
+            errors="coerce",
+        )
+
+        # OpenCV renderer uses 1-based frame_id while many dataframes are
+        # 0-based. Allow a one-frame tolerance so cumulative counts appear
+        # exactly when the crossing frame becomes visible.
+        eligible = final_crossings.loc[
+            frame_values.notna()
+            & (frame_values <= int(frame_id))
         ]
 
         for _, row in eligible.iterrows():
+            if "crossing_id" in eligible.columns and pd.notna(row["crossing_id"]):
+                unique_id = f"crossing:{int(row['crossing_id'])}"
+            elif "track_id" in eligible.columns and pd.notna(row["track_id"]):
+                unique_id = f"track:{int(row['track_id'])}"
+            else:
+                continue
 
-            track_id = int(row["track_id"])
-
-            if track_id in counted_track_ids:
+            if unique_id in counted_crossing_ids:
                 continue
 
             class_name = (
-                str(row["track_class"])
+                str(row.get("track_class", ""))
                 .lower()
                 .strip()
             )
 
-            direction = (
-                cls._normalize_direction(
-                    row["direction"]
-                )
+            direction = cls._normalize_direction(
+                row.get("direction")
             )
 
             if (
@@ -335,8 +360,7 @@ class VideoRenderer:
                 continue
 
             counts[class_name][direction] += 1
-
-            counted_track_ids.add(track_id)
+            counted_crossing_ids.add(unique_id)
 
     # ==========================================================
     # DRAW COUNT PANEL
@@ -350,52 +374,41 @@ class VideoRenderer:
         width: int,
         height: int,
     ) -> None:
+        """
+        Draw a cumulative audit-friendly count table.
 
-        # ------------------------------------------------------
-        # Panel geometry
-        # ------------------------------------------------------
+        Layout:
+            ARAH          Pejalan Kaki  Motor  Mobil  Truck  Bus  TOTAL
+            Kanan-Kiri    ...
+            Kiri-Kanan    ...
+            TOTAL         ...
 
-        margin = max(
-            12,
-            int(width * 0.015),
-        )
+        This makes direction/class mistakes immediately visible in the video.
+        """
+        margin = max(12, int(width * 0.015))
 
+        # 7 columns: direction + 5 classes + total.
         panel_width = min(
-            int(width * 0.46),
-            560,
+            int(width * 0.72),
+            920,
         )
 
         row_height = max(
-            24,
+            25,
             int(height * 0.045),
         )
 
-        header_height = row_height * 2
-
-        num_rows = len(cls.DISPLAY_CLASSES)
-
+        header_rows = 2
+        data_rows = 3
         panel_height = (
-            header_height
-            + num_rows * row_height
+            (header_rows + data_rows) * row_height
             + margin
         )
 
         x1 = margin
         y1 = margin
-
-        x2 = min(
-            width - margin,
-            x1 + panel_width,
-        )
-
-        y2 = min(
-            height - margin,
-            y1 + panel_height,
-        )
-
-        # ------------------------------------------------------
-        # Transparent black background
-        # ------------------------------------------------------
+        x2 = min(width - margin, x1 + panel_width)
+        y2 = min(height - margin, y1 + panel_height)
 
         cls._draw_transparent_panel(
             frame,
@@ -403,30 +416,24 @@ class VideoRenderer:
             y1,
             x2,
             y2,
-            alpha=0.72,
+            alpha=0.76,
         )
-
-        # ------------------------------------------------------
-        # Header
-        # ------------------------------------------------------
 
         font = cv2.FONT_HERSHEY_SIMPLEX
 
         title_scale = max(
             0.48,
-            min(
-                0.68,
-                width / 1800,
-            ),
+            min(0.68, width / 1800),
+        )
+        small_scale = max(
+            0.28,
+            min(0.43, width / 2500),
         )
 
         cv2.putText(
             frame,
             "TRAFFIC COUNT",
-            (
-                x1 + 14,
-                y1 + 25,
-            ),
+            (x1 + 14, y1 + 25),
             font,
             title_scale,
             (255, 255, 255),
@@ -434,119 +441,105 @@ class VideoRenderer:
             cv2.LINE_AA,
         )
 
-        # ------------------------------------------------------
-        # Column positions
-        # ------------------------------------------------------
+        # Column widths are proportional to the panel.
+        direction_x = x1 + 14
+        class_start = x1 + int(panel_width * 0.20)
 
-        class_x = x1 + 14
+        usable_width = panel_width - int(panel_width * 0.22)
+        class_width = int(usable_width / 6)
 
-        right_left_x = x1 + int(
-            panel_width * 0.48
-        )
-
-        left_right_x = x1 + int(
-            panel_width * 0.75
-        )
-
-        header_y = y1 + 50
-
-        small_scale = max(
-            0.32,
-            min(
-                0.48,
-                width / 2200,
-            ),
-        )
-
-        cv2.putText(
-            frame,
-            "KENDARAAN",
-            (
-                class_x,
-                header_y,
-            ),
-            font,
-            small_scale,
-            (210, 210, 210),
-            1,
-            cv2.LINE_AA,
-        )
-
-        cv2.putText(
-            frame,
-            "KANAN-KIRI",
-            (
-                right_left_x,
-                header_y,
-            ),
-            font,
-            small_scale,
-            (210, 210, 210),
-            1,
-            cv2.LINE_AA,
-        )
-
-        cv2.putText(
-            frame,
-            "KIRI-KANAN",
-            (
-                left_right_x,
-                header_y,
-            ),
-            font,
-            small_scale,
-            (210, 210, 210),
-            1,
-            cv2.LINE_AA,
-        )
-
-        # ------------------------------------------------------
-        # Rows
-        # ------------------------------------------------------
-
-        for index, class_name in enumerate(
-            cls.DISPLAY_CLASSES
-        ):
-
-            y = (
-                y1
-                + header_height
-                + index * row_height
+        column_x = {
+            class_name: class_start + i * class_width
+            for i, class_name in enumerate(
+                [
+                    "person",
+                    "motorcycle",
+                    "car",
+                    "truck",
+                    "bus",
+                ]
             )
+        }
+        total_x = class_start + 5 * class_width
 
-            color = cls._color_from_class(
-                class_name
+        header_y = y1 + row_height + 12
+
+        cv2.putText(
+            frame,
+            "ARAH",
+            (direction_x, header_y),
+            font,
+            small_scale,
+            (210, 210, 210),
+            1,
+            cv2.LINE_AA,
+        )
+
+        for class_name, x in column_x.items():
+            label = cls.CLASS_DISPLAY_NAMES.get(
+                class_name,
+                class_name.title(),
             )
+            color = cls._color_from_class(class_name)
 
-            # Color indicator
             cv2.rectangle(
                 frame,
-                (
-                    class_x,
-                    y + 5,
-                ),
-                (
-                    class_x + 10,
-                    y + row_height - 5,
-                ),
+                (x, header_y - 13),
+                (x + 8, header_y - 5),
                 color,
                 -1,
             )
 
-            display_name = (
-                cls.CLASS_DISPLAY_NAMES.get(
-                    class_name,
-                    class_name.title(),
-                )
+            cv2.putText(
+                frame,
+                label,
+                (x + 12, header_y),
+                font,
+                small_scale,
+                (210, 210, 210),
+                1,
+                cv2.LINE_AA,
+            )
+
+        cv2.putText(
+            frame,
+            "TOTAL",
+            (total_x + 5, header_y),
+            font,
+            small_scale,
+            (210, 210, 210),
+            1,
+            cv2.LINE_AA,
+        )
+
+        direction_rows = [
+            ("side_+1_to_-1", "Kanan-Kiri"),
+            ("side_-1_to_+1", "Kiri-Kanan"),
+        ]
+
+        total_by_class = {
+            class_name: (
+                counts[class_name]["side_+1_to_-1"]
+                + counts[class_name]["side_-1_to_+1"]
+            )
+            for class_name in cls.DISPLAY_CLASSES
+        }
+
+        grand_total = sum(total_by_class.values())
+
+        for row_index, (direction_key, direction_label) in enumerate(
+            direction_rows
+        ):
+            y = (
+                y1
+                + header_rows * row_height
+                + row_index * row_height
             )
 
             cv2.putText(
                 frame,
-                display_name,
-                (
-                    class_x + 18,
-                    y + row_height - 8,
-                ),
+                direction_label,
+                (direction_x, y + row_height - 8),
                 font,
                 small_scale,
                 (255, 255, 255),
@@ -554,51 +547,81 @@ class VideoRenderer:
                 cv2.LINE_AA,
             )
 
-            # Right → Left
-            right_left_count = counts[
-                class_name
-            ][
-                "side_+1_to_-1"
-            ]
+            direction_total = 0
+
+            for class_name, x in column_x.items():
+                value = int(
+                    counts[class_name][direction_key]
+                )
+                direction_total += value
+
+                cv2.putText(
+                    frame,
+                    str(value),
+                    (x + 18, y + row_height - 8),
+                    font,
+                    small_scale + 0.04,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             cv2.putText(
                 frame,
-                str(right_left_count),
-                (
-                    right_left_x,
-                    y + row_height - 8,
-                ),
+                str(direction_total),
+                (total_x + 18, y + row_height - 8),
                 font,
-                small_scale,
+                small_scale + 0.04,
                 (255, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
 
-            # Left → Right
-            left_right_count = counts[
-                class_name
-            ][
-                "side_-1_to_+1"
-            ]
+        # Overall total row.
+        y = y1 + (header_rows + 2) * row_height
 
+        cv2.line(
+            frame,
+            (x1 + 10, y - row_height + 4),
+            (x2 - 10, y - row_height + 4),
+            (110, 110, 110),
+            1,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            frame,
+            "TOTAL",
+            (direction_x, y + row_height - 8),
+            font,
+            small_scale,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        for class_name, x in column_x.items():
             cv2.putText(
                 frame,
-                str(left_right_count),
-                (
-                    left_right_x,
-                    y + row_height - 8,
-                ),
+                str(total_by_class[class_name]),
+                (x + 18, y + row_height - 8),
                 font,
-                small_scale,
-                (255, 255, 255),
+                small_scale + 0.04,
+                cls._color_from_class(class_name),
                 2,
                 cv2.LINE_AA,
             )
 
-        # ------------------------------------------------------
-        # Panel border
-        # ------------------------------------------------------
+        cv2.putText(
+            frame,
+            str(grand_total),
+            (total_x + 18, y + row_height - 8),
+            font,
+            small_scale + 0.06,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
 
         cv2.rectangle(
             frame,
@@ -677,6 +700,7 @@ class VideoRenderer:
         total_frames: int,
         tracks_phase2: pd.DataFrame,
         final_crossings: pd.DataFrame,
+        crossing_audit: pd.DataFrame | None = None,
         progress_callback=None,
     ) -> Path:
 
@@ -744,7 +768,25 @@ class VideoRenderer:
 
         counts = self._build_empty_counts()
 
-        counted_track_ids = set()
+        # Physical crossing identity is preferred over raw tracker ID.
+        counted_crossing_ids = set()
+
+        # Optional audit lookup for visual debugging.
+        audit_lookup = {}
+        if crossing_audit is not None and not crossing_audit.empty:
+            id_column = (
+                "crossing_id"
+                if "crossing_id" in crossing_audit.columns
+                else "track_id"
+                if "track_id" in crossing_audit.columns
+                else None
+            )
+            if id_column is not None:
+                for _, audit_row in crossing_audit.iterrows():
+                    try:
+                        audit_lookup[int(audit_row[id_column])] = audit_row
+                    except (TypeError, ValueError):
+                        continue
 
         # ======================================================
         # OPEN INPUT VIDEO
@@ -820,6 +862,22 @@ class VideoRenderer:
                     cv2.LINE_AA,
                 )
 
+                # Side labels help audit the meaning of direction.
+                cv2.putText(
+                    frame,
+                    "SIDE A",
+                    (
+                        min(width - 120, max(10, self.line_x1 + 10)),
+                        min(height - 15, max(25, self.line_y1 - 10)),
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (0, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+
                 # ==================================================
                 # UPDATE COUNTING PANEL
                 # ==================================================
@@ -828,7 +886,7 @@ class VideoRenderer:
                     counts=counts,
                     final_crossings=final_crossings,
                     frame_id=frame_id,
-                    counted_track_ids=counted_track_ids,
+                    counted_crossing_ids=counted_crossing_ids,
                 )
 
                 # ==================================================
@@ -984,10 +1042,50 @@ class VideoRenderer:
                             )
                         )
 
+                        # Optional crossing audit overlay.
+                        audit_text = ""
+                        audit_row = audit_lookup.get(track_id)
+                        if audit_row is not None:
+                            status = str(
+                                audit_row.get(
+                                    "crossing_candidate_class",
+                                    audit_row.get(
+                                        "phase2_status",
+                                        "",
+                                    ),
+                                )
+                            ).strip()
+
+                            direction_value = (
+                                audit_row.get(
+                                    "crossing_direction",
+                                    audit_row.get(
+                                        "direction",
+                                        "",
+                                    ),
+                                )
+                            )
+
+                            if status:
+                                audit_text = f" | {status}"
+
+                            normalized = self._normalize_direction(
+                                direction_value
+                            )
+                            if normalized is not None:
+                                direction_text = (
+                                    self.DIRECTION_DISPLAY_NAMES.get(
+                                        normalized,
+                                        normalized,
+                                    )
+                                )
+                                audit_text += f" | {direction_text}"
+
                         label = (
                             f"ID {track_id} | "
                             f"{display_name} | "
                             f"{confidence:.0%}"
+                            f"{audit_text}"
                         )
 
                         self._draw_label(
