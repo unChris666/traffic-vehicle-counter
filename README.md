@@ -1,31 +1,56 @@
-Phase 1/2 v2 — Pre-Phase-3 release
+Phase 1-2 v3 — Candidate-Preserving Trajectory + Crossing Audit
 
-Files:
+This release implements the requested architecture before State Machine Phase 3:
 
-robust_crossing.py: full replacement for Phase 1 Trajectory Engine + Phase 2 Crossing Corridor.
+TRACK
+-> TRAJECTORY
+-> ZONE CONTEXT
+-> CROSSING DETECTOR
+-> CROSSING EVIDENCE
+-> AUDIT
 
-engine.py: full replacement of the console Phase 1/2 audit report.
+Main changes
 
-Main changes:
+NO_CROSSING, APPROACHING, NEAR_LINE, and CROSSING_CANDIDATE are separate concepts.
 
-NOT_CROSSING is no longer treated as a failure.
+PRE/POST/CORRIDOR evidence does not delete a geometric crossing candidate.
 
-Crossing direction is derived from signed distance to the line (normal direction), not raw X motion.
+Stable-side transition handles +1 -> 0 -> -1 and -1 -> 0 -> +1.
 
-Zone assignment uses hysteresis: corridor enter at corridor_px, corridor exit at corridor_exit_px.
+Raw segment intersection is the primary geometric crossing signal.
 
-Crossing geometry uses raw observations, preventing EMA lag from suppressing fast crossings.
+Signed-distance sign change is an additional crossing signal.
 
-A crossing that jumps from PRE to POST without an observed corridor bbox is labeled FAST_CROSSING and audited separately.
+Sparse observation gaps can use a velocity/sign bridge.
 
-Audit reports NOT_CROSSING, NEAR_LINE, TRUE_CROSSING, and FAST_CROSSING separately.
+Fast crossings can be valid even with zero observed corridor frames.
 
-Audit reports direction coverage, zone chatter, fast-crossing speed, and review reasons.
+Normal velocity is computed relative to the counting line, not from raw X only.
 
-Important:
+Zone context uses spatial hysteresis.
 
-This release does not implement the Phase 3 state machine.
+Every track stays in the audit output, including non-crossing tracks.
 
-This release does not alter YOLO26, BoT-SORT, or identity reconnect logic.
+Multiple geometric crossing candidates are detected internally, while one primary event is exposed for backward compatibility.
 
-FAST_CROSSING can still remain REVIEW when there is insufficient PRE/POST evidence. That is deliberate; the next phase will decide whether such evidence can be safely accepted.
+Final counting remains intentionally outside this module; Phase 3 State Machine should own final count decisions.
+
+Drop-in file
+
+Replace:
+
+app/counting/robust_crossing.py
+
+with:
+
+robust_crossing_phase12_v3.py
+
+The public interface remains:
+
+CrossingConfig
+
+RobustCrossingEngine.process(trajectory, identity_column='crossing_id', return_diagnostics=False)
+
+Important
+
+This release intentionally does not implement the State Machine. Do not tune the final count from counted yet; treat count_eligibility and the audit fields as candidate-level evidence until Phase 3 is implemented.

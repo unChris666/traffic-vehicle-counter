@@ -10,53 +10,94 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class CrossingConfig:
-    """Phase 1 Trajectory Engine + Phase 2 Crossing Corridor.
+    """Phase 1 + Phase 2 engine.
 
-    This module is intentionally identity-agnostic. Identity management is
-    handled by CrossingIdentityEngine before this engine is called.
+    Architecture:
 
-    Key design changes in v2:
-      - NOT_CROSSING is a valid outcome, not a Phase-2 failure.
-      - Direction is computed from signed distance / line normal.
-      - Corridor membership uses hysteresis to prevent PRE/CORRIDOR chatter.
-      - Crossing uses RAW trajectory geometry, so fast objects can cross the
-        line between two observations without requiring a bbox observation
-        inside the corridor.
-      - FAST_CROSSING is explicitly reported when a valid line crossing skips
-        the observed corridor.
+        TRACK
+          |
+          v
+        TRAJECTORY
+          |- signed distance
+          |- normal velocity
+          |- speed
+          |- trajectory continuity
+          |
+          v
+        ZONE CONTEXT
+          |- NO_CROSSING
+          |- APPROACHING
+          |- NEAR_LINE
+          |- CROSSING_CANDIDATE
+          |
+          v
+        CROSSING DETECTOR
+          |- stable-side transition
+          |- raw segment intersection
+          |- deadband-aware transition
+          |- gap/velocity bridge
+          |
+          v
+        CROSSING EVIDENCE
+          |- pre evidence
+          |- corridor evidence
+          |- post evidence
+          |- direction evidence
+          |- fast/sparse evidence
+          |
+          v
+        AUDIT
+
+    Identity management is intentionally outside this module. A single
+    physical identity is expected to arrive under ``identity_column``.
     """
 
-    # Geometry
+    # ------------------------------------------------------------------
+    # LINE / ZONE GEOMETRY
+    # ------------------------------------------------------------------
     line_deadband_px: float = 8.0
     corridor_px: float = 45.0
     corridor_exit_px: float = 60.0
+    approach_distance_px: float = 120.0
 
-    # Trajectory
+    # ------------------------------------------------------------------
+    # TRAJECTORY
+    # ------------------------------------------------------------------
     max_trajectory_gap_sec: float = 1.50
     smoothing_alpha: float = 0.35
     velocity_window: int = 5
     min_direction_displacement_px: float = 8.0
     direction_window: int = 3
     max_velocity_px_per_frame: float = 80.0
+    max_velocity_bridge_px_per_frame: float = 140.0
+    min_normal_velocity_px_per_frame: float = 1.0
 
-    # Crossing validation
+    # ------------------------------------------------------------------
+    # EVIDENCE
+    # ------------------------------------------------------------------
     min_track_observations: int = 2
     min_pre_zone_observations: int = 2
     min_corridor_observations: int = 1
     min_post_zone_observations: int = 1
-    require_post_zone: bool = True
-
-    # Fast crossing
-    # A crossing with zero corridor observations is classified as FAST_CROSSING
-    # when the raw segment intersects the line or the signed side changes.
-    fast_crossing_allow_zero_corridor: bool = True
-
-    # Direction confidence
-    min_normal_displacement_px: float = 8.0
     min_direction_confidence: float = 0.50
+    min_normal_displacement_px: float = 8.0
 
-    # Business labels. The geometrically meaningful fields are normal_direction
-    # and side_transition. `direction` keeps the existing UI labels.
+    # Evidence is diagnostic. It does NOT invalidate geometry.
+    require_post_zone: bool = False
+    allow_crossing_without_pre: bool = True
+    allow_crossing_without_post: bool = True
+    allow_zero_corridor_crossing: bool = True
+
+    # ------------------------------------------------------------------
+    # GAP / FAST OBJECT HANDLING
+    # ------------------------------------------------------------------
+    gap_bridge_enabled: bool = True
+    gap_bridge_max_frames: int = 6
+    fast_speed_multiplier: float = 0.85
+
+    # ------------------------------------------------------------------
+    # BUSINESS LABELS
+    # ------------------------------------------------------------------
     positive_normal_label: str = "L→R"
     negative_normal_label: str = "R→L"
 
@@ -69,82 +110,189 @@ class CrossingConfig:
 
 
 class RobustCrossingEngine:
-    """Trajectory + crossing-corridor engine for pre-Phase-3 validation."""
+    """Candidate-preserving trajectory and crossing engine.
+
+    Important design rule:
+    A track is NOT discarded just because it lacks PRE/CORRIDOR/POST evidence.
+    Crossing geometry and crossing evidence are separate concepts.
+    """
 
     TRAJECTORY_COLUMNS = [
-        "raw_x", "raw_y", "smooth_x", "smooth_y",
-        "dx", "dy", "frame_delta", "time_delta_sec",
-        "speed_px_per_frame", "velocity_normal_px_per_frame",
-        "velocity_tangent_px_per_frame", "signed_distance_px",
-        "line_distance_px", "raw_signed_distance_px",
-        "raw_line_distance_px", "raw_side", "side", "zone",
-        "direction_local", "normal_direction_local",
-        "trajectory_continuity", "speed_anomaly", "trajectory_quality",
+        "raw_x",
+        "raw_y",
+        "smooth_x",
+        "smooth_y",
+        "dx",
+        "dy",
+        "frame_delta",
+        "time_delta_sec",
+        "speed_px_per_frame",
+        "velocity_normal_px_per_frame",
+        "velocity_tangent_px_per_frame",
+        "signed_distance_px",
+        "line_distance_px",
+        "raw_signed_distance_px",
+        "raw_line_distance_px",
+        "raw_side",
+        "stable_side",
+        "zone",
+        "zone_context",
+        "direction_local",
+        "normal_direction_local",
+        "trajectory_continuity",
+        "gap_bridge_candidate",
+        "speed_anomaly",
+        "trajectory_quality",
     ]
 
     EVENT_COLUMNS = [
-        "crossing_id", "track_id", "track_ids", "first_frame", "last_frame",
-        "crossing_frame", "crossing_time_sec", "crossing_x", "crossing_y",
-        "direction", "normal_direction", "line_direction", "side_transition",
-        "track_class", "track_class_ratio", "class_ambiguous",
-        "line_distance_px", "previous_side", "current_side", "frame_gap",
-        "crossing_method", "crossing_candidate_class", "fast_crossing",
-        "track_observations", "crossing_index",
-        "pre_zone_observations", "corridor_observations", "post_zone_observations",
-        "pre_zone_evidence", "corridor_evidence", "post_zone_evidence",
-        "zone_path", "zone_chatter_count", "trajectory_quality",
-        "direction_confidence", "corridor_confidence",
-        "phase1_status", "phase2_status", "counted",
+        "crossing_id",
+        "track_id",
+        "track_ids",
+        "first_frame",
+        "last_frame",
+        "crossing_frame",
+        "crossing_time_sec",
+        "crossing_x",
+        "crossing_y",
+        "direction",
+        "normal_direction",
+        "line_direction",
+        "side_transition",
+        "track_class",
+        "track_class_ratio",
+        "class_ambiguous",
+        "line_distance_px",
+        "previous_side",
+        "current_side",
+        "frame_gap",
+        "crossing_method",
+        "crossing_candidate_class",
+        "fast_crossing",
+        "sparse_crossing",
+        "gap_bridge_used",
+        "track_observations",
+        "crossing_index",
+        "pre_zone_observations",
+        "corridor_observations",
+        "post_zone_observations",
+        "pre_zone_evidence",
+        "corridor_evidence",
+        "post_zone_evidence",
+        "zone_path",
+        "zone_chatter_count",
+        "trajectory_quality",
+        "direction_confidence",
+        "normal_displacement_px",
+        "corridor_confidence",
+        "phase1_status",
+        "phase2_status",
+        "count_eligibility",
+        "counted",
     ]
 
     AUDIT_COLUMNS = [
-        "crossing_id", "track_ids", "first_frame", "last_frame", "track_class",
-        "track_observations", "first_side", "last_side",
-        "first_distance_px", "last_distance_px", "min_distance_px",
-        "max_speed_px_per_frame", "mean_speed_px_per_frame",
-        "max_normal_velocity_px_per_frame", "mean_abs_normal_velocity_px_per_frame",
-        "mean_abs_tangent_velocity_px_per_frame", "trajectory_direction",
-        "normal_direction", "direction_confidence", "zone_path",
-        "zone_chatter_count", "pre_zone_observations", "corridor_observations",
-        "post_zone_observations", "pre_zone_evidence", "corridor_evidence",
-        "post_zone_evidence", "crossing_detected", "crossing_candidate_class",
-        "fast_crossing", "crossing_frame", "frame_gap", "crossing_method",
-        "crossing_direction", "phase1_status", "phase2_status",
-        "phase1_pass", "phase2_pass", "counted", "failure_reason",
+        "crossing_id",
+        "track_ids",
+        "first_frame",
+        "last_frame",
+        "track_class",
+        "track_observations",
+        "first_side",
+        "last_side",
+        "min_distance_px",
+        "max_speed_px_per_frame",
+        "mean_speed_px_per_frame",
+        "max_abs_normal_velocity_px_per_frame",
+        "mean_abs_normal_velocity_px_per_frame",
+        "mean_abs_tangent_velocity_px_per_frame",
+        "trajectory_direction",
+        "normal_direction",
+        "direction_confidence",
+        "normal_displacement_px",
+        "zone_path",
+        "zone_chatter_count",
+        "pre_zone_observations",
+        "corridor_observations",
+        "post_zone_observations",
+        "pre_zone_evidence",
+        "corridor_evidence",
+        "post_zone_evidence",
+        "crossing_detected",
+        "crossing_candidate_class",
+        "fast_crossing",
+        "sparse_crossing",
+        "gap_bridge_used",
+        "crossing_frame",
+        "frame_gap",
+        "crossing_method",
+        "crossing_direction",
+        "phase1_status",
+        "phase2_status",
+        "phase1_pass",
+        "phase2_pass",
+        "count_eligibility",
+        "counted",
+        "failure_reason",
     ]
 
-    def __init__(self, *, line_x1: float, line_y1: float,
-                 line_x2: float, line_y2: float, fps: float,
-                 config: Optional[CrossingConfig] = None) -> None:
+    def __init__(
+        self,
+        *,
+        line_x1: float,
+        line_y1: float,
+        line_x2: float,
+        line_y2: float,
+        fps: float,
+        config: Optional[CrossingConfig] = None,
+    ) -> None:
         if fps <= 0:
             raise ValueError(f"fps must be > 0, got {fps}")
+
         self.fps = float(fps)
         self.config = config or CrossingConfig()
+
         if not 0.0 < self.config.smoothing_alpha <= 1.0:
             raise ValueError("smoothing_alpha must be in (0, 1].")
+        if self.config.line_deadband_px < 0:
+            raise ValueError("line_deadband_px must be >= 0.")
         if self.config.corridor_px <= self.config.line_deadband_px:
             raise ValueError("corridor_px must be > line_deadband_px.")
         if self.config.corridor_exit_px < self.config.corridor_px:
             raise ValueError("corridor_exit_px must be >= corridor_px.")
+        if self.config.approach_distance_px < self.config.corridor_exit_px:
+            raise ValueError("approach_distance_px must be >= corridor_exit_px.")
 
-        self.x1, self.y1 = float(line_x1), float(line_y1)
-        self.x2, self.y2 = float(line_x2), float(line_y2)
+        self.x1 = float(line_x1)
+        self.y1 = float(line_y1)
+        self.x2 = float(line_x2)
+        self.y2 = float(line_y2)
+
         self.line_dx = self.x2 - self.x1
         self.line_dy = self.y2 - self.y1
         self.line_length = math.hypot(self.line_dx, self.line_dy)
+
         if self.line_length <= 0:
             raise ValueError("Counting line length must be > 0.")
 
+        # Unit tangent along the counting line.
         self.tangent_x = self.line_dx / self.line_length
         self.tangent_y = self.line_dy / self.line_length
+
+        # Unit normal to the counting line.
+        # Positive normal corresponds to positive signed distance.
         self.normal_x = -self.line_dy / self.line_length
         self.normal_y = self.line_dx / self.line_length
 
-    # ------------------------------------------------------------------
-    # Geometry
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # GEOMETRY
+    # ==================================================================
+
     def signed_line_value(self, x: float, y: float) -> float:
-        return self.line_dx * (y - self.y1) - self.line_dy * (x - self.x1)
+        return (
+            self.line_dx * (y - self.y1)
+            - self.line_dy * (x - self.x1)
+        )
 
     def signed_distance(self, x: float, y: float) -> float:
         return self.signed_line_value(x, y) / self.line_length
@@ -153,694 +301,1372 @@ class RobustCrossingEngine:
         return abs(self.signed_distance(x, y))
 
     def side(self, x: float, y: float) -> int:
-        d = self.signed_distance(x, y)
-        if abs(d) <= self.config.line_deadband_px:
+        distance = self.signed_distance(x, y)
+        if abs(distance) <= self.config.line_deadband_px:
             return 0
-        return 1 if d > 0 else -1
+        return 1 if distance > 0.0 else -1
 
-    # ------------------------------------------------------------------
-    # Smoothing
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # SMOOTHING
+    # ==================================================================
+
     def _ema(self, values: np.ndarray) -> np.ndarray:
-        if len(values) == 0:
+        if values.size == 0:
             return values.copy()
-        alpha = float(self.config.smoothing_alpha)
-        out = np.empty_like(values, dtype=np.float64)
-        out[0] = values[0]
-        for i in range(1, len(values)):
-            out[i] = alpha * values[i] + (1.0 - alpha) * out[i - 1]
-        return out
 
-    # ------------------------------------------------------------------
-    # Segment / line intersection
-    # ------------------------------------------------------------------
+        alpha = float(self.config.smoothing_alpha)
+        output = np.empty_like(values, dtype=np.float64)
+        output[0] = values[0]
+
+        for i in range(1, len(values)):
+            output[i] = alpha * values[i] + (1.0 - alpha) * output[i - 1]
+
+        return output
+
+    # ==================================================================
+    # SEGMENT GEOMETRY
+    # ==================================================================
+
     @staticmethod
-    def _orientation(ax, ay, bx, by, cx, cy) -> float:
+    def _orientation(
+        ax: float,
+        ay: float,
+        bx: float,
+        by: float,
+        cx: float,
+        cy: float,
+    ) -> float:
         return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
 
     @staticmethod
-    def _on_segment(ax, ay, bx, by, px, py) -> bool:
+    def _on_segment(
+        ax: float,
+        ay: float,
+        bx: float,
+        by: float,
+        px: float,
+        py: float,
+    ) -> bool:
         eps = 1e-9
         return (
             min(ax, bx) - eps <= px <= max(ax, bx) + eps
             and min(ay, by) - eps <= py <= max(ay, by) + eps
         )
 
-    def segments_intersect(self, p1, p2, q1, q2) -> bool:
+    def segments_intersect(
+        self,
+        p1: tuple[float, float],
+        p2: tuple[float, float],
+        q1: tuple[float, float],
+        q2: tuple[float, float],
+    ) -> bool:
         eps = 1e-9
+
         o1 = self._orientation(*p1, *p2, *q1)
         o2 = self._orientation(*p1, *p2, *q2)
         o3 = self._orientation(*q1, *q2, *p1)
         o4 = self._orientation(*q1, *q2, *p2)
-        if (((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps))
-                and ((o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps))):
+
+        if (
+            ((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps))
+            and ((o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps))
+        ):
             return True
-        if abs(o1) <= eps and self._on_segment(*p1, *p2, *q1): return True
-        if abs(o2) <= eps and self._on_segment(*p1, *p2, *q2): return True
-        if abs(o3) <= eps and self._on_segment(*q1, *q2, *p1): return True
-        if abs(o4) <= eps and self._on_segment(*q1, *q2, *p2): return True
+
+        if abs(o1) <= eps and self._on_segment(*p1, *p2, *q1):
+            return True
+        if abs(o2) <= eps and self._on_segment(*p1, *p2, *q2):
+            return True
+        if abs(o3) <= eps and self._on_segment(*q1, *q2, *p1):
+            return True
+        if abs(o4) <= eps and self._on_segment(*q1, *q2, *p2):
+            return True
+
         return False
 
-    def trajectory_intersects_line(self, previous_point, current_point) -> bool:
+    def trajectory_intersects_line(
+        self,
+        previous_point: tuple[float, float],
+        current_point: tuple[float, float],
+    ) -> bool:
         return self.segments_intersect(
-            previous_point, current_point, (self.x1, self.y1), (self.x2, self.y2)
+            previous_point,
+            current_point,
+            (self.x1, self.y1),
+            (self.x2, self.y2),
         )
 
-    def estimate_crossing_point(self, previous_point, current_point):
+    def estimate_crossing_point(
+        self,
+        previous_point: tuple[float, float],
+        current_point: tuple[float, float],
+    ) -> tuple[float, float]:
         d_prev = self.signed_distance(*previous_point)
         d_curr = self.signed_distance(*current_point)
-        denom = d_prev - d_curr
-        if abs(denom) < 1e-9:
+        denominator = d_prev - d_curr
+
+        if abs(denominator) < 1e-9:
             return current_point
-        alpha = max(0.0, min(1.0, d_prev / denom))
+
+        alpha = max(0.0, min(1.0, d_prev / denominator))
+
         return (
-            float(previous_point[0] + alpha * (current_point[0] - previous_point[0])),
-            float(previous_point[1] + alpha * (current_point[1] - previous_point[1])),
+            float(
+                previous_point[0]
+                + alpha * (current_point[0] - previous_point[0])
+            ),
+            float(
+                previous_point[1]
+                + alpha * (current_point[1] - previous_point[1])
+            ),
         )
 
-    # ------------------------------------------------------------------
-    # Trajectory preparation
-    # ------------------------------------------------------------------
-    def prepare(self, trajectory: pd.DataFrame) -> pd.DataFrame:
-        required = {
-            "track_id", "frame_id", "timestamp_sec",
-            "bottom_center_x", "bottom_center_y", "track_class",
-        }
-        missing = required - set(trajectory.columns)
-        if missing:
-            raise ValueError(f"Trajectory missing required columns: {sorted(missing)}")
-        if trajectory.empty:
-            return trajectory.copy()
+    # ==================================================================
+    # STABLE SIDE / DEAD-BAND AWARE LOGIC
+    # ==================================================================
 
-        df = trajectory.copy().sort_values(["track_id", "frame_id"]).reset_index(drop=True)
-        df["raw_x"] = pd.to_numeric(df["bottom_center_x"], errors="coerce")
-        df["raw_y"] = pd.to_numeric(df["bottom_center_y"], errors="coerce")
-        if df[["raw_x", "raw_y"]].isna().any().any():
-            raise ValueError("Trajectory contains invalid bottom-center coordinates.")
+    def _stable_side_series(self, raw_signed_distance: np.ndarray) -> np.ndarray:
+        """Return a side series that preserves the last known non-zero side.
 
-        smooth_x = pd.Series(index=df.index, dtype=float)
-        smooth_y = pd.Series(index=df.index, dtype=float)
-        for _, g in df.groupby("track_id", sort=False):
-            smooth_x.loc[g.index] = self._ema(g["raw_x"].to_numpy(float))
-            smooth_y.loc[g.index] = self._ema(g["raw_y"].to_numpy(float))
-        df["smooth_x"] = smooth_x
-        df["smooth_y"] = smooth_y
+        This explicitly handles:
 
-        df["frame_delta"] = df.groupby("track_id")["frame_id"].diff()
-        df["time_delta_sec"] = df.groupby("track_id")["timestamp_sec"].diff()
-        valid = df["frame_delta"].notna() & (df["frame_delta"] > 0)
-        fd = df["frame_delta"].where(valid, 1.0).fillna(1.0)
+            +1 -> 0 -> -1
+            -1 -> 0 -> +1
 
-        df["dx"] = df.groupby("track_id")["smooth_x"].diff().where(valid, 0.0).fillna(0.0)
-        df["dy"] = df.groupby("track_id")["smooth_y"].diff().where(valid, 0.0).fillna(0.0)
-        df["speed_px_per_frame"] = np.hypot(df["dx"], df["dy"]) / fd
+        as a valid side transition rather than losing the crossing because
+        an intermediate observation lies inside the deadband.
+        """
+        result = np.zeros(len(raw_signed_distance), dtype=np.int8)
+        last_stable = 0
 
-        vx_i = df["dx"] / fd
-        vy_i = df["dy"] / fd
-        w = max(1, int(self.config.velocity_window))
-        df["_vx"] = vx_i
-        df["_vy"] = vy_i
-        df["_vx_med"] = df.groupby("track_id", sort=False)["_vx"].transform(
-            lambda s: s.rolling(w, min_periods=1).median()
-        )
-        df["_vy_med"] = df.groupby("track_id", sort=False)["_vy"].transform(
-            lambda s: s.rolling(w, min_periods=1).median()
-        )
+        for i, distance in enumerate(raw_signed_distance):
+            if abs(distance) > self.config.line_deadband_px:
+                last_stable = 1 if distance > 0 else -1
+                result[i] = last_stable
+            else:
+                result[i] = last_stable
 
-        df["velocity_normal_px_per_frame"] = (
-            df["_vx_med"] * self.normal_x + df["_vy_med"] * self.normal_y
-        )
-        df["velocity_tangent_px_per_frame"] = (
-            df["_vx_med"] * self.tangent_x + df["_vy_med"] * self.tangent_y
-        )
+        return result
 
-        df["signed_distance_px"] = (
-            self.line_dx * (df["smooth_y"] - self.y1)
-            - self.line_dy * (df["smooth_x"] - self.x1)
-        ) / self.line_length
-        df["line_distance_px"] = df["signed_distance_px"].abs()
-        df["raw_signed_distance_px"] = (
-            self.line_dx * (df["raw_y"] - self.y1)
-            - self.line_dy * (df["raw_x"] - self.x1)
-        ) / self.line_length
-        df["raw_line_distance_px"] = df["raw_signed_distance_px"].abs()
-        df["raw_side"] = np.select(
-            [df["raw_line_distance_px"] <= self.config.line_deadband_px,
-             df["raw_signed_distance_px"] > 0],
-            [0, 1], default=-1,
-        ).astype(int)
-        df["side"] = np.select(
-            [df["line_distance_px"] <= self.config.line_deadband_px,
-             df["signed_distance_px"] > 0],
-            [0, 1], default=-1,
-        ).astype(int)
-
-        max_gap = self.config.max_trajectory_gap_sec * self.fps
-        df["trajectory_continuity"] = (
-            df["frame_delta"].isna() | (df["frame_delta"] <= max_gap)
-        ).astype(float)
-        df["speed_anomaly"] = (
-            df["speed_px_per_frame"] > self.config.max_velocity_px_per_frame
-        ).astype(float)
-        df["trajectory_quality"] = (
-            0.45 * df["trajectory_continuity"]
-            + 0.35 * (1.0 - df["speed_anomaly"])
-            + 0.20 * np.isfinite(df["velocity_normal_px_per_frame"]).astype(float)
-        ).clip(0.0, 1.0)
-
-        df["zone"] = self._assign_zones_hysteresis(df)
-        df["direction_local"], df["normal_direction_local"] = self._local_directions(df)
-
-        return df.drop(columns=["_vx", "_vy", "_vx_med", "_vy_med"], errors="ignore")
-
-    def _assign_zones_hysteresis(self, df: pd.DataFrame) -> pd.Series:
-        zones = pd.Series("UNKNOWN", index=df.index, dtype="object")
-        enter = float(self.config.corridor_px)
-        exit_ = float(self.config.corridor_exit_px)
-
-        for _, g in df.groupby("track_id", sort=False):
-            stable = g.loc[g["raw_side"] != 0, "raw_side"]
-            if stable.empty:
-                continue
-            initial_side = int(stable.iloc[0])
-            state = "PRE"
-            for idx in g.index:
-                d = float(df.at[idx, "raw_line_distance_px"])
-                s = int(df.at[idx, "raw_side"])
-
-                if state == "PRE":
-                    if s != 0 and s != initial_side and d >= exit_:
-                        state = "POST"
-                    elif d <= enter:
-                        state = "CORRIDOR"
-                    else:
-                        state = "PRE"
-                elif state == "CORRIDOR":
-                    # Only leave corridor once the object is clearly on the
-                    # opposite side and outside the wider exit boundary.
-                    if s != 0 and s != initial_side and d >= exit_:
-                        state = "POST"
-                    else:
-                        state = "CORRIDOR"
-                elif state == "POST":
-                    # Do not bounce back to PRE/CORRIDOR because of line jitter.
-                    state = "POST"
-
-                zones.at[idx] = state
-
-        return zones
-
-    def _local_directions(self, df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
-        business = pd.Series("UNKNOWN", index=df.index, dtype="object")
-        normal = pd.Series("UNKNOWN", index=df.index, dtype="object")
-        w = max(1, int(self.config.direction_window))
-
-        for _, g in df.groupby("track_id", sort=False):
-            idxs = list(g.index)
-            for local_i, idx in enumerate(idxs):
-                start = max(0, local_i - w)
-                end = min(len(g) - 1, local_i + w)
-                if end <= start:
-                    continue
-                a, b = g.iloc[start], g.iloc[end]
-                normal_delta = float(b["raw_signed_distance_px"] - a["raw_signed_distance_px"])
-                tangent_delta = float(
-                    (b["raw_x"] - a["raw_x"]) * self.tangent_x
-                    + (b["raw_y"] - a["raw_y"]) * self.tangent_y
-                )
-                if abs(normal_delta) >= self.config.min_normal_displacement_px:
-                    normal.at[idx] = (
-                        self.config.positive_normal_label
-                        if normal_delta > 0
-                        else self.config.negative_normal_label
-                    )
-                if abs(tangent_delta) >= self.config.min_direction_displacement_px:
-                    business.at[idx] = "L→R" if tangent_delta > 0 else "R→L"
-        return business, normal
-
-    # ------------------------------------------------------------------
-    # Crossing candidate logic
-    # ------------------------------------------------------------------
-    def _side_transition(self, previous_side: int, current_side: int) -> str:
-        if previous_side == -1 and current_side == 1:
+    def _side_transition(
+        self,
+        before_side: int,
+        after_side: int,
+    ) -> str:
+        if before_side == -1 and after_side == 1:
             return "side_-1_to_+1"
-        if previous_side == 1 and current_side == -1:
+        if before_side == 1 and after_side == -1:
             return "side_+1_to_-1"
         return "UNKNOWN"
 
-    def _pair_crossing(self, previous: pd.Series, current: pd.Series) -> dict:
-        p1 = (float(previous["raw_x"]), float(previous["raw_y"]))
-        p2 = (float(current["raw_x"]), float(current["raw_y"]))
-        prev_side = int(previous["raw_side"])
-        curr_side = int(current["raw_side"])
-        frame_gap = int(current["frame_id"] - previous["frame_id"])
+    def _find_stable_side_transition(
+        self,
+        group: pd.DataFrame,
+        end_index: int,
+    ) -> tuple[bool, int, int, int | None]:
+        """Find the nearest stable-side transition before/at end_index."""
+        if end_index < 1:
+            return False, 0, 0, None
 
-        line_intersection = self.trajectory_intersects_line(p1, p2)
-        side_change = prev_side != 0 and curr_side != 0 and prev_side != curr_side
-        corridor_support = min(
-            float(previous["raw_line_distance_px"]),
-            float(current["raw_line_distance_px"]),
-        ) <= self.config.corridor_px
+        stable = group["stable_side"].to_numpy(dtype=np.int8)
+        previous_stable = 0
 
-        crossing = bool(line_intersection or side_change)
-        skipped_corridor = bool(
-            crossing
-            and self.config.fast_crossing_allow_zero_corridor
-            and not corridor_support
+        for i in range(0, end_index + 1):
+            current = int(stable[i])
+            if current == 0:
+                continue
+            if previous_stable != 0 and current != previous_stable:
+                return True, previous_stable, current, i
+            previous_stable = current
+
+        return False, 0, 0, None
+
+    # ==================================================================
+    # ZONE STATE
+    # ==================================================================
+
+    def _zone_from_distance(self, distance: float, previous_zone: str) -> str:
+        """Classify zone with spatial hysteresis.
+
+        PRE / CORRIDOR / POST are relative to stable side. We preserve side
+        separately; zone only describes proximity/context around the line.
+        """
+        d = abs(float(distance))
+
+        if previous_zone == "CORRIDOR":
+            if d <= self.config.corridor_exit_px:
+                return "CORRIDOR"
+        elif previous_zone == "NEAR_LINE":
+            if d <= self.config.corridor_exit_px:
+                return "NEAR_LINE"
+
+        if d <= self.config.corridor_px:
+            return "CORRIDOR"
+        if d <= self.config.approach_distance_px:
+            return "NEAR_LINE"
+        return "PRE"
+
+    @staticmethod
+    def _zone_context(
+        stable_side: int,
+        zone: str,
+        has_crossed: bool,
+    ) -> str:
+        if has_crossed:
+            return "POST"
+        if zone == "CORRIDOR":
+            return "CROSSING_CANDIDATE"
+        if zone == "NEAR_LINE":
+            return "APPROACHING"
+        return "NO_CROSSING"
+
+    @staticmethod
+    def _collapse_zone_path(zones: list[str]) -> tuple[str, int]:
+        cleaned: list[str] = []
+        chatter = 0
+
+        for zone in zones:
+            if not zone:
+                continue
+            if not cleaned or zone != cleaned[-1]:
+                if cleaned:
+                    previous = cleaned[-1]
+                    if {previous, zone} <= {"PRE", "NEAR_LINE", "CORRIDOR"}:
+                        chatter += 1
+                    if {previous, zone} <= {"CORRIDOR", "POST"}:
+                        chatter += 1
+                cleaned.append(zone)
+
+        return (
+            " → ".join(cleaned) if cleaned else "UNKNOWN",
+            chatter,
         )
 
-        # Swept corridor: the segment may cross the corridor even if neither
-        # endpoint has a bbox center inside it.
-        d1 = abs(float(previous["raw_signed_distance_px"]))
-        d2 = abs(float(current["raw_signed_distance_px"]))
-        swept_corridor = crossing and (min(d1, d2) <= self.config.corridor_px or line_intersection)
+    # ==================================================================
+    # DIRECTION / TRAJECTORY METRICS
+    # ==================================================================
 
-        if crossing and skipped_corridor:
-            candidate_class = "FAST_CROSSING"
-        elif crossing:
-            candidate_class = "TRUE_CROSSING"
-        elif corridor_support:
-            candidate_class = "NEAR_LINE"
+    def _infer_trajectory_direction(self, group: pd.DataFrame) -> str:
+        if len(group) < 2:
+            return "UNKNOWN"
+
+        first = group.iloc[0]
+        last = group.iloc[-1]
+
+        dx = float(last["raw_x"] - first["raw_x"])
+        dy = float(last["raw_y"] - first["raw_y"])
+
+        tangent_displacement = dx * self.tangent_x + dy * self.tangent_y
+
+        if abs(tangent_displacement) < self.config.min_direction_displacement_px:
+            return "UNKNOWN"
+
+        return "L→R" if tangent_displacement > 0 else "R→L"
+
+    def _infer_crossing_direction(
+        self,
+        group: pd.DataFrame,
+        crossing_index: int,
+    ) -> tuple[str, float, float]:
+        window = max(1, int(self.config.direction_window))
+        start = max(0, crossing_index - window)
+        end = min(len(group) - 1, crossing_index + window)
+
+        before = group.iloc[start : crossing_index + 1]
+        after = group.iloc[crossing_index : end + 1]
+
+        if before.empty or after.empty:
+            return "UNKNOWN", 0.0, 0.0
+
+        start_d = float(before.iloc[0]["raw_signed_distance_px"])
+        end_d = float(after.iloc[-1]["raw_signed_distance_px"])
+        normal_displacement = end_d - start_d
+
+        before_side = 1 if start_d > 0 else -1 if start_d < 0 else 0
+        after_side = 1 if end_d > 0 else -1 if end_d < 0 else 0
+
+        displacement_conf = min(
+            1.0,
+            abs(normal_displacement)
+            / max(self.config.min_normal_displacement_px, 1e-6),
+        )
+
+        velocity_values = pd.to_numeric(
+            group.iloc[start : end + 1]["velocity_normal_px_per_frame"],
+            errors="coerce",
+        ).dropna()
+
+        if velocity_values.empty:
+            velocity_conf = 0.0
         else:
-            candidate_class = "NOT_CROSSING"
+            mean_abs_velocity = float(velocity_values.abs().mean())
+            velocity_conf = min(
+                1.0,
+                mean_abs_velocity
+                / max(self.config.min_normal_velocity_px_per_frame, 1.0),
+            )
 
-        return {
-            "crossing": crossing,
-            "line_intersection": line_intersection,
-            "side_change": side_change,
-            "corridor_support": corridor_support,
-            "swept_corridor": bool(swept_corridor),
-            "skipped_corridor": skipped_corridor,
-            "candidate_class": candidate_class,
-            "previous_side": prev_side,
-            "current_side": curr_side,
-            "frame_gap": frame_gap,
+        confidence = float(
+            np.clip(
+                0.70 * displacement_conf + 0.30 * velocity_conf,
+                0.0,
+                1.0,
+            )
+        )
+
+        if before_side == -1 and after_side == 1:
+            return self.config.positive_normal_label, confidence, normal_displacement
+        if before_side == 1 and after_side == -1:
+            return self.config.negative_normal_label, confidence, normal_displacement
+
+        # When endpoints are in the deadband, use signed displacement.
+        if normal_displacement > self.config.min_normal_displacement_px:
+            return self.config.positive_normal_label, confidence, normal_displacement
+        if normal_displacement < -self.config.min_normal_displacement_px:
+            return self.config.negative_normal_label, confidence, normal_displacement
+
+        return "UNKNOWN", confidence, normal_displacement
+
+    # ==================================================================
+    # TRAJECTORY PREPARATION
+    # ==================================================================
+
+    def prepare(self, trajectory: pd.DataFrame) -> pd.DataFrame:
+        required = {
+            "track_id",
+            "frame_id",
+            "timestamp_sec",
+            "bottom_center_x",
+            "bottom_center_y",
+            "track_class",
         }
 
-    def _find_crossing(self, group: pd.DataFrame) -> tuple[int | None, dict | None]:
+        missing = required - set(trajectory.columns)
+        if missing:
+            raise ValueError(
+                f"Trajectory missing required columns: {sorted(missing)}"
+            )
+
+        if trajectory.empty:
+            return trajectory.copy()
+
+        df = (
+            trajectory.copy()
+            .sort_values(["track_id", "frame_id"])
+            .reset_index(drop=True)
+        )
+
+        if "confidence" not in df.columns:
+            df["confidence"] = 1.0
+
+        if "class_name" not in df.columns:
+            df["class_name"] = df["track_class"]
+
+        if "track_class_ratio" not in df.columns:
+            df["track_class_ratio"] = 1.0
+
+        if "class_ambiguous" not in df.columns:
+            df["class_ambiguous"] = False
+
+        df["raw_x"] = pd.to_numeric(
+            df["bottom_center_x"], errors="coerce"
+        )
+        df["raw_y"] = pd.to_numeric(
+            df["bottom_center_y"], errors="coerce"
+        )
+        df["frame_id"] = pd.to_numeric(
+            df["frame_id"], errors="coerce"
+        )
+        df["timestamp_sec"] = pd.to_numeric(
+            df["timestamp_sec"], errors="coerce"
+        )
+
+        if df[["raw_x", "raw_y", "frame_id"]].isna().any().any():
+            raise ValueError(
+                "Trajectory contains NaN values in raw position/frame_id."
+            )
+
+        # --------------------------------------------------------------
+        # Per-track trajectory features.
+        # --------------------------------------------------------------
+        frames: list[pd.DataFrame] = []
+
+        for track_id, group in df.groupby("track_id", sort=False):
+            group = group.sort_values("frame_id").copy().reset_index(drop=True)
+
+            x = group["raw_x"].to_numpy(dtype=np.float64)
+            y = group["raw_y"].to_numpy(dtype=np.float64)
+            frames_arr = group["frame_id"].to_numpy(dtype=np.float64)
+            time_arr = group["timestamp_sec"].to_numpy(dtype=np.float64)
+
+            smooth_x = self._ema(x)
+            smooth_y = self._ema(y)
+
+            frame_delta = np.diff(frames_arr, prepend=frames_arr[0])
+            time_delta = np.diff(time_arr, prepend=time_arr[0])
+
+            frame_delta[0] = 0.0
+            time_delta[0] = 0.0
+
+            safe_frame_delta = np.where(frame_delta > 0.0, frame_delta, np.nan)
+
+            raw_dx = np.diff(x, prepend=x[0])
+            raw_dy = np.diff(y, prepend=y[0])
+
+            smooth_dx = np.diff(smooth_x, prepend=smooth_x[0])
+            smooth_dy = np.diff(smooth_y, prepend=smooth_y[0])
+
+            speed = np.sqrt(raw_dx**2 + raw_dy**2) / np.where(
+                np.isnan(safe_frame_delta), 1.0, np.maximum(safe_frame_delta, 1.0)
+            )
+
+            velocity_normal = (
+                smooth_dx * self.normal_x
+                + smooth_dy * self.normal_y
+            ) / np.where(
+                np.isnan(safe_frame_delta), 1.0, np.maximum(safe_frame_delta, 1.0)
+            )
+
+            velocity_tangent = (
+                smooth_dx * self.tangent_x
+                + smooth_dy * self.tangent_y
+            ) / np.where(
+                np.isnan(safe_frame_delta), 1.0, np.maximum(safe_frame_delta, 1.0)
+            )
+
+            signed_distance_raw = np.array(
+                [self.signed_distance(float(px), float(py)) for px, py in zip(x, y)],
+                dtype=np.float64,
+            )
+            signed_distance_smooth = np.array(
+                [
+                    self.signed_distance(float(px), float(py))
+                    for px, py in zip(smooth_x, smooth_y)
+                ],
+                dtype=np.float64,
+            )
+
+            raw_side = np.array(
+                [
+                    self.side(float(px), float(py))
+                    for px, py in zip(x, y)
+                ],
+                dtype=np.int8,
+            )
+
+            stable_side = self._stable_side_series(signed_distance_raw)
+
+            # ----------------------------------------------------------
+            # Hysteretic spatial zone.
+            # ----------------------------------------------------------
+            zones: list[str] = []
+            previous_zone = "PRE"
+            for distance in np.abs(signed_distance_raw):
+                zone = self._zone_from_distance(
+                    float(distance), previous_zone
+                )
+                zones.append(zone)
+                previous_zone = zone
+
+            # Determine whether a stable side transition already occurred.
+            crossed_seen = False
+            context: list[str] = []
+            previous_stable_side = 0
+
+            for side_value, zone_value in zip(stable_side, zones):
+                current_side = int(side_value)
+                if (
+                    previous_stable_side != 0
+                    and current_side != 0
+                    and current_side != previous_stable_side
+                ):
+                    crossed_seen = True
+                if current_side != 0:
+                    previous_stable_side = current_side
+
+                context.append(
+                    self._zone_context(
+                        current_side,
+                        zone_value,
+                        crossed_seen,
+                    )
+                )
+
+            continuity = np.ones(len(group), dtype=np.float64)
+            speed_anomaly = np.zeros(len(group), dtype=bool)
+            gap_bridge = np.zeros(len(group), dtype=bool)
+            quality = np.ones(len(group), dtype=np.float64)
+
+            for i in range(1, len(group)):
+                gap = int(frames_arr[i] - frames_arr[i - 1])
+                continuity[i] = 1.0 if gap <= 1 else max(
+                    0.0,
+                    1.0
+                    - (
+                        (gap - 1)
+                        / max(
+                            self.config.max_trajectory_gap_sec * self.fps,
+                            1.0,
+                        )
+                    ),
+                )
+
+                if (
+                    gap > 1
+                    and gap <= self.config.gap_bridge_max_frames
+                    and self.config.gap_bridge_enabled
+                ):
+                    gap_bridge[i] = True
+
+            speed_limit = max(self.config.max_velocity_px_per_frame, 1e-6)
+            bridge_limit = max(self.config.max_velocity_bridge_px_per_frame, speed_limit)
+
+            for i in range(len(group)):
+                speed_value = float(speed[i])
+                limit = bridge_limit if gap_bridge[i] else speed_limit
+
+                if speed_value > limit:
+                    speed_anomaly[i] = True
+                    quality[i] *= max(
+                        0.0,
+                        min(1.0, limit / max(speed_value, 1e-6)),
+                    )
+
+                quality[i] *= float(0.75 + 0.25 * continuity[i])
+
+            group["smooth_x"] = smooth_x
+            group["smooth_y"] = smooth_y
+            group["dx"] = raw_dx
+            group["dy"] = raw_dy
+            group["frame_delta"] = frame_delta
+            group["time_delta_sec"] = time_delta
+            group["speed_px_per_frame"] = speed
+            group["velocity_normal_px_per_frame"] = velocity_normal
+            group["velocity_tangent_px_per_frame"] = velocity_tangent
+            group["raw_signed_distance_px"] = signed_distance_raw
+            group["raw_line_distance_px"] = np.abs(signed_distance_raw)
+            group["signed_distance_px"] = signed_distance_smooth
+            group["line_distance_px"] = np.abs(signed_distance_smooth)
+            group["raw_side"] = raw_side
+            group["stable_side"] = stable_side
+            group["zone"] = zones
+            group["zone_context"] = context
+            group["trajectory_continuity"] = continuity
+            group["gap_bridge_candidate"] = gap_bridge
+            group["speed_anomaly"] = speed_anomaly
+            group["trajectory_quality"] = quality
+
+            # Local direction is computed from normal/tangent velocity.
+            group["direction_local"] = np.where(
+                velocity_tangent > self.config.min_direction_displacement_px,
+                "L→R",
+                np.where(
+                    velocity_tangent < -self.config.min_direction_displacement_px,
+                    "R→L",
+                    "UNKNOWN",
+                ),
+            )
+            group["normal_direction_local"] = np.where(
+                velocity_normal > self.config.min_normal_velocity_px_per_frame,
+                self.config.positive_normal_label,
+                np.where(
+                    velocity_normal < -self.config.min_normal_velocity_px_per_frame,
+                    self.config.negative_normal_label,
+                    "UNKNOWN",
+                ),
+            )
+
+            frames.append(group)
+
+        result = pd.concat(frames, ignore_index=True)
+
+        return result
+
+    # ==================================================================
+    # CROSSING DETECTION
+    # ==================================================================
+
+    def _gap_velocity_bridge(
+        self,
+        previous: pd.Series,
+        current: pd.Series,
+    ) -> tuple[bool, str]:
+        """Detect crossing across a sparse observation gap."""
+        if not self.config.gap_bridge_enabled:
+            return False, ""
+
+        frame_gap = int(current["frame_id"] - previous["frame_id"])
+        if frame_gap <= 1 or frame_gap > self.config.gap_bridge_max_frames:
+            return False, ""
+
+        previous_distance = float(previous["raw_signed_distance_px"])
+        current_distance = float(current["raw_signed_distance_px"])
+
+        # The strongest sparse crossing evidence is a sign change.
+        sign_change = (
+            previous_distance != 0.0
+            and current_distance != 0.0
+            and np.sign(previous_distance) != np.sign(current_distance)
+        )
+
+        dx = float(current["raw_x"] - previous["raw_x"])
+        dy = float(current["raw_y"] - previous["raw_y"])
+        speed = math.hypot(dx, dy) / max(frame_gap, 1)
+
+        fast_motion = speed >= (
+            self.config.fast_speed_multiplier
+            * self.config.max_velocity_px_per_frame
+        )
+
+        if sign_change and fast_motion:
+            return True, "gap_velocity_bridge"
+
+        # Even without high speed, a sparse sign transition is a valid bridge.
+        if sign_change:
+            return True, "gap_side_transition"
+
+        return False, ""
+
+    def _detect_crossing_candidates(
+        self,
+        group: pd.DataFrame,
+    ) -> list[dict]:
+        """Return every geometric crossing candidate; do not stop at first.
+
+        Candidate types are based on geometry first, not PRE/POST eligibility.
+        """
+        candidates: list[dict] = []
+
+        if len(group) < self.config.min_track_observations:
+            return candidates
+
+        max_gap_frames = max(
+            1.0,
+            self.config.max_trajectory_gap_sec * self.fps,
+        )
+
+        last_nonzero_index: int | None = None
+        last_nonzero_side: int = 0
+
         for i in range(1, len(group)):
             previous = group.iloc[i - 1]
             current = group.iloc[i]
-            gap = int(current["frame_id"] - previous["frame_id"])
-            if gap <= 0 or gap > self.config.max_trajectory_gap_sec * self.fps:
+
+            previous_frame = int(previous["frame_id"])
+            current_frame = int(current["frame_id"])
+            frame_gap = current_frame - previous_frame
+
+            if frame_gap <= 0 or frame_gap > max_gap_frames:
                 continue
-            result = self._pair_crossing(previous, current)
-            if result["crossing"]:
-                return i, result
-        return None, None
 
-    def _zone_summary(self, group: pd.DataFrame) -> dict:
+            previous_point = (
+                float(previous["raw_x"]),
+                float(previous["raw_y"]),
+            )
+            current_point = (
+                float(current["raw_x"]),
+                float(current["raw_y"]),
+            )
+
+            prev_distance = float(previous["raw_signed_distance_px"])
+            curr_distance = float(current["raw_signed_distance_px"])
+
+            prev_raw_side = int(previous["raw_side"])
+            curr_raw_side = int(current["raw_side"])
+
+            prev_stable_side = int(previous["stable_side"])
+            curr_stable_side = int(current["stable_side"])
+
+            # ----------------------------------------------------------
+            # A. Raw segment intersection.
+            # ----------------------------------------------------------
+            line_intersection = self.trajectory_intersects_line(
+                previous_point,
+                current_point,
+            )
+
+            # ----------------------------------------------------------
+            # B. Stable-side crossing. This catches + -> 0 -> -.
+            # ----------------------------------------------------------
+            stable_side_change = (
+                prev_stable_side != 0
+                and curr_stable_side != 0
+                and prev_stable_side != curr_stable_side
+            )
+
+            # ----------------------------------------------------------
+            # C. Deadband-aware signed-distance transition.
+            # ----------------------------------------------------------
+            deadband_aware_transition = False
+
+            if last_nonzero_index is not None and i >= last_nonzero_index:
+                if (
+                    last_nonzero_side != 0
+                    and curr_stable_side != 0
+                    and last_nonzero_side != curr_stable_side
+                ):
+                    deadband_aware_transition = True
+
+            if curr_raw_side != 0:
+                last_nonzero_index = i
+                last_nonzero_side = curr_raw_side
+
+            # Another direct form: previous/current signed distances have
+            # opposite signs, even if both are inside/outside a deadband.
+            signed_distance_sign_change = (
+                prev_distance != 0.0
+                and curr_distance != 0.0
+                and np.sign(prev_distance) != np.sign(curr_distance)
+            )
+
+            # ----------------------------------------------------------
+            # D. Gap / velocity bridge.
+            # ----------------------------------------------------------
+            gap_bridge, gap_method = self._gap_velocity_bridge(
+                previous,
+                current,
+            )
+
+            crossing = bool(
+                line_intersection
+                or stable_side_change
+                or deadband_aware_transition
+                or signed_distance_sign_change
+                or gap_bridge
+            )
+
+            if not crossing:
+                continue
+
+            method_parts: list[str] = []
+            if line_intersection:
+                method_parts.append("raw_segment_intersection")
+            if stable_side_change:
+                method_parts.append("stable_side_transition")
+            if deadband_aware_transition:
+                method_parts.append("deadband_aware_transition")
+            if signed_distance_sign_change:
+                method_parts.append("signed_distance_sign_change")
+            if gap_bridge:
+                method_parts.append(gap_method)
+
+            min_distance = min(
+                abs(prev_distance),
+                abs(curr_distance),
+            )
+
+            corridor_touch = min_distance <= self.config.corridor_px
+            previous_zone = str(previous["zone"])
+            current_zone = str(current["zone"])
+            zero_corridor = not corridor_touch
+
+            speed_now = float(current["speed_px_per_frame"])
+            speed_fast_threshold = (
+                self.config.fast_speed_multiplier
+                * self.config.max_velocity_px_per_frame
+            )
+            speed_fast = speed_now >= speed_fast_threshold
+
+            sparse_crossing = (
+                frame_gap > 1
+                or zero_corridor
+                or gap_bridge
+            )
+
+            fast_crossing = bool(
+                sparse_crossing
+                and (
+                    speed_fast
+                    or gap_bridge
+                    or zero_corridor
+                )
+            )
+
+            if zero_corridor and not self.config.allow_zero_corridor_crossing:
+                # Geometry remains a candidate; do not discard it. Mark as
+                # sparse so Phase 3 can decide later.
+                method_parts.append("corridor_skipped")
+            elif zero_corridor:
+                method_parts.append("corridor_skipped")
+
+            crossing_x, crossing_y = self.estimate_crossing_point(
+                previous_point,
+                current_point,
+            )
+
+            candidates.append(
+                {
+                    "index": i,
+                    "crossing_frame": current_frame,
+                    "crossing_time_sec": float(current["timestamp_sec"]),
+                    "crossing_x": crossing_x,
+                    "crossing_y": crossing_y,
+                    "previous_side": prev_stable_side,
+                    "current_side": curr_stable_side,
+                    "side_transition": self._side_transition(
+                        prev_stable_side,
+                        curr_stable_side,
+                    ),
+                    "frame_gap": frame_gap,
+                    "crossing_method": "+".join(dict.fromkeys(method_parts)),
+                    "corridor_touch": bool(corridor_touch),
+                    "fast_crossing": bool(fast_crossing),
+                    "sparse_crossing": bool(sparse_crossing),
+                    "gap_bridge_used": bool(gap_bridge),
+                    "previous_zone": previous_zone,
+                    "current_zone": current_zone,
+                }
+            )
+
+        return candidates
+
+    # ==================================================================
+    # CROSSING EVIDENCE
+    # ==================================================================
+
+    def _zone_evidence(
+        self,
+        group: pd.DataFrame,
+        crossing_index: int | None,
+    ) -> dict:
+        if group.empty:
+            return {
+                "pre_zone_observations": 0,
+                "corridor_observations": 0,
+                "post_zone_observations": 0,
+                "pre_zone_evidence": False,
+                "corridor_evidence": False,
+                "post_zone_evidence": False,
+                "zone_path": "UNKNOWN",
+                "zone_chatter_count": 0,
+                "normal_direction": "UNKNOWN",
+                "direction_confidence": 0.0,
+                "normal_displacement_px": 0.0,
+                "corridor_confidence": 0.0,
+            }
+
         zones = group["zone"].astype(str).tolist()
-        compact = []
-        for zone in zones:
-            if not compact or compact[-1] != zone:
-                compact.append(zone)
 
-        chatter = sum(
-            1 for a, b in zip(compact, compact[1:])
-            if {a, b} == {"PRE", "CORRIDOR"}
+        # Use first geometric crossing position as the temporal split.
+        split = crossing_index if crossing_index is not None else len(group)
+
+        before = group.iloc[: split + 1]
+        after = group.iloc[split:]
+
+        pre_obs = int((before["zone"] == "PRE").sum())
+        corridor_obs = int((group["zone"] == "CORRIDOR").sum())
+
+        # POST evidence is derived from a stable-side change after the
+        # crossing candidate. This avoids relying on the precomputed
+        # zone_context, because the trajectory was not yet labelled as
+        # crossed when zone_context was originally generated.
+        if crossing_index is None or crossing_index <= 0:
+            post_obs = 0
+        else:
+            pre_stable_values = group.iloc[:crossing_index]["stable_side"]
+            stable_pre = pre_stable_values[pre_stable_values != 0]
+            reference_side = int(stable_pre.iloc[-1]) if not stable_pre.empty else 0
+            if reference_side == 0:
+                post_obs = 0
+            else:
+                post_obs = int(
+                    (group.iloc[crossing_index + 1 :]["stable_side"] != reference_side).sum()
+                )
+
+        pre_evidence = pre_obs >= self.config.min_pre_zone_observations
+        corridor_evidence = corridor_obs >= self.config.min_corridor_observations
+        post_evidence = post_obs >= self.config.min_post_zone_observations
+
+        path, chatter = self._collapse_zone_path(zones)
+
+        if crossing_index is None:
+            normal_direction = "UNKNOWN"
+            direction_confidence = 0.0
+            normal_displacement = 0.0
+        else:
+            normal_direction, direction_confidence, normal_displacement = (
+                self._infer_crossing_direction(group, crossing_index)
+            )
+
+        corridor_density = corridor_obs / max(len(group), 1)
+        corridor_confidence = float(
+            np.clip(
+                0.40 * min(1.0, corridor_obs / max(self.config.min_corridor_observations, 1))
+                + 0.30 * min(1.0, corridor_density * 10.0)
+                + 0.30 * direction_confidence,
+                0.0,
+                1.0,
+            )
         )
-        counts = group["zone"].value_counts()
+
         return {
-            "zone_path": " → ".join(compact),
+            "pre_zone_observations": pre_obs,
+            "corridor_observations": corridor_obs,
+            "post_zone_observations": post_obs,
+            "pre_zone_evidence": bool(pre_evidence),
+            "corridor_evidence": bool(corridor_evidence),
+            "post_zone_evidence": bool(post_evidence),
+            "zone_path": path,
             "zone_chatter_count": int(chatter),
-            "pre_zone_observations": int(counts.get("PRE", 0)),
-            "corridor_observations": int(counts.get("CORRIDOR", 0)),
-            "post_zone_observations": int(counts.get("POST", 0)),
+            "normal_direction": normal_direction,
+            "direction_confidence": float(direction_confidence),
+            "normal_displacement_px": float(normal_displacement),
+            "corridor_confidence": corridor_confidence,
         }
 
-    def _direction_at_crossing(self, group: pd.DataFrame, crossing_index: int) -> tuple[str, str, float]:
-        w = max(1, int(self.config.direction_window))
-        start = max(0, crossing_index - w)
-        end = min(len(group) - 1, crossing_index + w)
-        if end <= start:
-            return "UNKNOWN", "UNKNOWN", 0.0
+    # ==================================================================
+    # PHASE STATUS
+    # ==================================================================
 
-        before = group.iloc[start]
-        after = group.iloc[end]
-        normal_delta = float(after["raw_signed_distance_px"] - before["raw_signed_distance_px"])
-        displacement = abs(normal_delta)
-
-        samples = group.iloc[start:end + 1]
-        normal_v = pd.to_numeric(samples["velocity_normal_px_per_frame"], errors="coerce").dropna()
-        if displacement < self.config.min_normal_displacement_px:
-            return "UNKNOWN", "UNKNOWN", 0.0
-
-        normal_direction = (
-            self.config.positive_normal_label
-            if normal_delta > 0
-            else self.config.negative_normal_label
-        )
-
-        same_sign_fraction = float(
-            (np.sign(normal_v) == (1 if normal_delta > 0 else -1)).mean()
-        ) if not normal_v.empty else 0.0
-        displacement_score = min(1.0, displacement / (3.0 * self.config.min_normal_displacement_px))
-        confidence = float(np.clip(0.65 * displacement_score + 0.35 * same_sign_fraction, 0.0, 1.0))
-
-        return normal_direction, normal_direction, confidence
-
-    def _phase1_status(self, group: pd.DataFrame) -> tuple[str, bool, str]:
+    def _phase1_status(self, group: pd.DataFrame) -> tuple[str, str, bool]:
         if len(group) < self.config.min_track_observations:
-            return "FAIL", False, "insufficient_track_observations"
-        if not np.isfinite(group["speed_px_per_frame"].to_numpy()).all():
-            return "FAIL", False, "non_finite_velocity"
-        if not np.isfinite(group["signed_distance_px"].to_numpy()).all():
-            return "FAIL", False, "non_finite_signed_distance"
-        if not np.isfinite(group["velocity_normal_px_per_frame"].to_numpy()).all():
-            return "FAIL", False, "non_finite_normal_velocity"
+            return "FAIL", "insufficient_track_observations", False
 
-        continuity = float(group["trajectory_continuity"].mean())
-        anomaly_fraction = float(group["speed_anomaly"].mean())
-        if continuity < 0.80:
-            return "REVIEW", False, "trajectory_has_large_gaps"
-        if anomaly_fraction > 0.25:
-            return "REVIEW", False, "frequent_speed_anomalies"
-        return "PASS", True, ""
+        finite_cols = [
+            "raw_x",
+            "raw_y",
+            "speed_px_per_frame",
+            "velocity_normal_px_per_frame",
+            "trajectory_continuity",
+        ]
+        if group[finite_cols].isna().any().any():
+            return "FAIL", "non_finite_trajectory_values", False
 
-    def _zone_evidence(self, group: pd.DataFrame, crossing_index: int | None) -> dict:
-        zone = self._zone_summary(group)
-        if crossing_index is None:
-            pre_n = zone["pre_zone_observations"]
-            corridor_n = zone["corridor_observations"]
-            post_n = zone["post_zone_observations"]
-        else:
-            before = group.iloc[:crossing_index + 1]
-            after = group.iloc[crossing_index:]
-            pre_n = int((before["zone"] == "PRE").sum())
-            corridor_n = int((before["zone"] == "CORRIDOR").sum())
-            post_n = int((after["zone"] == "POST").sum())
+        mean_quality = float(group["trajectory_quality"].mean())
+        anomaly_count = int(group["speed_anomaly"].sum())
+        continuity_mean = float(group["trajectory_continuity"].mean())
 
-        zone["pre_zone_evidence"] = pre_n >= self.config.min_pre_zone_observations
-        zone["corridor_evidence"] = corridor_n >= self.config.min_corridor_observations
-        zone["post_zone_evidence"] = post_n >= self.config.min_post_zone_observations
-        return zone
+        if anomaly_count > max(2, int(len(group) * 0.25)):
+            return "REVIEW", "frequent_speed_anomalies", False
 
-    def _phase2_status(self, *, candidate_class: str, crossing: bool, zone: dict,
-                       normal_direction: str, direction_confidence: float) -> tuple[str, bool, str]:
-        if not crossing:
-            return "NOT_CROSSING", False, ""
-        if normal_direction == "UNKNOWN" or direction_confidence < self.config.min_direction_confidence:
-            return "REVIEW", False, "low_crossing_direction_confidence"
+        if continuity_mean < 0.50:
+            return "REVIEW", "poor_trajectory_continuity", False
 
-        # Fast crossing is valid geometric evidence even when there is no
-        # actual bbox-center observation inside the corridor.
-        corridor_ok = zone["corridor_evidence"] or candidate_class == "FAST_CROSSING"
-        if not corridor_ok:
-            return "REVIEW", False, "insufficient_corridor_evidence"
+        if mean_quality < 0.65:
+            return "REVIEW", "low_trajectory_quality", False
 
-        if not zone["pre_zone_evidence"]:
-            return "REVIEW", False, "insufficient_pre_zone_evidence"
-        if self.config.require_post_zone and not zone["post_zone_evidence"]:
-            return "REVIEW", False, "insufficient_post_zone_evidence"
-        return "PASS", True, ""
+        return "PASS", "", True
 
-    def detect_track_crossing(self, group: pd.DataFrame, *, identity_id: int | None = None) -> Optional[dict]:
-        group = group.sort_values("frame_id").reset_index(drop=True).copy()
-        if len(group) < self.config.min_track_observations:
-            return None
-        if identity_id is None:
-            identity_id = int(group.iloc[0]["track_id"])
+    def _phase2_status(
+        self,
+        crossing: dict | None,
+        evidence: dict,
+    ) -> tuple[str, str, bool, bool]:
+        """Return status, reason, phase2_pass, count_eligibility.
 
-        track_class = str(group.iloc[0]["track_class"])
-        first_frame = int(group["frame_id"].min())
-        last_frame = int(group["frame_id"].max())
-        phase1_status, phase1_pass, phase1_reason = self._phase1_status(group)
-        crossing_index, pair = self._find_crossing(group)
-        zone = self._zone_evidence(group, crossing_index)
+        Important: geometry and evidence remain separate.
+        A true geometric crossing can be REVIEW without being deleted.
+        """
+        if crossing is None:
+            return "NOT_CROSSING", "no_geometric_crossing_detected", False, False
 
-        if crossing_index is None or pair is None:
-            phase2_status, phase2_pass, phase2_reason = self._phase2_status(
-                candidate_class="NOT_CROSSING", crossing=False, zone=zone,
-                normal_direction="UNKNOWN", direction_confidence=0.0,
-            )
-            candidate_class = "NEAR_LINE" if zone["corridor_observations"] else "NOT_CROSSING"
-            return self._build_event(
-                group, identity_id, track_class, zone, phase1_status, phase1_pass,
-                phase1_reason, phase2_status, phase2_pass, phase2_reason,
-                crossing_index=None, pair=None, candidate_class=candidate_class,
-                normal_direction="UNKNOWN", direction_confidence=0.0,
-            )
+        reasons: list[str] = []
 
-        normal_direction, line_direction, direction_confidence = self._direction_at_crossing(group, crossing_index)
-        phase2_status, phase2_pass, phase2_reason = self._phase2_status(
-            candidate_class=pair["candidate_class"], crossing=True, zone=zone,
-            normal_direction=normal_direction, direction_confidence=direction_confidence,
+        if not evidence["pre_zone_evidence"]:
+            reasons.append("insufficient_pre_zone_evidence")
+
+        if not evidence["corridor_evidence"]:
+            reasons.append("insufficient_corridor_evidence")
+
+        if not evidence["post_zone_evidence"]:
+            reasons.append("insufficient_post_zone_evidence")
+
+        if (
+            evidence["normal_direction"] == "UNKNOWN"
+            or evidence["direction_confidence"] < self.config.min_direction_confidence
+        ):
+            reasons.append("low_crossing_direction_confidence")
+
+        # Fast/sparse crossing is still a geometric crossing. Missing zone
+        # evidence becomes REVIEW, never automatic rejection.
+        if crossing["fast_crossing"]:
+            reasons.append("fast_or_sparse_crossing")
+
+        if reasons:
+            return "REVIEW", ";".join(reasons), False, True
+
+        return "PASS", "", True, True
+
+    # ==================================================================
+    # TRACK EVENT
+    # ==================================================================
+
+    def _build_event_for_track(
+        self,
+        group: pd.DataFrame,
+        identity_id: int,
+    ) -> dict:
+        track_class = str(group.iloc[0].get("track_class", "unknown"))
+        track_class_ratio = float(group.iloc[0].get("track_class_ratio", 1.0))
+        class_ambiguous = bool(group.iloc[0].get("class_ambiguous", False))
+
+        phase1_status, phase1_reason, phase1_pass = self._phase1_status(group)
+
+        candidates = self._detect_crossing_candidates(group)
+
+        # We preserve ALL geometric candidates for audit. For backward
+        # compatibility with one-event-per-identity consumers, the primary
+        # event is the first geometrically valid crossing.
+        crossing = candidates[0] if candidates else None
+        crossing_index = crossing["index"] if crossing else None
+
+        evidence = self._zone_evidence(
+            group,
+            crossing_index,
         )
 
-        return self._build_event(
-            group, identity_id, track_class, zone, phase1_status, phase1_pass,
-            phase1_reason, phase2_status, phase2_pass, phase2_reason,
-            crossing_index=crossing_index, pair=pair,
-            candidate_class=pair["candidate_class"],
-            normal_direction=normal_direction,
-            direction_confidence=direction_confidence,
-            line_direction=line_direction,
+        phase2_status, phase2_reason, phase2_pass, count_eligibility = (
+            self._phase2_status(crossing, evidence)
         )
 
-    def _build_event(self, group, identity_id, track_class, zone,
-                     phase1_status, phase1_pass, phase1_reason,
-                     phase2_status, phase2_pass, phase2_reason,
-                     crossing_index, pair, candidate_class,
-                     normal_direction, direction_confidence,
-                     line_direction="UNKNOWN") -> dict:
-        first_frame = int(group["frame_id"].min())
-        last_frame = int(group["frame_id"].max())
         max_speed = float(group["speed_px_per_frame"].max())
         mean_speed = float(group["speed_px_per_frame"].mean())
         max_normal = float(group["velocity_normal_px_per_frame"].abs().max())
         mean_abs_normal = float(group["velocity_normal_px_per_frame"].abs().mean())
         mean_abs_tangent = float(group["velocity_tangent_px_per_frame"].abs().mean())
-        trajectory_direction = self._infer_track_direction(group)
+        trajectory_direction = self._infer_trajectory_direction(group)
+        trajectory_quality = float(group["trajectory_quality"].mean())
 
-        if crossing_index is None or pair is None:
-            crossing_frame = pd.NA
-            crossing_time = pd.NA
-            crossing_x = pd.NA
-            crossing_y = pd.NA
-            previous_side = pd.NA
-            current_side = pd.NA
-            frame_gap = pd.NA
-            method = ""
-            side_transition = "UNKNOWN"
-            direction = trajectory_direction
-            fast_crossing = False
-            line_distance = float(group["raw_line_distance_px"].min())
-        else:
-            previous = group.iloc[crossing_index - 1]
-            current = group.iloc[crossing_index]
-            p1 = (float(previous["raw_x"]), float(previous["raw_y"]))
-            p2 = (float(current["raw_x"]), float(current["raw_y"]))
-            cross_point = self.estimate_crossing_point(p1, p2)
-            crossing_frame = int(current["frame_id"])
-            crossing_time = float(current["timestamp_sec"])
-            crossing_x, crossing_y = cross_point
-            previous_side = pair["previous_side"] if pair["previous_side"] != 0 else None
-            current_side = pair["current_side"] if pair["current_side"] != 0 else None
-            frame_gap = pair["frame_gap"]
-            side_transition = self._side_transition(previous_side or 0, current_side or 0)
-            methods = []
-            if pair["side_change"]: methods.append("side_change")
-            if pair["line_intersection"]: methods.append("line_intersection")
-            if pair["corridor_support"]: methods.append("corridor_support")
-            if pair["skipped_corridor"]: methods.append("corridor_skipped")
-            method = "+".join(methods)
-            direction = normal_direction if normal_direction != "UNKNOWN" else trajectory_direction
-            fast_crossing = bool(pair["skipped_corridor"])
-            line_distance = min(float(previous["raw_line_distance_px"]), float(current["raw_line_distance_px"]))
+        crossing_detected = crossing is not None
+        candidate_class = (
+            "TRUE_CROSSING"
+            if crossing_detected and not crossing["fast_crossing"]
+            else "FAST_CROSSING"
+            if crossing_detected
+            else "NEAR_LINE"
+            if float(group["raw_line_distance_px"].min()) <= self.config.corridor_exit_px
+            else "APPROACHING"
+            if float(group["raw_line_distance_px"].min()) <= self.config.approach_distance_px
+            else "NO_CROSSING"
+        )
 
-        corridor_confidence = float(np.clip(
-            zone["corridor_observations"] / max(1, self.config.min_corridor_observations), 0.0, 1.0
-        ))
-        counted = bool(phase1_pass and phase2_pass)
+        # A track can be a TRUE_CROSSING even if evidence is incomplete.
+        # This is exactly the candidate-preserving behavior needed before
+        # State Machine.
+        count_eligible = bool(
+            crossing_detected
+            and evidence["direction_confidence"] >= self.config.min_direction_confidence
+        )
 
-        return {
+        # Current module deliberately does NOT perform final counting.
+        # `counted` mirrors geometry eligibility only so downstream consumers
+        # can inspect candidates without silently deleting them. Phase 3 will
+        # own the final count decision.
+        counted = count_eligible
+
+        reasons: list[str] = []
+        if phase1_reason:
+            reasons.append(f"P1:{phase1_reason}")
+        if phase2_reason:
+            reasons.append(f"P2:{phase2_reason}")
+
+        event = {
             "crossing_id": int(identity_id),
             "track_id": int(group.iloc[-1]["track_id"]),
-            "track_ids": "",
-            "first_frame": first_frame,
-            "last_frame": last_frame,
-            "crossing_frame": crossing_frame,
-            "crossing_time_sec": crossing_time,
-            "crossing_x": crossing_x,
-            "crossing_y": crossing_y,
-            "direction": direction,
-            "normal_direction": normal_direction,
-            "line_direction": line_direction,
-            "side_transition": side_transition,
+            "track_ids": str(group["track_id"].drop_duplicates().tolist()),
+            "first_frame": int(group["frame_id"].min()),
+            "last_frame": int(group["frame_id"].max()),
+            "crossing_frame": crossing["crossing_frame"] if crossing else pd.NA,
+            "crossing_time_sec": crossing["crossing_time_sec"] if crossing else pd.NA,
+            "crossing_x": crossing["crossing_x"] if crossing else pd.NA,
+            "crossing_y": crossing["crossing_y"] if crossing else pd.NA,
+            "direction": evidence["normal_direction"],
+            "normal_direction": evidence["normal_direction"],
+            "line_direction": trajectory_direction,
+            "side_transition": crossing["side_transition"] if crossing else "UNKNOWN",
             "track_class": track_class,
-            "track_class_ratio": float(group.iloc[0].get("track_class_ratio", np.nan)),
-            "class_ambiguous": bool(group.iloc[0].get("class_ambiguous", False)),
-            "line_distance_px": line_distance,
-            "previous_side": previous_side,
-            "current_side": current_side,
-            "frame_gap": frame_gap,
-            "crossing_method": method,
+            "track_class_ratio": track_class_ratio,
+            "class_ambiguous": class_ambiguous,
+            "line_distance_px": (
+                min(
+                    float(group.iloc[max(0, crossing_index - 1)]["raw_line_distance_px"]),
+                    float(group.iloc[crossing_index]["raw_line_distance_px"]),
+                )
+                if crossing_index is not None
+                else float(group["raw_line_distance_px"].min())
+            ),
+            "previous_side": crossing["previous_side"] if crossing else pd.NA,
+            "current_side": crossing["current_side"] if crossing else pd.NA,
+            "frame_gap": crossing["frame_gap"] if crossing else pd.NA,
+            "crossing_method": crossing["crossing_method"] if crossing else "",
             "crossing_candidate_class": candidate_class,
-            "fast_crossing": fast_crossing,
-            "track_observations": len(group),
+            "fast_crossing": bool(crossing["fast_crossing"]) if crossing else False,
+            "sparse_crossing": bool(crossing["sparse_crossing"]) if crossing else False,
+            "gap_bridge_used": bool(crossing["gap_bridge_used"]) if crossing else False,
+            "track_observations": int(len(group)),
             "crossing_index": crossing_index if crossing_index is not None else pd.NA,
-            **zone,
-            "trajectory_quality": round(float(group["trajectory_quality"].mean()), 4),
-            "direction_confidence": round(float(direction_confidence), 4),
-            "corridor_confidence": round(corridor_confidence, 4),
+            "pre_zone_observations": evidence["pre_zone_observations"],
+            "corridor_observations": evidence["corridor_observations"],
+            "post_zone_observations": evidence["post_zone_observations"],
+            "pre_zone_evidence": evidence["pre_zone_evidence"],
+            "corridor_evidence": evidence["corridor_evidence"],
+            "post_zone_evidence": evidence["post_zone_evidence"],
+            "zone_path": evidence["zone_path"],
+            "zone_chatter_count": evidence["zone_chatter_count"],
+            "trajectory_quality": round(trajectory_quality, 4),
+            "direction_confidence": round(float(evidence["direction_confidence"]), 4),
+            "normal_displacement_px": round(float(evidence["normal_displacement_px"]), 4),
+            "corridor_confidence": round(float(evidence["corridor_confidence"]), 4),
             "phase1_status": phase1_status,
             "phase2_status": phase2_status,
-            "counted": counted,
-            "_phase1_pass": phase1_pass,
-            "_phase2_pass": phase2_pass,
+            "count_eligibility": bool(count_eligibility),
+            "counted": bool(counted),
+            "_phase1_pass": bool(phase1_pass),
+            "_phase2_pass": bool(phase2_pass),
             "_phase1_reason": phase1_reason,
             "_phase2_reason": phase2_reason,
+            "_failure_reason": ";".join(reasons),
             "_max_speed": max_speed,
             "_mean_speed": mean_speed,
             "_max_normal": max_normal,
             "_mean_abs_normal": mean_abs_normal,
             "_mean_abs_tangent": mean_abs_tangent,
             "_trajectory_direction": trajectory_direction,
+            "_candidates": candidates,
         }
 
-    def _infer_track_direction(self, group: pd.DataFrame) -> str:
-        if len(group) < 2:
-            return "UNKNOWN"
-        tangent_delta = (
-            float(group.iloc[-1]["raw_x"] - group.iloc[0]["raw_x"]) * self.tangent_x
-            + float(group.iloc[-1]["raw_y"] - group.iloc[0]["raw_y"]) * self.tangent_y
-        )
-        if abs(tangent_delta) < self.config.min_direction_displacement_px:
-            return "UNKNOWN"
-        return "L→R" if tangent_delta > 0 else "R→L"
+        return event
 
-    # ------------------------------------------------------------------
-    # Audit
-    # ------------------------------------------------------------------
-    def _build_track_audit_row(self, group: pd.DataFrame, event: dict, identity_id: int) -> dict:
-        stable = group.loc[group["raw_side"] != 0, "raw_side"]
+    # ==================================================================
+    # AUDIT
+    # ==================================================================
+
+    def _build_audit_row(
+        self,
+        group: pd.DataFrame,
+        event: dict,
+    ) -> dict:
+        stable = group.loc[group["stable_side"] != 0, "stable_side"]
         first_side = int(stable.iloc[0]) if not stable.empty else 0
         last_side = int(stable.iloc[-1]) if not stable.empty else 0
-        reasons = []
-        if event.get("_phase1_reason"):
-            reasons.append(f"P1:{event['_phase1_reason']}")
-        if event.get("_phase2_reason"):
-            reasons.append(f"P2:{event['_phase2_reason']}")
 
-        crossing_detected = pd.notna(event.get("crossing_frame", pd.NA))
+        crossing_detected = bool(event.get("crossing_candidate_class") in {
+            "TRUE_CROSSING",
+            "FAST_CROSSING",
+        })
+
         return {
-            "crossing_id": int(identity_id),
-            "track_ids": str(group["track_id"].drop_duplicates().tolist()),
+            "crossing_id": int(event["crossing_id"]),
+            "track_ids": event["track_ids"],
             "first_frame": int(group["frame_id"].min()),
             "last_frame": int(group["frame_id"].max()),
-            "track_class": str(event.get("track_class", "unknown")),
+            "track_class": event["track_class"],
             "track_observations": int(len(group)),
             "first_side": first_side,
             "last_side": last_side,
-            "first_distance_px": float(group.iloc[0]["raw_line_distance_px"]),
-            "last_distance_px": float(group.iloc[-1]["raw_line_distance_px"]),
             "min_distance_px": float(group["raw_line_distance_px"].min()),
-            "max_speed_px_per_frame": float(event.get("_max_speed", 0.0)),
-            "mean_speed_px_per_frame": float(event.get("_mean_speed", 0.0)),
-            "max_normal_velocity_px_per_frame": float(event.get("_max_normal", 0.0)),
-            "mean_abs_normal_velocity_px_per_frame": float(event.get("_mean_abs_normal", 0.0)),
-            "mean_abs_tangent_velocity_px_per_frame": float(event.get("_mean_abs_tangent", 0.0)),
-            "trajectory_direction": str(event.get("_trajectory_direction", "UNKNOWN")),
-            "normal_direction": str(event.get("normal_direction", "UNKNOWN")),
-            "direction_confidence": float(event.get("direction_confidence", 0.0)),
-            "zone_path": str(event.get("zone_path", "UNKNOWN")),
-            "zone_chatter_count": int(event.get("zone_chatter_count", 0)),
-            "pre_zone_observations": int(event.get("pre_zone_observations", 0)),
-            "corridor_observations": int(event.get("corridor_observations", 0)),
-            "post_zone_observations": int(event.get("post_zone_observations", 0)),
-            "pre_zone_evidence": bool(event.get("pre_zone_evidence", False)),
-            "corridor_evidence": bool(event.get("corridor_evidence", False)),
-            "post_zone_evidence": bool(event.get("post_zone_evidence", False)),
-            "crossing_detected": bool(crossing_detected),
-            "crossing_candidate_class": str(event.get("crossing_candidate_class", "NOT_CROSSING")),
-            "fast_crossing": bool(event.get("fast_crossing", False)),
-            "crossing_frame": event.get("crossing_frame", pd.NA),
-            "frame_gap": event.get("frame_gap", pd.NA),
-            "crossing_method": str(event.get("crossing_method", "")),
-            "crossing_direction": str(event.get("normal_direction", "UNKNOWN")),
-            "phase1_status": str(event.get("phase1_status", "FAIL")),
-            "phase2_status": str(event.get("phase2_status", "NOT_CROSSING")),
-            "phase1_pass": bool(event.get("_phase1_pass", False)),
-            "phase2_pass": bool(event.get("_phase2_pass", False)),
-            "counted": bool(event.get("counted", False)),
-            "failure_reason": ";".join(reasons),
+            "max_speed_px_per_frame": float(event["_max_speed"]),
+            "mean_speed_px_per_frame": float(event["_mean_speed"]),
+            "max_abs_normal_velocity_px_per_frame": float(event["_max_normal"]),
+            "mean_abs_normal_velocity_px_per_frame": float(event["_mean_abs_normal"]),
+            "mean_abs_tangent_velocity_px_per_frame": float(event["_mean_abs_tangent"]),
+            "trajectory_direction": event["_trajectory_direction"],
+            "normal_direction": event["normal_direction"],
+            "direction_confidence": float(event["direction_confidence"]),
+            "normal_displacement_px": float(event["normal_displacement_px"]),
+            "zone_path": event["zone_path"],
+            "zone_chatter_count": int(event["zone_chatter_count"]),
+            "pre_zone_observations": int(event["pre_zone_observations"]),
+            "corridor_observations": int(event["corridor_observations"]),
+            "post_zone_observations": int(event["post_zone_observations"]),
+            "pre_zone_evidence": bool(event["pre_zone_evidence"]),
+            "corridor_evidence": bool(event["corridor_evidence"]),
+            "post_zone_evidence": bool(event["post_zone_evidence"]),
+            "crossing_detected": crossing_detected,
+            "crossing_candidate_class": event["crossing_candidate_class"],
+            "fast_crossing": bool(event["fast_crossing"]),
+            "sparse_crossing": bool(event["sparse_crossing"]),
+            "gap_bridge_used": bool(event["gap_bridge_used"]),
+            "crossing_frame": event["crossing_frame"],
+            "frame_gap": event["frame_gap"],
+            "crossing_method": event["crossing_method"],
+            "crossing_direction": event["normal_direction"],
+            "phase1_status": event["phase1_status"],
+            "phase2_status": event["phase2_status"],
+            "phase1_pass": bool(event["_phase1_pass"]),
+            "phase2_pass": bool(event["_phase2_pass"]),
+            "count_eligibility": bool(event["count_eligibility"]),
+            "counted": bool(event["counted"]),
+            "failure_reason": event["_failure_reason"],
         }
 
-    # ------------------------------------------------------------------
-    # Batch
-    # ------------------------------------------------------------------
-    def process(self, trajectory: pd.DataFrame, identity_column: str = "crossing_id",
-                return_diagnostics: bool = False):
+    # ==================================================================
+    # BATCH
+    # ==================================================================
+
+    def process(
+        self,
+        trajectory: pd.DataFrame,
+        identity_column: str = "crossing_id",
+        return_diagnostics: bool = False,
+    ):
         if identity_column not in trajectory.columns:
-            raise ValueError(f"Trajectory missing identity column: {identity_column}")
+            raise ValueError(
+                f"Trajectory missing identity column: {identity_column}"
+            )
+
         if trajectory.empty:
-            e = pd.DataFrame(columns=self.EVENT_COLUMNS)
-            a = pd.DataFrame(columns=self.AUDIT_COLUMNS)
-            p = trajectory.copy()
+            events = pd.DataFrame(columns=self.EVENT_COLUMNS)
+            audits = pd.DataFrame(columns=self.AUDIT_COLUMNS)
+            prepared = trajectory.copy()
             if return_diagnostics:
-                return e, a, p
-            return e, a
+                return events, audits, prepared
+            return events, audits
 
         prepared = self.prepare(trajectory)
-        events, audits = [], []
-        for identity_id, group in prepared.groupby(identity_column, sort=False):
-            group = group.sort_values("frame_id").reset_index(drop=True)
-            event = self.detect_track_crossing(group, identity_id=int(identity_id))
-            if event is None:
-                continue
-            event["track_ids"] = str(group["track_id"].drop_duplicates().tolist())
-            events.append({k: event.get(k, pd.NA) for k in self.EVENT_COLUMNS})
-            audits.append(self._build_track_audit_row(group, event, int(identity_id)))
 
-        events_df = pd.DataFrame(events, columns=self.EVENT_COLUMNS)
-        audit_df = pd.DataFrame(audits, columns=self.AUDIT_COLUMNS)
+        events: list[dict] = []
+        audits: list[dict] = []
+
+        for identity_id, group in prepared.groupby(identity_column, sort=False):
+            group = (
+                group.sort_values("frame_id")
+                .reset_index(drop=True)
+            )
+
+            event = self._build_event_for_track(
+                group,
+                int(identity_id),
+            )
+
+            # Every identity gets an audit row. This fixes the previous
+            # problem where no-crossing tracks vanished from the audit.
+            audits.append(
+                self._build_audit_row(
+                    group,
+                    event,
+                )
+            )
+
+            # Only geometric crossing candidates become events. Non-crossing
+            # and merely approaching tracks stay in the audit table and do not
+            # become fake crossing events.
+            if event["crossing_candidate_class"] in {
+                "TRUE_CROSSING",
+                "FAST_CROSSING",
+            }:
+                events.append(
+                    {
+                        key: event.get(key, pd.NA)
+                        for key in self.EVENT_COLUMNS
+                    }
+                )
+
+        events_df = pd.DataFrame(
+            events,
+            columns=self.EVENT_COLUMNS,
+        )
+
+        audit_df = pd.DataFrame(
+            audits,
+            columns=self.AUDIT_COLUMNS,
+        )
+
         if return_diagnostics:
             return events_df, audit_df, prepared
+
         return events_df, audit_df
 
+    # ==================================================================
+    # REPORT
+    # ==================================================================
+
     @staticmethod
-    def print_phase_report(events_df: pd.DataFrame, audit_df: pd.DataFrame) -> None:
+    def print_phase_report(
+        events_df: pd.DataFrame,
+        audit_df: pd.DataFrame,
+    ) -> None:
         print("\n" + "=" * 96)
-        print("PHASE 1/2 TRAJECTORY + CROSSING CANDIDATE AUDIT v2")
+        print("PHASE 1/2 TRAJECTORY + CROSSING CANDIDATE AUDIT v3")
         print("=" * 96)
+
         if audit_df.empty:
             print("No tracks available.")
             return
 
         total = len(audit_df)
-        p1p = int((audit_df.phase1_status == "PASS").sum())
-        p1r = int((audit_df.phase1_status == "REVIEW").sum())
-        p1f = int((audit_df.phase1_status == "FAIL").sum())
-        not_cross = int((audit_df.crossing_candidate_class == "NOT_CROSSING").sum())
-        near_line = int((audit_df.crossing_candidate_class == "NEAR_LINE").sum())
-        true_cross = int((audit_df.crossing_candidate_class == "TRUE_CROSSING").sum())
-        fast_cross = int((audit_df.crossing_candidate_class == "FAST_CROSSING").sum())
-        p2p = int((audit_df.phase2_status == "PASS").sum())
-        p2r = int((audit_df.phase2_status == "REVIEW").sum())
-        p2f = int((audit_df.phase2_status == "FAIL").sum())
-        direction_known = int((audit_df.normal_direction != "UNKNOWN").sum())
-        chatter = int((audit_df.zone_chatter_count > 0).sum())
+
+        p1_pass = int((audit_df["phase1_status"] == "PASS").sum())
+        p1_review = int((audit_df["phase1_status"] == "REVIEW").sum())
+        p1_fail = int((audit_df["phase1_status"] == "FAIL").sum())
+
+        candidate_counts = (
+            audit_df["crossing_candidate_class"]
+            .value_counts()
+            .to_dict()
+        )
+
+        no_cross = int(candidate_counts.get("NO_CROSSING", 0))
+        approaching = int(candidate_counts.get("APPROACHING", 0))
+        near_line = int(candidate_counts.get("NEAR_LINE", 0))
+        true_cross = int(candidate_counts.get("TRUE_CROSSING", 0))
+        fast_cross = int(candidate_counts.get("FAST_CROSSING", 0))
+
+        p2_pass = int((audit_df["phase2_status"] == "PASS").sum())
+        p2_review = int((audit_df["phase2_status"] == "REVIEW").sum())
+        p2_not_cross = int((audit_df["phase2_status"] == "NOT_CROSSING").sum())
+
+        known_direction = int(
+            audit_df["normal_direction"].ne("UNKNOWN").sum()
+        )
+        crossing_total = true_cross + fast_cross
+
+        chatter = int(
+            (pd.to_numeric(audit_df["zone_chatter_count"], errors="coerce") > 0).sum()
+        )
+
+        fast = audit_df[
+            audit_df["crossing_candidate_class"] == "FAST_CROSSING"
+        ]
+
+        sparse = audit_df[
+            audit_df["sparse_crossing"].astype(bool)
+            & audit_df["crossing_detected"].astype(bool)
+        ]
 
         print(f"Tracks analysed                    : {total:,}")
-        print(f"NOT_CROSSING tracks                 : {not_cross:,}")
+        print(f"NO_CROSSING tracks                  : {no_cross:,}")
+        print(f"APPROACHING tracks                  : {approaching:,}")
         print(f"NEAR_LINE tracks                    : {near_line:,}")
         print(f"TRUE_CROSSING candidates            : {true_cross:,}")
         print(f"FAST_CROSSING candidates            : {fast_cross:,}")
         print()
-        print(f"PHASE 1                            : PASS={p1p:,} | REVIEW={p1r:,} | FAIL={p1f:,}")
-        print(f"PHASE 2                            : PASS={p2p:,} | REVIEW={p2r:,} | FAIL={p2f:,} | NOT_CROSSING={not_cross:,}")
-        print(f"Normal direction known              : {direction_known:,}/{true_cross + fast_cross:,}")
+        print(
+            f"PHASE 1                            : "
+            f"PASS={p1_pass:,} | REVIEW={p1_review:,} | FAIL={p1_fail:,}"
+        )
+        print(
+            f"PHASE 2                            : "
+            f"PASS={p2_pass:,} | REVIEW={p2_review:,} | "
+            f"NOT_CROSSING={p2_not_cross:,}"
+        )
+        print(
+            f"Known normal direction              : "
+            f"{known_direction:,}/{crossing_total:,}"
+        )
         print(f"Zone chatter tracks                 : {chatter:,}")
+        print(f"Sparse crossing candidates           : {len(sparse):,}")
         print()
-        if fast_cross:
-            fast = audit_df[audit_df.crossing_candidate_class == "FAST_CROSSING"]
-            print("FAST CROSSING DIAGNOSTIC:")
-            print(f"  Zero/low corridor evidence        : {int((fast.corridor_observations == 0).sum()):,}")
-            print(f"  Mean frame gap at crossing         : {pd.to_numeric(fast.frame_gap, errors='coerce').mean():.2f}")
-            print(f"  Mean max speed (px/frame)          : {fast.max_speed_px_per_frame.mean():.2f}")
 
-        review = audit_df[audit_df.phase2_status == "REVIEW"]
+        if not fast.empty:
+            print("FAST CROSSING DIAGNOSTIC:")
+            print(
+                "  Mean max speed (px/frame)         : "
+                f"{fast['max_speed_px_per_frame'].mean():.2f}"
+            )
+            print(
+                "  Mean crossing frame gap           : "
+                f"{pd.to_numeric(fast['frame_gap'], errors='coerce').mean():.2f}"
+            )
+            print(
+                "  Zero corridor observations        : "
+                f"{int((fast['corridor_observations'] == 0).sum()):,}"
+            )
+
+        review = audit_df[
+            audit_df["phase2_status"] == "REVIEW"
+        ]
+
         if not review.empty:
             print("\nTOP REVIEW REASONS:")
             print(
@@ -852,8 +1678,31 @@ class RobustCrossingEngine:
             )
 
         print("\nCANDIDATE CLASS DISTRIBUTION:")
-        print(audit_df["crossing_candidate_class"].value_counts().to_string())
+        print(
+            audit_df["crossing_candidate_class"]
+            .value_counts()
+            .to_string()
+        )
+
+        print("\nCROSSING METHOD DISTRIBUTION:")
+        crossing_rows = audit_df[
+            audit_df["crossing_detected"].astype(bool)
+        ]
+        if crossing_rows.empty:
+            print("No geometric crossings.")
+        else:
+            print(
+                crossing_rows["crossing_method"]
+                .fillna("")
+                .value_counts()
+                .head(15)
+                .to_string()
+            )
+
         print("=" * 96)
 
 
-__all__ = ["CrossingConfig", "RobustCrossingEngine"]
+__all__ = [
+    "CrossingConfig",
+    "RobustCrossingEngine",
+]
