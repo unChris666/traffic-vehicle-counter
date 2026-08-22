@@ -1,56 +1,67 @@
-Phase 1-2 v3 — Candidate-Preserving Trajectory + Crossing Audit
+# Phase 1-2 v4: Class Evidence + Short Track + Zone Stability
 
-This release implements the requested architecture before State Machine Phase 3:
+Architecture:
 
 TRACK
--> TRAJECTORY
--> ZONE CONTEXT
--> CROSSING DETECTOR
--> CROSSING EVIDENCE
--> AUDIT
+  -> TRAJECTORY
+  -> CROSSING CANDIDATE
+  -> AUDIT
+  -> COUNTER
 
-Main changes
+This release does NOT implement Phase 3 State Machine.
 
-NO_CROSSING, APPROACHING, NEAR_LINE, and CROSSING_CANDIDATE are separate concepts.
+## 1. Class evidence
 
-PRE/POST/CORRIDOR evidence does not delete a geometric crossing candidate.
+`track_class` from the earlier track-level majority classifier is preserved as `detector_track_class`.
+The crossing engine computes `counting_class` using raw `class_name` observations near the crossing, confidence-weighted and recency-weighted.
 
-Stable-side transition handles +1 -> 0 -> -1 and -1 -> 0 -> +1.
+Example:
 
-Raw segment intersection is the primary geometric crossing signal.
+person -> person -> motorcycle -> motorcycle -> motorcycle
 
-Signed-distance sign change is an additional crossing signal.
+can become:
 
-Sparse observation gaps can use a velocity/sign bridge.
+counting_class = motorcycle
+class_transition = person->motorcycle
 
-Fast crossings can be valid even with zero observed corridor frames.
+The event still exposes `track_class` as `counting_class` for backward compatibility with the existing counter.
 
-Normal velocity is computed relative to the counting line, not from raw X only.
+## 2. Short-track eligibility
 
-Zone context uses spatial hysteresis.
+A short track is no longer an automatic invalid object.
 
-Every track stays in the audit output, including non-crossing tracks.
+`short_track=True` is diagnostic. A geometric crossing can remain `count_eligibility=True` when direction and counting-class evidence are strong enough.
 
-Multiple geometric crossing candidates are detected internally, while one primary event is exposed for backward compatibility.
+The engine records `short_track_crossing` and reasons in the audit.
 
-Final counting remains intentionally outside this module; Phase 3 State Machine should own final count decisions.
+## 3. Zone stability
 
-Drop-in file
+Raw geometry continues to use raw bbox coordinates.
+Zone labels use temporal hysteresis:
 
-Replace:
+- `zone_enter_confirm_observations`
+- `zone_exit_confirm_observations`
 
-app/counting/robust_crossing.py
+`PRE -> NEAR_LINE -> CORRIDOR` is normal progression and is NOT counted as chatter.
+Chatter means actual backtracking such as:
 
-with:
+`PRE -> NEAR_LINE -> PRE`
 
-robust_crossing_phase12_v3.py
+or
 
-The public interface remains:
+`CORRIDOR -> NEAR_LINE -> CORRIDOR`.
 
-CrossingConfig
+## 4. Counter
 
-RobustCrossingEngine.process(trajectory, identity_column='crossing_id', return_diagnostics=False)
+`TrafficCounter` uses `counting_class` exposed through `track_class` by `RobustCrossingEngine`, so the existing vehicle filter remains compatible.
 
-Important
+Additional class evidence columns are preserved in `final_crossings`.
 
-This release intentionally does not implement the State Machine. Do not tune the final count from counted yet; treat count_eligibility and the audit fields as candidate-level evidence until Phase 3 is implemented.
+## 5. Required replacement files
+
+- app/counting/robust_crossing.py
+- app/counting/counter.py
+- app/core/config.py
+- app/inference/engine.py
+
+No changes to YOLO26 / BoT-SORT are required.

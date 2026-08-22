@@ -11,20 +11,60 @@ from pathlib import Path
 @dataclass(frozen=True)
 class DetectionConfig:
     """
-    Detection and tracking configuration.
+    BASELINE detection configuration.
 
-    YOLO26m + BoT-SORT remain unchanged for Phase 1.
+    IMPORTANT:
+        Robust branch changes Phase 3 counting logic only.
+
+        Phase 1 should remain aligned with baseline:
+            YOLO26m .pt
+            BoT-SORT
+            existing inference settings
     """
 
+    # --------------------------------------------------------
+    # YOLO26m pretrained weights
+    #
+    # Do NOT use TensorRT on robust branch.
+    # --------------------------------------------------------
+
     model_name: str = "yolo26m.pt"
+
+    # --------------------------------------------------------
+    # Tracker
+    # --------------------------------------------------------
+
     tracker: str = "botsort.yaml"
 
+    # --------------------------------------------------------
+    # Baseline inference size
+    # --------------------------------------------------------
+
     imgsz: int = 640
+
+    # --------------------------------------------------------
+    # Detection confidence
+    # --------------------------------------------------------
+
     conf_threshold: float = 0.20
+
+    # --------------------------------------------------------
+    # IoU
+    # --------------------------------------------------------
+
     iou_threshold: float = 0.70
 
-    # Process every frame.
+    # --------------------------------------------------------
+    # Baseline processes the source video normally.
+    #
+    # We are NOT changing temporal sampling in this branch.
+    # --------------------------------------------------------
+
     vid_stride: int = 1
+
+    # --------------------------------------------------------
+    # Device
+    # --------------------------------------------------------
 
     device: str = "auto"
 
@@ -36,14 +76,11 @@ class DetectionConfig:
 @dataclass(frozen=True)
 class CountingConfig:
     """
-    Robust counting configuration.
+    Robust Phase 3 configuration.
 
-    This configuration intentionally contains both:
+    Phase 1 / Phase 2 remain baseline.
 
-    1. Existing identity-management parameters required by
-       TrafficCounter / CrossingIdentityEngine.
-
-    2. New Phase 1 / Phase 2 trajectory and corridor parameters.
+    Only Phase 3 crossing/counting is changed.
     """
 
     # ========================================================
@@ -61,106 +98,82 @@ class CountingConfig:
     line_x2_ratio: float = 0.05
     line_y2_ratio: float = 0.95
 
-    line_deadband_px: float = 8.0
+    # ========================================================
+    # LINE DEADBAND
+    # ========================================================
 
+    line_deadband_px: float = 8.0
 
     # ========================================================
     # TRACK TRAJECTORY
     # ========================================================
 
+    # Keep this reasonably permissive because temporary
+    # tracking gaps can occur during occlusion.
     max_trajectory_gap_sec: float = 1.50
 
-
     # ========================================================
-    # LEGACY MOTORCYCLE DEDUP
+    # LEGACY MOTORCYCLE FRAGMENTATION
     # ========================================================
 
-    # Preserved for API compatibility.
-    # Generic time/distance dedup remains disabled in the
-    # current identity architecture.
-
+    # These remain for compatibility with TrafficCounter.
     moto_dedup_time_sec: float = 0.25
     moto_dedup_distance_px: float = 30.0
-
-
-    # ========================================================
-    # IDENTITY MANAGEMENT / FRAGMENT RECONNECT
-    # ========================================================
-
-    pre_crossing_distance_px: float = 100.0
-
-    max_identity_reconnect_gap_sec: float = 1.0
-
-    max_identity_reconnect_distance_px: float = 100.0
-
-    identity_match_threshold: float = 0.82
-
-    identity_match_margin: float = 0.08
-
-    velocity_gate_px_per_frame: float = 30.0
-
-    min_pre_crossing_observations: int = 2
-
 
     # ========================================================
     # ROBUST CROSSING GEOMETRY
     # ========================================================
 
+    # Wider corridor helps fast vehicles that may have sparse
+    # observations around the line.
     crossing_corridor_px: float = 45.0
 
+    # Minimum movement before direction is trusted.
     min_direction_displacement_px: float = 8.0
 
+    # Observations around crossing used for direction estimate.
     direction_window: int = 3
-
 
     # ========================================================
     # PHASE 1 — TRAJECTORY ENGINE
     # ========================================================
 
-    # Causal EMA smoothing.
-    #
-    # Important:
-    # trajectory analysis may use smoothed coordinates,
-    # while zone classification should use raw coordinates
-    # to avoid smoothing latency.
-
+    # Causal EMA used for trajectory analysis. Zone membership still uses
+    # the raw observed bbox position to avoid smoothing latency.
     trajectory_smoothing_alpha: float = 0.35
 
-    # Number of recent observations used for velocity analysis.
-
+    # Velocity samples used internally by downstream phases when needed.
     trajectory_velocity_window: int = 5
 
-    # Diagnostic upper bound for image-space speed.
-
+    # Maximum image-space speed considered reasonable for trajectory
+    # quality diagnostics. This is not a detector confidence threshold.
     max_velocity_px_per_frame: float = 80.0
-
 
     # ========================================================
     # PHASE 2 — CROSSING CORRIDOR
     # ========================================================
 
-    # Minimum evidence required in each zone.
-
     min_pre_zone_observations: int = 2
-
     min_corridor_observations: int = 1
-
     min_post_zone_observations: int = 1
 
-    # Phase 2 PASS requires evidence after the line.
-
+    # Require evidence that the object actually reaches the post-zone
+    # before Phase 2 can be considered PASS.
     require_post_zone: bool = True
-
 
     # ========================================================
     # FINAL DUPLICATE SUPPRESSION
     # ========================================================
 
-    # Conservative values retained for compatibility.
-    # Identity management remains the primary mechanism.
+    # VERY conservative.
+    #
+    # Goal:
+    #   two real motorcycles close together = 2
+    #
+    # Fragmentation should primarily be resolved by track
+    # continuity / identity, not by an enormous spatial window.
 
     duplicate_time_sec: float = 0.30
-
     duplicate_distance_px: float = 25.0
 
 
@@ -181,7 +194,6 @@ class AppConfig:
         default_factory=CountingConfig
     )
 
-
     # ========================================================
     # TARGET CLASSES
     # ========================================================
@@ -194,9 +206,8 @@ class AppConfig:
         "truck",
     )
 
-
     # ========================================================
-    # VEHICLE CLASSES
+    # VEHICLES
     # ========================================================
 
     vehicle_classes: tuple[str, ...] = (
@@ -212,6 +223,7 @@ class AppConfig:
 # ============================================================
 
 def build_config() -> AppConfig:
+
     config = AppConfig()
 
     Path(

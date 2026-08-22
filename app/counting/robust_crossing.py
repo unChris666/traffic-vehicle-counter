@@ -82,6 +82,28 @@ class CrossingConfig:
     min_direction_confidence: float = 0.50
     min_normal_displacement_px: float = 8.0
 
+    # Short tracks are diagnostic, not automatic rejection.
+    short_track_observation_threshold: int = 8
+
+    # --------------------------------------------------------------
+    # CLASS EVIDENCE
+    # --------------------------------------------------------------
+    # Use raw detector classes near the crossing, rather than relying
+    # only on the global majority `track_class`. This handles cases such
+    # as person -> motorcycle during one physical track.
+    class_evidence_window_frames: int = 8
+    class_recency_decay: float = 0.18
+    min_counting_class_confidence: float = 0.45
+
+    # --------------------------------------------------------------
+    # ZONE TEMPORAL HYSTERESIS
+    # --------------------------------------------------------------
+    # A zone transition must persist for N consecutive observations before
+    # the stable zone changes. Geometry still uses raw coordinates; this
+    # only stabilizes zone labels/evidence.
+    zone_enter_confirm_observations: int = 2
+    zone_exit_confirm_observations: int = 2
+
     # Evidence is diagnostic. It does NOT invalidate geometry.
     require_post_zone: bool = False
     allow_crossing_without_pre: bool = True
@@ -160,8 +182,13 @@ class RobustCrossingEngine:
         "line_direction",
         "side_transition",
         "track_class",
+        "detector_track_class",
         "track_class_ratio",
         "class_ambiguous",
+        "counting_class",
+        "counting_class_confidence",
+        "class_transition",
+        "class_evidence",
         "line_distance_px",
         "previous_side",
         "current_side",
@@ -172,6 +199,7 @@ class RobustCrossingEngine:
         "sparse_crossing",
         "gap_bridge_used",
         "track_observations",
+        "short_track",
         "crossing_index",
         "pre_zone_observations",
         "corridor_observations",
@@ -197,7 +225,13 @@ class RobustCrossingEngine:
         "first_frame",
         "last_frame",
         "track_class",
+        "detector_track_class",
+        "counting_class",
+        "counting_class_confidence",
+        "class_transition",
+        "class_evidence",
         "track_observations",
+        "short_track",
         "first_side",
         "last_side",
         "min_distance_px",
@@ -486,11 +520,7 @@ class RobustCrossingEngine:
     # ==================================================================
 
     def _zone_from_distance(self, distance: float, previous_zone: str) -> str:
-        """Classify zone with spatial hysteresis.
-
-        PRE / CORRIDOR / POST are relative to stable side. We preserve side
-        separately; zone only describes proximity/context around the line.
-        """
+        """Raw zone proposal using spatial hysteresis."""
         d = abs(float(distance))
 
         if previous_zone == "CORRIDOR":
@@ -505,6 +535,54 @@ class RobustCrossingEngine:
         if d <= self.config.approach_distance_px:
             return "NEAR_LINE"
         return "PRE"
+
+    def _stable_zone_series(self, raw_signed_distance: np.ndarray) -> np.ndarray:
+        """Temporally stabilize PRE/NEAR_LINE/CORRIDOR.
+
+        The raw distance remains untouched for crossing geometry. A new zone
+        only becomes the stable zone after it is observed consecutively for
+        the configured confirmation count. This attacks PRE<->NEAR chatter
+        without delaying line-intersection detection.
+        """
+        n = len(raw_signed_distance)
+        if n == 0:
+            return np.array([], dtype=object)
+
+        stable: list[str] = []
+        current = "PRE"
+        pending = None
+        pending_count = 0
+        enter_need = max(1, int(self.config.zone_enter_confirm_observations))
+        exit_need = max(1, int(self.config.zone_exit_confirm_observations))
+
+        for distance in raw_signed_distance:
+            proposal = self._zone_from_distance(float(distance), current)
+
+            if proposal == current:
+                pending = None
+                pending_count = 0
+                stable.append(current)
+                continue
+
+            if proposal != pending:
+                pending = proposal
+                pending_count = 1
+            else:
+                pending_count += 1
+
+            # Entering CORRIDOR/NEAR_LINE is noisy, especially with small
+            # motorcycles. Exiting is also stabilized, but use the same
+            # explicit configurable minimum rather than a hard one-frame hop.
+            need = enter_need if proposal in {"CORRIDOR", "NEAR_LINE"} else exit_need
+
+            if pending_count >= need:
+                current = proposal
+                pending = None
+                pending_count = 0
+
+            stable.append(current)
+
+        return np.asarray(stable, dtype=object)
 
     @staticmethod
     def _zone_context(
@@ -522,20 +600,40 @@ class RobustCrossingEngine:
 
     @staticmethod
     def _collapse_zone_path(zones: list[str]) -> tuple[str, int]:
-        cleaned: list[str] = []
-        chatter = 0
+        """Collapse stable zones and count only genuine backtracking chatter.
 
+        A normal progression such as PRE -> NEAR_LINE -> CORRIDOR is NOT
+        chatter. Chatter means the trajectory reverses between adjacent
+        proximity zones, e.g. PRE -> NEAR_LINE -> PRE or CORRIDOR ->
+        NEAR_LINE -> CORRIDOR.
+        """
+        cleaned: list[str] = []
         for zone in zones:
-            if not zone:
-                continue
-            if not cleaned or zone != cleaned[-1]:
-                if cleaned:
-                    previous = cleaned[-1]
-                    if {previous, zone} <= {"PRE", "NEAR_LINE", "CORRIDOR"}:
-                        chatter += 1
-                    if {previous, zone} <= {"CORRIDOR", "POST"}:
-                        chatter += 1
+            if zone and (not cleaned or zone != cleaned[-1]):
                 cleaned.append(zone)
+
+        order = {
+            "PRE": 0,
+            "NEAR_LINE": 1,
+            "CORRIDOR": 2,
+        }
+
+        chatter = 0
+        previous_direction = 0
+        for i in range(1, len(cleaned)):
+            a = cleaned[i - 1]
+            b = cleaned[i]
+            if a not in order or b not in order:
+                continue
+
+            delta = order[b] - order[a]
+            direction = 1 if delta > 0 else -1 if delta < 0 else 0
+
+            if direction != 0 and previous_direction != 0 and direction != previous_direction:
+                chatter += 1
+
+            if direction != 0:
+                previous_direction = direction
 
         return (
             " → ".join(cleaned) if cleaned else "UNKNOWN",
@@ -759,14 +857,9 @@ class RobustCrossingEngine:
             # ----------------------------------------------------------
             # Hysteretic spatial zone.
             # ----------------------------------------------------------
-            zones: list[str] = []
-            previous_zone = "PRE"
-            for distance in np.abs(signed_distance_raw):
-                zone = self._zone_from_distance(
-                    float(distance), previous_zone
-                )
-                zones.append(zone)
-                previous_zone = zone
+            zones = self._stable_zone_series(
+                signed_distance_raw
+            ).tolist()
 
             # Determine whether a stable side transition already occurred.
             crossed_seen = False
@@ -1215,12 +1308,108 @@ class RobustCrossingEngine:
         }
 
     # ==================================================================
+    # CLASS EVIDENCE
+    # ==================================================================
+
+    def _class_evidence(
+        self,
+        group: pd.DataFrame,
+        crossing_index: int | None,
+    ) -> dict:
+        """Estimate the physical object's class from raw class evidence.
+
+        The global `track_class` is retained as a diagnostic, but the class
+        used downstream for counting is learned from detector observations
+        near the crossing. This avoids losing a motorcycle whose early
+        frames were classified as person.
+        """
+        if group.empty:
+            return {
+                "counting_class": "unknown",
+                "counting_class_confidence": 0.0,
+                "class_transition": "",
+                "class_evidence": "",
+            }
+
+        raw = group.copy()
+        raw["class_name"] = raw.get("class_name", raw.get("track_class", "unknown"))
+        raw["class_name"] = raw["class_name"].astype(str).str.lower().str.strip()
+        raw["confidence"] = pd.to_numeric(
+            raw.get("confidence", 1.0), errors="coerce"
+        ).fillna(1.0).clip(0.0, 1.0)
+        raw["frame_id"] = pd.to_numeric(raw["frame_id"], errors="coerce")
+
+        if crossing_index is None:
+            end_frame = int(raw["frame_id"].max())
+        else:
+            end_frame = int(raw.iloc[crossing_index]["frame_id"])
+
+        window = max(1, int(self.config.class_evidence_window_frames))
+        selected = raw[
+            raw["frame_id"] >= (end_frame - window)
+        ].copy()
+
+        if selected.empty:
+            selected = raw.tail(min(len(raw), window)).copy()
+
+        decay = max(1e-6, float(self.config.class_recency_decay))
+        age = (end_frame - selected["frame_id"]).clip(lower=0)
+        selected["recency_weight"] = np.exp(-decay * age.astype(float))
+        selected["evidence_weight"] = (
+            selected["confidence"] * selected["recency_weight"]
+        )
+
+        scores = (
+            selected.groupby("class_name")["evidence_weight"]
+            .sum()
+            .sort_values(ascending=False)
+        )
+
+        if scores.empty or float(scores.sum()) <= 0.0:
+            return {
+                "counting_class": "unknown",
+                "counting_class_confidence": 0.0,
+                "class_transition": "",
+                "class_evidence": "",
+            }
+
+        top_class = str(scores.index[0])
+        total_score = float(scores.sum())
+        top_score = float(scores.iloc[0])
+        top_conf = top_score / total_score
+
+        # Evidence string is intentionally compact for the audit CSV.
+        evidence_parts = [
+            f"{cls}:{float(score):.3f}"
+            for cls, score in scores.items()
+        ]
+        evidence_text = " | ".join(evidence_parts)
+
+        ordered_classes = raw["class_name"].tolist()
+        transitions: list[str] = []
+        for prev, curr in zip(ordered_classes, ordered_classes[1:]):
+            if prev != curr:
+                pair = f"{prev}->{curr}"
+                if pair not in transitions:
+                    transitions.append(pair)
+
+        transition_text = " | ".join(transitions)
+
+        return {
+            "counting_class": top_class,
+            "counting_class_confidence": float(top_conf),
+            "class_transition": transition_text,
+            "class_evidence": evidence_text,
+        }
+
+    # ==================================================================
     # PHASE STATUS
     # ==================================================================
 
     def _phase1_status(self, group: pd.DataFrame) -> tuple[str, str, bool]:
-        if len(group) < self.config.min_track_observations:
-            return "FAIL", "insufficient_track_observations", False
+        """Assess trajectory usability without equating short tracks to failure."""
+        if group.empty:
+            return "FAIL", "empty_trajectory", False
 
         finite_cols = [
             "raw_x",
@@ -1235,15 +1424,26 @@ class RobustCrossingEngine:
         mean_quality = float(group["trajectory_quality"].mean())
         anomaly_count = int(group["speed_anomaly"].sum())
         continuity_mean = float(group["trajectory_continuity"].mean())
+        observations = len(group)
 
-        if anomaly_count > max(2, int(len(group) * 0.25)):
-            return "REVIEW", "frequent_speed_anomalies", False
+        reasons: list[str] = []
+
+        # Short track is not automatic invalidation. Keep it visible as
+        # REVIEW, and let geometric crossing evidence rescue it downstream.
+        if observations < self.config.short_track_observation_threshold:
+            reasons.append("short_track")
+
+        if anomaly_count > max(2, int(observations * 0.35)):
+            reasons.append("frequent_speed_anomalies")
 
         if continuity_mean < 0.50:
-            return "REVIEW", "poor_trajectory_continuity", False
+            reasons.append("poor_trajectory_continuity")
 
-        if mean_quality < 0.65:
-            return "REVIEW", "low_trajectory_quality", False
+        if mean_quality < 0.50:
+            reasons.append("low_trajectory_quality")
+
+        if reasons:
+            return "REVIEW", ";".join(reasons), False
 
         return "PASS", "", True
 
@@ -1251,11 +1451,16 @@ class RobustCrossingEngine:
         self,
         crossing: dict | None,
         evidence: dict,
+        class_evidence: dict,
+        phase1_status: str,
+        phase1_reason: str,
+        track_observations: int,
     ) -> tuple[str, str, bool, bool]:
-        """Return status, reason, phase2_pass, count_eligibility.
+        """Separate geometric truth from evidence completeness.
 
-        Important: geometry and evidence remain separate.
-        A true geometric crossing can be REVIEW without being deleted.
+        A geometric crossing is never rejected solely because PRE/CORRIDOR/
+        POST evidence is incomplete. This is essential for short and fast
+        tracks. The returned count_eligibility is the pre-State-Machine gate.
         """
         if crossing is None:
             return "NOT_CROSSING", "no_geometric_crossing_detected", False, False
@@ -1264,28 +1469,40 @@ class RobustCrossingEngine:
 
         if not evidence["pre_zone_evidence"]:
             reasons.append("insufficient_pre_zone_evidence")
-
         if not evidence["corridor_evidence"]:
             reasons.append("insufficient_corridor_evidence")
-
         if not evidence["post_zone_evidence"]:
             reasons.append("insufficient_post_zone_evidence")
-
         if (
             evidence["normal_direction"] == "UNKNOWN"
             or evidence["direction_confidence"] < self.config.min_direction_confidence
         ):
             reasons.append("low_crossing_direction_confidence")
-
-        # Fast/sparse crossing is still a geometric crossing. Missing zone
-        # evidence becomes REVIEW, never automatic rejection.
         if crossing["fast_crossing"]:
             reasons.append("fast_or_sparse_crossing")
+        if track_observations < self.config.short_track_observation_threshold:
+            reasons.append("short_track_crossing")
+        if class_evidence["counting_class"] == "unknown":
+            reasons.append("unknown_counting_class")
+        elif class_evidence["counting_class_confidence"] < self.config.min_counting_class_confidence:
+            reasons.append("low_counting_class_confidence")
 
-        if reasons:
-            return "REVIEW", ";".join(reasons), False, True
+        # Geometric crossing + usable direction + usable class evidence is
+        # sufficient to remain count-eligible before Phase 3.
+        count_eligible = bool(
+            evidence["normal_direction"] != "UNKNOWN"
+            and evidence["direction_confidence"] >= self.config.min_direction_confidence
+            and class_evidence["counting_class"] != "unknown"
+            and class_evidence["counting_class_confidence"] >= self.config.min_counting_class_confidence
+        )
 
-        return "PASS", "", True, True
+        # A crossing with all required evidence can be PASS. Missing zone
+        # evidence remains REVIEW but does not destroy candidate eligibility.
+        if not reasons:
+            return "PASS", "", True, count_eligible
+
+        # Short/fast/sparse candidates stay REVIEW. They are not dropped.
+        return "REVIEW", ";".join(reasons), False, count_eligible
 
     # ==================================================================
     # TRACK EVENT
@@ -1296,27 +1513,27 @@ class RobustCrossingEngine:
         group: pd.DataFrame,
         identity_id: int,
     ) -> dict:
-        track_class = str(group.iloc[0].get("track_class", "unknown"))
+        detector_track_class = str(group.iloc[0].get("track_class", "unknown"))
         track_class_ratio = float(group.iloc[0].get("track_class_ratio", 1.0))
         class_ambiguous = bool(group.iloc[0].get("class_ambiguous", False))
 
         phase1_status, phase1_reason, phase1_pass = self._phase1_status(group)
-
         candidates = self._detect_crossing_candidates(group)
-
-        # We preserve ALL geometric candidates for audit. For backward
-        # compatibility with one-event-per-identity consumers, the primary
-        # event is the first geometrically valid crossing.
         crossing = candidates[0] if candidates else None
         crossing_index = crossing["index"] if crossing else None
 
-        evidence = self._zone_evidence(
-            group,
-            crossing_index,
-        )
+        evidence = self._zone_evidence(group, crossing_index)
+        class_evidence = self._class_evidence(group, crossing_index)
 
         phase2_status, phase2_reason, phase2_pass, count_eligibility = (
-            self._phase2_status(crossing, evidence)
+            self._phase2_status(
+                crossing,
+                evidence,
+                class_evidence,
+                phase1_status,
+                phase1_reason,
+                len(group),
+            )
         )
 
         max_speed = float(group["speed_px_per_frame"].max())
@@ -1326,13 +1543,13 @@ class RobustCrossingEngine:
         mean_abs_tangent = float(group["velocity_tangent_px_per_frame"].abs().mean())
         trajectory_direction = self._infer_trajectory_direction(group)
         trajectory_quality = float(group["trajectory_quality"].mean())
+        short_track = len(group) < self.config.short_track_observation_threshold
 
-        crossing_detected = crossing is not None
         candidate_class = (
             "TRUE_CROSSING"
-            if crossing_detected and not crossing["fast_crossing"]
+            if crossing is not None and not crossing["fast_crossing"]
             else "FAST_CROSSING"
-            if crossing_detected
+            if crossing is not None
             else "NEAR_LINE"
             if float(group["raw_line_distance_px"].min()) <= self.config.corridor_exit_px
             else "APPROACHING"
@@ -1340,27 +1557,13 @@ class RobustCrossingEngine:
             else "NO_CROSSING"
         )
 
-        # A track can be a TRUE_CROSSING even if evidence is incomplete.
-        # This is exactly the candidate-preserving behavior needed before
-        # State Machine.
-        count_eligible = bool(
-            crossing_detected
-            and evidence["direction_confidence"] >= self.config.min_direction_confidence
-        )
-
-        # Current module deliberately does NOT perform final counting.
-        # `counted` mirrors geometry eligibility only so downstream consumers
-        # can inspect candidates without silently deleting them. Phase 3 will
-        # own the final count decision.
-        counted = count_eligible
-
         reasons: list[str] = []
         if phase1_reason:
             reasons.append(f"P1:{phase1_reason}")
         if phase2_reason:
             reasons.append(f"P2:{phase2_reason}")
 
-        event = {
+        return {
             "crossing_id": int(identity_id),
             "track_id": int(group.iloc[-1]["track_id"]),
             "track_ids": str(group["track_id"].drop_duplicates().tolist()),
@@ -1374,9 +1577,17 @@ class RobustCrossingEngine:
             "normal_direction": evidence["normal_direction"],
             "line_direction": trajectory_direction,
             "side_transition": crossing["side_transition"] if crossing else "UNKNOWN",
-            "track_class": track_class,
+            # IMPORTANT: expose counting_class through track_class so the
+            # existing counter remains API-compatible, while preserving the
+            # original detector-level track class in a separate field.
+            "track_class": class_evidence["counting_class"],
+            "detector_track_class": detector_track_class,
             "track_class_ratio": track_class_ratio,
             "class_ambiguous": class_ambiguous,
+            "counting_class": class_evidence["counting_class"],
+            "counting_class_confidence": float(class_evidence["counting_class_confidence"]),
+            "class_transition": class_evidence["class_transition"],
+            "class_evidence": class_evidence["class_evidence"],
             "line_distance_px": (
                 min(
                     float(group.iloc[max(0, crossing_index - 1)]["raw_line_distance_px"]),
@@ -1394,6 +1605,7 @@ class RobustCrossingEngine:
             "sparse_crossing": bool(crossing["sparse_crossing"]) if crossing else False,
             "gap_bridge_used": bool(crossing["gap_bridge_used"]) if crossing else False,
             "track_observations": int(len(group)),
+            "short_track": bool(short_track),
             "crossing_index": crossing_index if crossing_index is not None else pd.NA,
             "pre_zone_observations": evidence["pre_zone_observations"],
             "corridor_observations": evidence["corridor_observations"],
@@ -1410,7 +1622,7 @@ class RobustCrossingEngine:
             "phase1_status": phase1_status,
             "phase2_status": phase2_status,
             "count_eligibility": bool(count_eligibility),
-            "counted": bool(counted),
+            "counted": bool(count_eligibility),
             "_phase1_pass": bool(phase1_pass),
             "_phase2_pass": bool(phase2_pass),
             "_phase1_reason": phase1_reason,
@@ -1424,8 +1636,6 @@ class RobustCrossingEngine:
             "_trajectory_direction": trajectory_direction,
             "_candidates": candidates,
         }
-
-        return event
 
     # ==================================================================
     # AUDIT
@@ -1451,7 +1661,13 @@ class RobustCrossingEngine:
             "first_frame": int(group["frame_id"].min()),
             "last_frame": int(group["frame_id"].max()),
             "track_class": event["track_class"],
+            "detector_track_class": event["detector_track_class"],
+            "counting_class": event["counting_class"],
+            "counting_class_confidence": float(event["counting_class_confidence"]),
+            "class_transition": event["class_transition"],
+            "class_evidence": event["class_evidence"],
             "track_observations": int(len(group)),
+            "short_track": bool(event["short_track"]),
             "first_side": first_side,
             "last_side": last_side,
             "min_distance_px": float(group["raw_line_distance_px"].min()),
@@ -1646,6 +1862,19 @@ class RobustCrossingEngine:
         )
         print(f"Zone chatter tracks                 : {chatter:,}")
         print(f"Sparse crossing candidates           : {len(sparse):,}")
+        print(
+            "Short-track crossings               : "
+            f"{int(((audit_df['short_track'] == True) & audit_df['crossing_detected']).sum()):,}"
+        )
+        print(
+            "Class-transition tracks              : "
+            f"{int(audit_df['class_transition'].fillna('').astype(str).ne('').sum()):,}"
+        )
+        if crossing_total > 0:
+            print(
+                "Mean zone chatter (crossings)        : "
+                f"{pd.to_numeric(audit_df.loc[audit_df['crossing_detected'].astype(bool), 'zone_chatter_count'], errors='coerce').fillna(0).mean():.2f}"
+            )
         print()
 
         if not fast.empty:
@@ -1683,6 +1912,22 @@ class RobustCrossingEngine:
             .value_counts()
             .to_string()
         )
+
+        print("\nCOUNTING CLASS DISTRIBUTION:")
+        crossing_classes = audit_df[audit_df["crossing_detected"].astype(bool)]
+        if crossing_classes.empty:
+            print("No crossing classes.")
+        else:
+            print(crossing_classes["counting_class"].value_counts().to_string())
+
+        print("\nCLASS TRANSITION EXAMPLES:")
+        transitioned = crossing_classes[
+            crossing_classes["class_transition"].fillna("").astype(str).ne("")
+        ][["crossing_id", "detector_track_class", "counting_class", "class_transition", "class_evidence"]]
+        if transitioned.empty:
+            print("No class transitions detected.")
+        else:
+            print(transitioned.head(15).to_string(index=False))
 
         print("\nCROSSING METHOD DISTRIBUTION:")
         crossing_rows = audit_df[

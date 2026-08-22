@@ -107,6 +107,12 @@ class TrafficCounter:
         min_corridor_observations: int = 1,
         min_post_zone_observations: int = 1,
         require_post_zone: bool = True,
+        short_track_observation_threshold: int = 8,
+        class_evidence_window_frames: int = 8,
+        class_recency_decay: float = 0.18,
+        min_counting_class_confidence: float = 0.45,
+        zone_enter_confirm_observations: int = 2,
+        zone_exit_confirm_observations: int = 2,
 
     ) -> None:
 
@@ -248,6 +254,24 @@ class TrafficCounter:
                     require_post_zone=(
                         require_post_zone
                     ),
+                    short_track_observation_threshold=(
+                        short_track_observation_threshold
+                    ),
+                    class_evidence_window_frames=(
+                        class_evidence_window_frames
+                    ),
+                    class_recency_decay=(
+                        class_recency_decay
+                    ),
+                    min_counting_class_confidence=(
+                        min_counting_class_confidence
+                    ),
+                    zone_enter_confirm_observations=(
+                        zone_enter_confirm_observations
+                    ),
+                    zone_exit_confirm_observations=(
+                        zone_exit_confirm_observations
+                    ),
                     vehicle_classes=tuple(
                         sorted(self.vehicle_classes)
                     ),
@@ -354,8 +378,13 @@ class TrafficCounter:
                 "direction",
                 "side_transition",
                 "track_class",
+                "detector_track_class",
                 "track_class_ratio",
                 "class_ambiguous",
+                "counting_class",
+                "counting_class_confidence",
+                "class_transition",
+                "class_evidence",
                 "line_distance_px",
                 "previous_side",
                 "current_side",
@@ -480,6 +509,11 @@ class TrafficCounter:
                                 "track_class"
                             ]
                         ),
+                        "counting_class": event.get("counting_class", event.get("track_class", "unknown")),
+                        "counting_class_confidence": float(event.get("counting_class_confidence", 1.0)),
+                        "class_transition": event.get("class_transition", ""),
+                        "class_evidence": event.get("class_evidence", ""),
+                        "short_track": bool(event.get("short_track", False)),
                         "first_frame": first_frame,
                         "last_frame": last_frame,
                         "crossing_frame": (
@@ -721,8 +755,13 @@ class TrafficCounter:
                         "direction",
                         "side_transition",
                         "track_class",
+                        "detector_track_class",
                         "track_class_ratio",
                         "class_ambiguous",
+                        "counting_class",
+                        "counting_class_confidence",
+                        "class_transition",
+                        "class_evidence",
                         "line_distance_px",
                         "previous_side",
                         "current_side",
@@ -742,6 +781,27 @@ class TrafficCounter:
                 )
                 .reset_index(drop=True)
             )
+
+        # ==========================================================
+        # 5B. CANDIDATE CLASS / SHORT TRACK AUDIT
+        # ==========================================================
+        if not crossing_events.empty:
+            transitions = int(
+                crossing_events.get("class_transition", pd.Series(dtype=str))
+                .fillna("")
+                .astype(str)
+                .ne("")
+                .sum()
+            )
+            short_crossings = int(
+                crossing_events.get("short_track", pd.Series(dtype=bool))
+                .fillna(False)
+                .astype(bool)
+                .sum()
+            )
+        else:
+            transitions = 0
+            short_crossings = 0
 
         # ==========================================================
         # 6. COUNTS
@@ -853,6 +913,11 @@ class TrafficCounter:
             ),
             "final_vehicle_count": int(
                 total
+            ),
+            "class_transition_crossings": int(transitions),
+            "short_track_crossings": int(short_crossings),
+            "counting_class_available": bool(
+                "counting_class" in crossing_events.columns
             ),
 
             # Explicitly record that broad duplicate suppression
