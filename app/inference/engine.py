@@ -815,46 +815,69 @@ class TrafficCountingEngine:
         )
 
         # =====================================================
-        # CONSOLE REPORT
+        # CONSOLE REPORT — PHASE 1/2 V2
         # =====================================================
         if isinstance(phase12_trajectory, pd.DataFrame) and isinstance(phase12_audit, pd.DataFrame):
-            print("\n" + "=" * 70)
-            print("PHASE 1/2 TRAJECTORY + CROSSING CORRIDOR AUDIT")
-            print("=" * 70)
-            print(
-                f"Tracks analyzed      : {len(phase12_audit):,}"
-            )
-            print(
-                f"Phase 1 PASS         : {int((phase12_audit['phase1_status'] == 'PASS').sum()):,}"
-            )
-            print(
-                f"Phase 1 REVIEW       : {int((phase12_audit['phase1_status'] == 'REVIEW').sum()):,}"
-            )
-            print(
-                f"Phase 1 FAIL         : {int((phase12_audit['phase1_status'] == 'FAIL').sum()):,}"
-            )
-            print(
-                f"Phase 2 PASS         : {int((phase12_audit['phase2_status'] == 'PASS').sum()):,}"
-            )
-            print(
-                f"Phase 2 REVIEW       : {int((phase12_audit['phase2_status'] == 'REVIEW').sum()):,}"
-            )
-            print(
-                f"Phase 2 FAIL         : {int((phase12_audit['phase2_status'] == 'FAIL').sum()):,}"
-            )
-            print(
-                f"P1 + P2 PASS         : {int(phase12_audit['counted'].sum()):,}"
-            )
-            print("\nZone path examples:")
-            print(
-                phase12_audit["zone_path"]
-                .value_counts()
-                .head(10)
-                .to_string()
-            )
-            print(
-                f"\nPhase 1/2 audit: {phase12_audit_path}"
-            )
+            print("\n" + "=" * 96)
+            print("PHASE 1/2 TRAJECTORY + CROSSING CANDIDATE AUDIT v2")
+            print("=" * 96)
+            if phase12_audit.empty:
+                print("No Phase 1/2 audit rows.")
+            else:
+                total = len(phase12_audit)
+                candidate = phase12_audit[
+                    phase12_audit["crossing_candidate_class"].isin(
+                        ["TRUE_CROSSING", "FAST_CROSSING"]
+                    )
+                ]
+                p1_pass = int((phase12_audit["phase1_status"] == "PASS").sum())
+                p1_review = int((phase12_audit["phase1_status"] == "REVIEW").sum())
+                p1_fail = int((phase12_audit["phase1_status"] == "FAIL").sum())
+                p2_pass = int((phase12_audit["phase2_status"] == "PASS").sum())
+                p2_review = int((phase12_audit["phase2_status"] == "REVIEW").sum())
+                p2_not = int((phase12_audit["phase2_status"] == "NOT_CROSSING").sum())
+                direction_known = int((candidate["normal_direction"] != "UNKNOWN").sum())
+                fast = phase12_audit[phase12_audit["crossing_candidate_class"] == "FAST_CROSSING"]
+                chatter = int((phase12_audit.get("zone_chatter_count", pd.Series(dtype=int)) > 0).sum())
+
+                print(f"Tracks analysed                    : {total:,}")
+                print(f"NOT_CROSSING                        : {int((phase12_audit['crossing_candidate_class'] == 'NOT_CROSSING').sum()):,}")
+                print(f"NEAR_LINE                           : {int((phase12_audit['crossing_candidate_class'] == 'NEAR_LINE').sum()):,}")
+                print(f"TRUE_CROSSING                       : {int((phase12_audit['crossing_candidate_class'] == 'TRUE_CROSSING').sum()):,}")
+                print(f"FAST_CROSSING                       : {int((phase12_audit['crossing_candidate_class'] == 'FAST_CROSSING').sum()):,}")
+                print()
+                print(f"Phase 1                            : PASS={p1_pass:,} | REVIEW={p1_review:,} | FAIL={p1_fail:,}")
+                print(f"Phase 2                            : PASS={p2_pass:,} | REVIEW={p2_review:,} | NOT_CROSSING={p2_not:,}")
+                print(f"Known normal direction              : {direction_known:,}/{len(candidate):,}")
+                print(f"Zone chatter tracks                 : {chatter:,}")
+                print(f"P1 + P2 PASS                        : {int(phase12_audit['counted'].sum()):,}")
+
+                if not fast.empty:
+                    print("\nFAST CROSSING DIAGNOSTIC")
+                    print(f"  Fast crossings                    : {len(fast):,}")
+                    print(f"  Zero corridor observations        : {int((fast['corridor_observations'] == 0).sum()):,}")
+                    print(f"  Mean max speed (px/frame)         : {pd.to_numeric(fast['max_speed_px_per_frame'], errors='coerce').mean():.2f}")
+                    print(f"  Max speed observed (px/frame)     : {pd.to_numeric(fast['max_speed_px_per_frame'], errors='coerce').max():.2f}")
+
+                review = phase12_audit[phase12_audit["phase2_status"] == "REVIEW"]
+                if not review.empty:
+                    print("\nTOP PHASE 2 REVIEW REASONS")
+                    print(
+                        review["failure_reason"]
+                        .replace("", "NO_REASON")
+                        .value_counts()
+                        .head(10)
+                        .to_string()
+                    )
+
+                print("\nZone path examples:")
+                print(
+                    phase12_audit["zone_path"]
+                    .value_counts()
+                    .head(10)
+                    .to_string()
+                )
+                print(f"\nPhase 1/2 audit: {phase12_audit_path}")
 
         print("\n" + "=" * 70)
         print("FINAL VEHICLE COUNT")

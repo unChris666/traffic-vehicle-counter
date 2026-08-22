@@ -1,25 +1,31 @@
-# Traffic Counter
+Phase 1/2 v2 — Pre-Phase-3 release
 
-Production refactor of the Kaggle notebook for YOLO26m + BoT-SORT traffic counting.
+Files:
 
-## Current step
+robust_crossing.py: full replacement for Phase 1 Trajectory Engine + Phase 2 Crossing Corridor.
 
-Phase 6 foundation: convert notebook assumptions into a Python package with:
+engine.py: full replacement of the console Phase 1/2 audit report.
 
-- centralized configuration
-- video validation
-- production inference entry point
-- CLI entry point
-- separation between CV, video, API, and configuration layers
+Main changes:
 
-## Current interface
+NOT_CROSSING is no longer treated as a failure.
 
-```python
-from app.inference.engine import TrafficCountingEngine
+Crossing direction is derived from signed distance to the line (normal direction), not raw X motion.
 
-engine = TrafficCountingEngine()
-metadata = engine.validate("traffic.mp4")
-result = engine.process("traffic.mp4")
-```
+Zone assignment uses hysteresis: corridor enter at corridor_px, corridor exit at corridor_exit_px.
 
-`process()` is intentionally not implemented yet. The next development step is to move the existing Phase 1-3 pipeline behind this interface without changing its counting logic.
+Crossing geometry uses raw observations, preventing EMA lag from suppressing fast crossings.
+
+A crossing that jumps from PRE to POST without an observed corridor bbox is labeled FAST_CROSSING and audited separately.
+
+Audit reports NOT_CROSSING, NEAR_LINE, TRUE_CROSSING, and FAST_CROSSING separately.
+
+Audit reports direction coverage, zone chatter, fast-crossing speed, and review reasons.
+
+Important:
+
+This release does not implement the Phase 3 state machine.
+
+This release does not alter YOLO26, BoT-SORT, or identity reconnect logic.
+
+FAST_CROSSING can still remain REVIEW when there is insufficient PRE/POST evidence. That is deliberate; the next phase will decide whether such evidence can be safely accepted.
