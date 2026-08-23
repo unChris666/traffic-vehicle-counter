@@ -241,6 +241,33 @@ class TrafficCountingEngine:
             "duplicate_distance_px": (
                 self._counting_value("duplicate_distance_px", 25.0)
             ),
+            "identity_gap_crossing_enabled": (
+                self._counting_value("identity_gap_crossing_enabled", True)
+            ),
+            "identity_gap_max_frames": (
+                self._counting_value("identity_gap_max_frames", 8)
+            ),
+            "identity_gap_max_endpoint_distance_px": (
+                self._counting_value("identity_gap_max_endpoint_distance_px", 140.0)
+            ),
+            "identity_gap_min_side_displacement_px": (
+                self._counting_value("identity_gap_min_side_displacement_px", 12.0)
+            ),
+            "candidate_duplicate_max_frame_gap": (
+                self._counting_value("candidate_duplicate_max_frame_gap", 8)
+            ),
+            "candidate_duplicate_max_endpoint_distance_px": (
+                self._counting_value("candidate_duplicate_max_endpoint_distance_px", 55.0)
+            ),
+            "candidate_duplicate_max_crossing_distance_px": (
+                self._counting_value("candidate_duplicate_max_crossing_distance_px", 55.0)
+            ),
+            "candidate_duplicate_min_direction_cosine": (
+                self._counting_value("candidate_duplicate_min_direction_cosine", 0.75)
+            ),
+            "candidate_duplicate_require_non_overlapping_tracks": (
+                self._counting_value("candidate_duplicate_require_non_overlapping_tracks", True)
+            ),
         }
 
         signature = inspect.signature(
@@ -547,6 +574,26 @@ class TrafficCountingEngine:
             output_dir / "crossing_candidates_canonical.csv",
             index=False,
         )
+
+        # Dedicated identity-duplicate audit. The canonical candidate CSV
+        # remains the source of truth; this file is a convenient filtered view
+        # for debugging duplicate physical identities.
+        canonical = counting_result.crossing_candidates
+        duplicate_path = output_dir / "trajectory_duplicate_identity_audit.csv"
+        if (
+            isinstance(canonical, pd.DataFrame)
+            and not canonical.empty
+            and "candidate_duplicate_of" in canonical.columns
+        ):
+            canonical[
+                canonical["candidate_duplicate_of"].notna()
+                | canonical.get(
+                    "candidate_duplicate_suppressed",
+                    pd.Series(False, index=canonical.index),
+                ).fillna(False).astype(bool)
+            ].to_csv(duplicate_path, index=False)
+        else:
+            pd.DataFrame().to_csv(duplicate_path, index=False)
 
         # =====================================================
         # PHASE 1/2 DIAGNOSTIC ARTIFACTS
@@ -864,6 +911,16 @@ class TrafficCountingEngine:
             print(
                 f"\nPhase 1/2 audit: {phase12_audit_path}"
             )
+            if isinstance(canonical, pd.DataFrame) and not canonical.empty:
+                duplicate_flags = canonical.get(
+                    "candidate_duplicate_suppressed",
+                    pd.Series(False, index=canonical.index),
+                ).fillna(False).astype(bool)
+                print(
+                    "Canonical duplicate identities : "
+                    f"{int(duplicate_flags.sum()):,}"
+                )
+            print(f"Trajectory duplicate audit: {duplicate_path}")
 
         print("\n" + "=" * 70)
         print("FINAL VEHICLE COUNT (CANONICAL CANDIDATES)")

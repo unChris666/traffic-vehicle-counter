@@ -82,6 +82,27 @@ class CrossingConfig:
     min_direction_confidence: float = 0.50
     min_normal_displacement_px: float = 8.0
 
+    # --------------------------------------------------------------
+    # IDENTITY-GAP CROSSING
+    # --------------------------------------------------------------
+    # If the same physical identity is visible on side A, disappears,
+    # and reappears on side B, this may be a valid crossing even when
+    # there is no bbox observation inside the line corridor.
+    identity_gap_crossing_enabled: bool = True
+    identity_gap_max_frames: int = 8
+    identity_gap_max_endpoint_distance_px: float = 140.0
+    identity_gap_min_side_displacement_px: float = 12.0
+
+    # --------------------------------------------------------------
+    # TRAJECTORY-AWARE DUPLICATE IDENTITY AUDIT
+    # --------------------------------------------------------------
+    candidate_duplicate_max_frame_gap: int = 8
+    candidate_duplicate_max_endpoint_distance_px: float = 55.0
+    candidate_duplicate_max_crossing_distance_px: float = 55.0
+    candidate_duplicate_min_direction_cosine: float = 0.75
+    candidate_duplicate_require_non_overlapping_tracks: bool = True
+
+
     # Short tracks are diagnostic, not automatic rejection.
     short_track_observation_threshold: int = 8
 
@@ -218,6 +239,12 @@ class RobustCrossingEngine:
         "count_eligibility",
         "candidate_quality",
         "geometry_crossing",
+        "identity_gap_side_transition",
+        "identity_gap_frames",
+        "candidate_duplicate_of",
+        "candidate_duplicate_confidence",
+        "candidate_duplicate_reason",
+        "candidate_duplicate_suppressed",
         "gap_count",
         "counted",
     ]
@@ -990,16 +1017,25 @@ class RobustCrossingEngine:
         previous: pd.Series,
         current: pd.Series,
     ) -> tuple[bool, str]:
-        """Bridge a short observation gap using side/distance/motion evidence.
+        """Detect a crossing across a sparse observation gap.
 
-        This is intentionally per physical identity. It never compares two
-        objects in the same frame, so simultaneous crossings remain independent.
+        The strongest special case is the identity-gap side transition:
+        the same physical identity was stably on side A, disappeared,
+        then reappeared on side B.  This must be treated as crossing
+        evidence even when no bbox exists inside the corridor.
         """
         if not self.config.gap_bridge_enabled:
             return False, ""
 
         frame_gap = int(current["frame_id"] - previous["frame_id"])
-        if frame_gap <= 1 or frame_gap > self.config.gap_bridge_max_frames:
+        if frame_gap <= 1:
+            return False, ""
+
+        max_gap = min(
+            int(self.config.gap_bridge_max_frames),
+            int(self.config.identity_gap_max_frames),
+        )
+        if frame_gap > max_gap:
             return False, ""
 
         prev_d = float(previous["raw_signed_distance_px"])
@@ -1007,12 +1043,10 @@ class RobustCrossingEngine:
         prev_side = int(previous.get("stable_side", previous.get("raw_side", 0)))
         curr_side = int(current.get("stable_side", current.get("raw_side", 0)))
 
-        distance_bridge = (
-            prev_side != 0
-            and curr_side != 0
-            and prev_side != curr_side
-            and min(abs(prev_d), abs(curr_d)) <= max(self.config.approach_distance_px, self.config.corridor_px * 2.0)
-        )
+        dx = float(current["raw_x"] - previous["raw_x"])
+        dy = float(current["raw_y"] - previous["raw_y"])
+        endpoint_distance = math.hypot(dx, dy)
+        speed = endpoint_distance / max(frame_gap, 1)
 
         sign_change = (
             prev_d != 0.0
@@ -1020,22 +1054,48 @@ class RobustCrossingEngine:
             and np.sign(prev_d) != np.sign(curr_d)
         )
 
-        dx = float(current["raw_x"] - previous["raw_x"])
-        dy = float(current["raw_y"] - previous["raw_y"])
-        speed = math.hypot(dx, dy) / max(frame_gap, 1)
-
-        normal_velocity = float(current.get("velocity_normal_px_per_frame", 0.0))
-        fast_motion = (
-            speed >= self.config.fast_speed_multiplier * self.config.max_velocity_px_per_frame
-            or abs(normal_velocity) >= self.config.min_normal_velocity_px_per_frame
+        explicit_side_change = (
+            prev_side != 0
+            and curr_side != 0
+            and prev_side != curr_side
         )
 
-        if sign_change and fast_motion:
+        near_boundary = (
+            min(abs(prev_d), abs(curr_d))
+            <= max(
+                self.config.approach_distance_px,
+                self.config.corridor_px * 3.0,
+            )
+        )
+
+        identity_gap_side = bool(
+            self.config.identity_gap_crossing_enabled
+            and explicit_side_change
+            and near_boundary
+            and endpoint_distance <= self.config.identity_gap_max_endpoint_distance_px
+            and abs(prev_d - curr_d) >= self.config.identity_gap_min_side_displacement_px
+        )
+
+        if identity_gap_side:
+            return True, "identity_gap_side_transition"
+
+        velocity_bridge = bool(
+            sign_change
+            and (
+                speed >= self.config.fast_speed_multiplier * self.config.max_velocity_px_per_frame
+                or speed >= self.config.min_normal_velocity_px_per_frame
+            )
+            and endpoint_distance <= self.config.identity_gap_max_endpoint_distance_px
+        )
+
+        if velocity_bridge:
             return True, "gap_velocity_bridge"
-        if distance_bridge:
-            return True, "gap_side_bridge"
-        if sign_change:
+
+        if explicit_side_change and near_boundary:
             return True, "gap_side_transition"
+
+        if sign_change:
+            return True, "gap_side_sign_change"
 
         return False, ""
 
@@ -1165,7 +1225,33 @@ class RobustCrossingEngine:
                 method_parts.append("deadband_aware_transition")
             if signed_distance_sign_change:
                 method_parts.append("signed_distance_sign_change")
-            if gap_bridge:
+            # An identity gap is a first-class crossing signal whenever the
+            # same physical identity has a valid non-zero side before the gap
+            # and the opposite side after the gap. This remains true even if
+            # the raw segment itself also intersects the line.
+            endpoint_distance = math.hypot(
+                current_point[0] - previous_point[0],
+                current_point[1] - previous_point[1],
+            )
+            identity_gap_side = bool(
+                self.config.identity_gap_crossing_enabled
+                and frame_gap > 1
+                and (
+                    stable_side_change
+                    or deadband_aware_transition
+                    or (
+                        prev_raw_side != 0
+                        and curr_raw_side != 0
+                        and prev_raw_side != curr_raw_side
+                    )
+                )
+                and endpoint_distance <= self.config.identity_gap_max_endpoint_distance_px
+                and min(abs(prev_distance), abs(curr_distance))
+                <= max(self.config.approach_distance_px, self.config.corridor_px * 3.0)
+            )
+            if identity_gap_side:
+                method_parts.append("identity_gap_side_transition")
+            elif gap_bridge:
                 method_parts.append(gap_method)
 
             min_distance = min(
@@ -1231,6 +1317,8 @@ class RobustCrossingEngine:
                     "fast_crossing": bool(fast_crossing),
                     "sparse_crossing": bool(sparse_crossing),
                     "gap_bridge_used": bool(gap_bridge),
+                    "identity_gap_side_transition": bool(identity_gap_side),
+                    "identity_gap_frames": int(frame_gap) if identity_gap_side else 0,
                     "previous_zone": previous_zone,
                     "current_zone": current_zone,
                 }
@@ -1664,6 +1752,12 @@ class RobustCrossingEngine:
             "count_eligibility": bool(count_eligibility),
             "candidate_quality": round(float(candidate_quality), 4),
             "geometry_crossing": bool(crossing is not None),
+            "identity_gap_side_transition": bool(crossing.get("identity_gap_side_transition", False)) if crossing else False,
+            "identity_gap_frames": int(crossing.get("identity_gap_frames", 0)) if crossing else 0,
+            "candidate_duplicate_of": pd.NA,
+            "candidate_duplicate_confidence": 0.0,
+            "candidate_duplicate_reason": "",
+            "candidate_duplicate_suppressed": False,
             "gap_count": int((group["frame_delta"] > 1).sum()),
             "counted": bool(count_eligibility),
             "_phase1_pass": bool(phase1_pass),
@@ -1739,6 +1833,12 @@ class RobustCrossingEngine:
             "crossing_frame": event["crossing_frame"],
             "frame_gap": event["frame_gap"],
             "crossing_method": event["crossing_method"],
+            "identity_gap_side_transition": bool(event.get("identity_gap_side_transition", False)),
+            "identity_gap_frames": int(event.get("identity_gap_frames", 0)),
+            "candidate_duplicate_of": event.get("candidate_duplicate_of", pd.NA),
+            "candidate_duplicate_confidence": float(event.get("candidate_duplicate_confidence", 0.0)),
+            "candidate_duplicate_reason": event.get("candidate_duplicate_reason", ""),
+            "candidate_duplicate_suppressed": bool(event.get("candidate_duplicate_suppressed", False)),
             "crossing_direction": event["normal_direction"],
             "phase1_status": event["phase1_status"],
             "phase2_status": event["phase2_status"],
@@ -1748,6 +1848,204 @@ class RobustCrossingEngine:
             "counted": bool(event["counted"]),
             "failure_reason": event["_failure_reason"],
         }
+
+    # ==================================================================
+    # TRAJECTORY-AWARE DUPLICATE IDENTITY AUDIT
+    # ==================================================================
+
+    @staticmethod
+    def _direction_vector(label: str) -> np.ndarray:
+        if label == "L→R":
+            return np.array([1.0, 0.0], dtype=float)
+        if label == "R→L":
+            return np.array([-1.0, 0.0], dtype=float)
+        return np.zeros(2, dtype=float)
+
+    def _candidate_duplicate_score(
+        self,
+        a: pd.Series,
+        b: pd.Series,
+        prepared: pd.DataFrame,
+    ) -> tuple[bool, float, str]:
+        """Score whether two *different* CrossingCandidates are one physical identity.
+
+        The duplicate audit is deliberately different from generic time-distance
+        deduplication.  It only considers candidates with the same class and
+        direction, then checks whether their raw track intervals are sequential
+        rather than simultaneous.  Finally it compares both crossing locations
+        and the continuity between the end of the earlier identity and the start
+        of the later identity.
+        """
+        if int(a["crossing_id"]) == int(b["crossing_id"]):
+            return False, 0.0, "same_identity"
+
+        class_a = str(a.get("counting_class", a.get("track_class", "unknown"))).lower().strip()
+        class_b = str(b.get("counting_class", b.get("track_class", "unknown"))).lower().strip()
+        if class_a != class_b:
+            return False, 0.0, "class_mismatch"
+
+        dir_a = str(a.get("direction", "UNKNOWN"))
+        dir_b = str(b.get("direction", "UNKNOWN"))
+        if dir_a == "UNKNOWN" or dir_b == "UNKNOWN" or dir_a != dir_b:
+            return False, 0.0, "direction_mismatch"
+
+        fa, fb = int(a["crossing_frame"]), int(b["crossing_frame"])
+        if fa == fb:
+            return False, 0.0, "same_frame_independent_event"
+
+        if fa < fb:
+            earlier, later = a, b
+        else:
+            earlier, later = b, a
+
+        crossing_frame_gap = int(later["crossing_frame"] - earlier["crossing_frame"])
+        if crossing_frame_gap <= 0 or crossing_frame_gap > self.config.candidate_duplicate_max_frame_gap:
+            return False, 0.0, "crossing_frame_gap_outside_duplicate_window"
+
+        early_rows = prepared[
+            prepared["crossing_id"] == int(earlier["crossing_id"])
+        ].sort_values("frame_id")
+        late_rows = prepared[
+            prepared["crossing_id"] == int(later["crossing_id"])
+        ].sort_values("frame_id")
+        if early_rows.empty or late_rows.empty:
+            return False, 0.0, "missing_identity_trajectory"
+
+        early_last_frame = int(early_rows["frame_id"].max())
+        late_first_frame = int(late_rows["frame_id"].min())
+        identity_gap = late_first_frame - early_last_frame
+
+        if self.config.candidate_duplicate_require_non_overlapping_tracks:
+            if identity_gap <= 0:
+                return False, 0.0, "temporal_overlap_independent_tracks"
+
+        ex = float(early_rows.iloc[-1]["raw_x"])
+        ey = float(early_rows.iloc[-1]["raw_y"])
+        lx = float(late_rows.iloc[0]["raw_x"])
+        ly = float(late_rows.iloc[0]["raw_y"])
+        endpoint_distance = math.hypot(lx - ex, ly - ey)
+        if endpoint_distance > self.config.candidate_duplicate_max_endpoint_distance_px:
+            return False, 0.0, "endpoint_distance_too_large"
+
+        crossing_distance = math.hypot(
+            float(a["crossing_x"]) - float(b["crossing_x"]),
+            float(a["crossing_y"]) - float(b["crossing_y"]),
+        )
+        if crossing_distance > self.config.candidate_duplicate_max_crossing_distance_px:
+            return False, 0.0, "crossing_point_distance_too_large"
+
+        # Motion continuity in image coordinates.
+        dx_prev = float(early_rows.iloc[-1].get("dx", 0.0))
+        dy_prev = float(early_rows.iloc[-1].get("dy", 0.0))
+        dx_next = float(late_rows.iloc[0].get("dx", 0.0))
+        dy_next = float(late_rows.iloc[0].get("dy", 0.0))
+        va = np.array([dx_prev, dy_prev], dtype=float)
+        vb = np.array([dx_next, dy_next], dtype=float)
+        na = float(np.linalg.norm(va))
+        nb = float(np.linalg.norm(vb))
+        if na > 1e-6 and nb > 1e-6:
+            cosine = float(np.dot(va, vb) / (na * nb))
+        else:
+            cosine = 1.0
+        if cosine < self.config.candidate_duplicate_min_direction_cosine:
+            return False, 0.0, "trajectory_direction_incompatible"
+
+        temporal_identity_score = max(
+            0.0,
+            1.0 - min(identity_gap, 8) / 8.0,
+        )
+        crossing_time_score = max(
+            0.0,
+            1.0 - crossing_frame_gap / max(self.config.candidate_duplicate_max_frame_gap, 1),
+        )
+        endpoint_score = max(
+            0.0,
+            1.0 - endpoint_distance / max(self.config.candidate_duplicate_max_endpoint_distance_px, 1e-6),
+        )
+        crossing_score = max(
+            0.0,
+            1.0 - crossing_distance / max(self.config.candidate_duplicate_max_crossing_distance_px, 1e-6),
+        )
+        direction_score = max(0.0, min(1.0, (cosine + 1.0) / 2.0))
+
+        score = float(
+            0.25 * temporal_identity_score
+            + 0.20 * crossing_time_score
+            + 0.25 * endpoint_score
+            + 0.20 * crossing_score
+            + 0.10 * direction_score
+        )
+
+        # Extra-hard duplicate signature. This is intentionally stricter than
+        # the score itself to avoid suppressing two vehicles that follow each
+        # other legitimately.
+        hard_signature = bool(
+            identity_gap <= 2
+            and crossing_frame_gap <= 5
+            and endpoint_distance <= self.config.candidate_duplicate_max_endpoint_distance_px
+            and crossing_distance <= self.config.candidate_duplicate_max_crossing_distance_px
+            and cosine >= self.config.candidate_duplicate_min_direction_cosine
+        )
+
+        if hard_signature:
+            return True, max(score, 0.72), (
+                f"trajectory_duplicate;class={class_a};direction={dir_a};"
+                f"identity_gap={identity_gap};crossing_frame_gap={crossing_frame_gap};"
+                f"endpoint_distance={endpoint_distance:.1f};"
+                f"crossing_distance={crossing_distance:.1f};"
+                f"direction_cosine={cosine:.3f}"
+            )
+
+        return False, score, "duplicate_signature_not_strong_enough"
+
+    def _apply_duplicate_identity_audit(
+        self,
+        events: pd.DataFrame,
+        prepared: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if events.empty or len(events) < 2:
+            events = events.copy()
+            if not events.empty:
+                events["candidate_duplicate_of"] = pd.NA
+                events["candidate_duplicate_confidence"] = 0.0
+                events["candidate_duplicate_reason"] = ""
+                events["candidate_duplicate_suppressed"] = False
+            return events
+
+        events = events.copy().reset_index(drop=True)
+        events["candidate_duplicate_of"] = pd.NA
+        events["candidate_duplicate_confidence"] = 0.0
+        events["candidate_duplicate_reason"] = ""
+        events["candidate_duplicate_suppressed"] = False
+
+        # Process chronological candidates. Earlier candidate wins only when
+        # the later candidate is strongly explained as its continuation.
+        order = events.sort_values(["crossing_frame", "crossing_id"]).index.tolist()
+        for pos, i in enumerate(order):
+            if bool(events.loc[i, "candidate_duplicate_suppressed"]):
+                continue
+            for j in order[pos + 1 :]:
+                if bool(events.loc[j, "candidate_duplicate_suppressed"]):
+                    continue
+                is_dup, score, reason = self._candidate_duplicate_score(
+                    events.loc[i], events.loc[j], prepared
+                )
+                if not is_dup:
+                    continue
+                events.loc[j, "candidate_duplicate_of"] = int(events.loc[i, "crossing_id"])
+                events.loc[j, "candidate_duplicate_confidence"] = float(score)
+                events.loc[j, "candidate_duplicate_reason"] = reason
+                events.loc[j, "candidate_duplicate_suppressed"] = True
+                events.loc[j, "count_eligibility"] = False
+                events.loc[j, "counted"] = False
+                events.loc[j, "phase2_status"] = "REVIEW"
+                existing = str(events.loc[j, "crossing_method"])
+                events.loc[j, "crossing_method"] = (
+                    existing + "+trajectory_duplicate_identity"
+                    if existing else "trajectory_duplicate_identity"
+                )
+
+        return events
 
     # ==================================================================
     # BATCH
@@ -1811,15 +2109,56 @@ class RobustCrossingEngine:
                     }
                 )
 
-        events_df = pd.DataFrame(
-            events,
-            columns=self.EVENT_COLUMNS,
-        )
+        events_df = pd.DataFrame(events)
+
+        # --------------------------------------------------------------
+        # Canonical duplicate-identity audit happens AFTER every physical
+        # identity has produced its crossing candidate.  This is important:
+        # no frame-level or class-level suppression is allowed before all
+        # candidates exist.
+        # --------------------------------------------------------------
+        if not events_df.empty:
+            events_df = self._apply_duplicate_identity_audit(
+                events_df,
+                prepared,
+            )
+            for column in self.EVENT_COLUMNS:
+                if column not in events_df.columns:
+                    events_df[column] = pd.NA
+            events_df = events_df[
+                self.EVENT_COLUMNS
+            ]
+        else:
+            events_df = pd.DataFrame(columns=self.EVENT_COLUMNS)
 
         audit_df = pd.DataFrame(
             audits,
-            columns=self.AUDIT_COLUMNS,
         )
+
+        # Reflect canonical duplicate decisions back into the per-identity
+        # audit.  The same CrossingCandidate is therefore visible in both
+        # canonical candidates and audit outputs.
+        if not audit_df.empty and not events_df.empty:
+            merge_cols = [
+                "crossing_id",
+                "identity_gap_side_transition",
+                "identity_gap_frames",
+                "candidate_duplicate_of",
+                "candidate_duplicate_confidence",
+                "candidate_duplicate_reason",
+                "candidate_duplicate_suppressed",
+                "count_eligibility",
+                "counted",
+            ]
+            available = [c for c in merge_cols if c in events_df.columns]
+            audit_df = audit_df.drop(
+                columns=[c for c in available if c != "crossing_id" and c in audit_df.columns],
+                errors="ignore",
+            ).merge(
+                events_df[available],
+                on="crossing_id",
+                how="left",
+            )
 
         if return_diagnostics:
             return events_df, audit_df, prepared
@@ -1905,6 +2244,21 @@ class RobustCrossingEngine:
         )
         print(f"Zone chatter tracks                 : {chatter:,}")
         print(f"Sparse crossing candidates           : {len(sparse):,}")
+        duplicate_count = 0
+        suppressed_duplicates = 0
+        identity_gap_candidates = 0
+        if not audit_df.empty:
+            if "candidate_duplicate_suppressed" in audit_df.columns:
+                suppressed_duplicates = int(audit_df["candidate_duplicate_suppressed"].fillna(False).astype(bool).sum())
+            if "crossing_candidate_class" in audit_df.columns:
+                identity_gap_candidates = int(
+                    audit_df.get("identity_gap_side_transition", pd.Series(False, index=audit_df.index)).fillna(False).astype(bool).sum()
+                )
+        if not events_df.empty:
+            duplicate_count = int(events_df.get("candidate_duplicate_of", pd.Series(pd.NA, index=events_df.index)).notna().sum())
+        print(f"Identity-gap crossing candidates      : {identity_gap_candidates:,}")
+        print(f"Trajectory duplicate candidates      : {duplicate_count:,}")
+        print(f"Duplicate candidates suppressed      : {suppressed_duplicates:,}")
         print(
             "Short-track crossings               : "
             f"{int(((audit_df['short_track'] == True) & audit_df['crossing_detected']).sum()):,}"

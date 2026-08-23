@@ -1,85 +1,74 @@
-# Traffic Counter Phase 1/2 v6 — Simultaneous Crossing / Identity Safety
+# Traffic Counter Phase 1–2 v7 — Identity-Gap Crossing + Duplicate Identity Audit
 
-This release fixes a failure mode where two vehicles cross the counting line at nearly the same time, especially when one object becomes fragmented or briefly occluded.
+This release is the final pre-State-Machine refactor for the current architecture.
 
-## Core architecture
+## Canonical flow
 
 TRACK
-  ↓
-TRAJECTORY
-  ↓
-CROSSING CANDIDATE
-  ↓
-CLASS EVIDENCE MERGE
-  ↓
-AUDIT
-  ↓
-COUNTER
+→ TRAJECTORY
+→ CROSSING CANDIDATE
+→ CLASS EVIDENCE MERGE
+→ AUDIT
+→ COUNTER
 
-`RobustCrossingEngine` remains the only crossing detector.
-`TrafficCounter` only consumes canonical crossing candidates.
+`TrafficCounter` does not run geometric crossing detection. `RobustCrossingEngine` is the single source of `CrossingCandidate` events.
 
-## Main fixes
+## New capability 1 — identity_gap_side_transition
 
-1. Vehicle-class reconnect safety
-   - `person ↔ motorcycle` reconnect remains allowed.
-   - `car ↔ motorcycle`, `car ↔ truck`, `car ↔ bus`, etc. are hard-rejected during identity reconnect.
-   - This prevents a fragmented vehicle from attaching to a different vehicle identity with a different vehicle class.
+A physical identity can now be counted as crossing when:
 
-2. Direction-aware reconnect safety
-   - Fragment reconnect now uses velocity normal to the counting line.
-   - Opposite-direction fragments are rejected when the normal-motion evidence conflicts.
-   - This is designed for two vehicles meeting near the line from opposite directions.
+- the identity has a stable side before a tracking gap;
+- the same physical identity reappears on the opposite side;
+- the temporal gap is within `identity_gap_max_frames`;
+- endpoint continuity is plausible;
+- the transition is sufficiently close to the counting boundary.
 
-3. Simultaneous crossing
-   - No deduplication by crossing frame.
-   - No deduplication by class.
-   - No generic time-distance deduplication.
-   - Each `crossing_id` is counted once.
-   - Two different `crossing_id`s at the same `crossing_frame` remain two events.
+The candidate is tagged with:
 
-4. Audit additions
-   - `same_frame_max_crossings`
-   - `class_conflict_rejections`
-   - `direction_conflict_rejections`
-   - `canonical_crossing_candidates`
-   - `count_eligible_candidates`
+- `identity_gap_side_transition`
+- `identity_gap_frames`
+- `crossing_method += identity_gap_side_transition`
 
-## Runtime contract
+No bbox observation inside the corridor is required for this case.
 
-All existing CountingConfig compatibility parameters are retained, including:
+## New capability 2 — trajectory-aware duplicate identity audit
 
-- pre_crossing_distance_px
-- max_identity_reconnect_gap_sec
-- max_identity_reconnect_distance_px
-- identity_match_threshold
-- identity_match_margin
-- velocity_gate_px_per_frame
-- min_pre_crossing_observations
-- crossing_corridor_px
-- min_direction_displacement_px
-- direction_window
-- trajectory_smoothing_alpha
-- trajectory_velocity_window
-- max_velocity_px_per_frame
-- min_pre_zone_observations
-- min_corridor_observations
-- min_post_zone_observations
-- require_post_zone
+A candidate is flagged as a duplicate identity only when all of the following are consistent:
 
-## Validation performed
+- same counting class;
+- same direction;
+- different crossing IDs;
+- non-overlapping raw track intervals when configured;
+- small gap between identities;
+- close crossing points;
+- close identity endpoints;
+- compatible motion direction.
 
-- All replacement Python modules compile successfully.
-- Synthetic simultaneous motorcycle + car crossing: PASS (2 counts).
-- Synthetic simultaneous opposite-direction cars: PASS (2 counts; same_frame_max_crossings = 2).
-- Synthetic fragmented car vs motorcycle: PASS (1 motorcycle + 1 car).
+Same-frame simultaneous vehicles are explicitly not treated as duplicates.
 
-## Important interpretation
+The candidate stores:
 
-If the real video still produces only one count for two visible crossing objects after this release, inspect:
+- `candidate_duplicate_of`
+- `candidate_duplicate_confidence`
+- `candidate_duplicate_reason`
+- `candidate_duplicate_suppressed`
 
-`canonical_crossing_candidates.csv`
+Suppressed duplicates have `count_eligibility=False`.
 
-and compare `crossing_id`, `track_ids`, `crossing_frame`, `counting_class`, and `crossing_method` for the two physical objects.
+## New artifacts
 
-That will tell us whether the loss happens in tracker identity continuity or in candidate generation, rather than hiding it inside final aggregation.
+`crossing_candidates_canonical.csv` is the canonical candidate table.
+
+`trajectory_duplicate_identity_audit.csv` is a filtered duplicate view.
+
+`phase12_crossing_corridor_audit.csv` contains the per-identity audit.
+
+## Compatibility
+
+The legacy counting parameters remain available in `CountingConfig` and the `TrafficCounter` constructor. `engine.py` uses safe config lookups so stale config objects do not trigger missing-field `AttributeError` failures.
+
+## Expected audit interpretation
+
+- `identity_gap_side_transition=True` means a same-identity observation gap itself supplied crossing evidence.
+- `candidate_duplicate_suppressed=True` means the candidate was strongly consistent with a prior physical identity and is not counted.
+- Two different `crossing_id` values on the same `crossing_frame` remain independent candidates and are not frame-deduplicated.

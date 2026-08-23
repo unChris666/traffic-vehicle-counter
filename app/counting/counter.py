@@ -120,6 +120,17 @@ class TrafficCounter:
         min_normal_velocity_px_per_frame: float = 1.0,
         min_normal_displacement_px: float = 8.0,
 
+        # Identity-gap crossing / duplicate candidate audit.
+        identity_gap_crossing_enabled: bool = True,
+        identity_gap_max_frames: int = 8,
+        identity_gap_max_endpoint_distance_px: float = 140.0,
+        identity_gap_min_side_displacement_px: float = 12.0,
+        candidate_duplicate_max_frame_gap: int = 8,
+        candidate_duplicate_max_endpoint_distance_px: float = 55.0,
+        candidate_duplicate_max_crossing_distance_px: float = 55.0,
+        candidate_duplicate_min_direction_cosine: float = 0.75,
+        candidate_duplicate_require_non_overlapping_tracks: bool = True,
+
     ) -> None:
 
         if fps <= 0:
@@ -407,6 +418,12 @@ class TrafficCounter:
                 "candidate_quality",
                 "geometry_crossing",
                 "gap_count",
+                "identity_gap_side_transition",
+                "identity_gap_frames",
+                "candidate_duplicate_of",
+                "candidate_duplicate_confidence",
+                "candidate_duplicate_reason",
+                "candidate_duplicate_suppressed",
             ]
         )
 
@@ -685,6 +702,10 @@ class TrafficCounter:
         # ----------------------------------------------------------
         eligible = crossing_events[
             crossing_events["count_eligibility"].astype(bool)
+            & ~crossing_events.get(
+                "candidate_duplicate_suppressed",
+                pd.Series(False, index=crossing_events.index),
+            ).fillna(False).astype(bool)
         ].copy()
 
         # Keep exactly one event per physical identity. There is deliberately
@@ -765,6 +786,10 @@ class TrafficCounter:
             counted_ids = set(final_crossings["crossing_id"].astype(int).tolist()) if not final_crossings.empty else set()
             track_audit["counted_vehicle"] = track_audit["crossing_id"].isin(counted_ids)
             track_audit["counter_class"] = track_audit["counting_class"]
+            track_audit["duplicate_identity_suppressed"] = track_audit.get(
+                "candidate_duplicate_suppressed",
+                False,
+            )
 
         same_frame_max = 0
         if not crossing_events.empty and "crossing_frame" in crossing_events.columns:
@@ -784,6 +809,24 @@ class TrafficCounter:
             "final_vehicle_crossings": int(len(final_crossings)),
             "final_vehicle_count": int(total),
             "same_frame_max_crossings": int(same_frame_max),
+            "identity_gap_crossing_candidates": int(
+                crossing_events.get(
+                    "identity_gap_side_transition",
+                    pd.Series(False, index=crossing_events.index),
+                ).fillna(False).astype(bool).sum()
+            ),
+            "trajectory_duplicate_candidates": int(
+                crossing_events.get(
+                    "candidate_duplicate_of",
+                    pd.Series(pd.NA, index=crossing_events.index),
+                ).notna().sum()
+            ),
+            "trajectory_duplicate_suppressed": int(
+                crossing_events.get(
+                    "candidate_duplicate_suppressed",
+                    pd.Series(False, index=crossing_events.index),
+                ).fillna(False).astype(bool).sum()
+            ),
         }
 
         return CountingResult(

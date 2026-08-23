@@ -892,6 +892,7 @@ class CrossingIdentityEngine:
         reconnection_count = 0
         class_conflict_rejections = 0
         direction_conflict_rejections = 0
+        temporal_overlap_rejections = 0
 
         for fragment in fragments:
 
@@ -918,6 +919,20 @@ class CrossingIdentityEngine:
                     candidates.append(
                         (score, identity)
                     )
+                else:
+                    # Keep lightweight rejection counters for auditability.
+                    gap_frames = (
+                        fragment.first_frame - identity.last_frame
+                        if identity.last_frame is not None
+                        else None
+                    )
+                    if gap_frames is not None and gap_frames <= 0:
+                        temporal_overlap_rejections += 1
+                    allowed, _ = self._class_pair_compatible(
+                        identity.vehicle_class, fragment.class_name
+                    )
+                    if not allowed:
+                        class_conflict_rejections += 1
 
             candidates.sort(
                 key=lambda item: item[0],
@@ -1028,6 +1043,15 @@ class CrossingIdentityEngine:
                 ),
                 "track_reconnections": int(
                     reconnection_count
+                ),
+                "class_conflict_rejections": int(
+                    class_conflict_rejections
+                ),
+                "direction_conflict_rejections": int(
+                    direction_conflict_rejections
+                ),
+                "temporal_overlap_rejections": int(
+                    temporal_overlap_rejections
                 ),
                 "fragmented_identities": int(
                     sum(

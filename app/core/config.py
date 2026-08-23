@@ -208,6 +208,27 @@ class CountingConfig:
     min_normal_velocity_px_per_frame: float = 1.0
     min_normal_displacement_px: float = 8.0
 
+    # ========================================================
+    # IDENTITY-GAP CROSSING
+    # ========================================================
+    identity_gap_crossing_enabled: bool = True
+    identity_gap_max_frames: int = 8
+    identity_gap_max_endpoint_distance_px: float = 140.0
+    identity_gap_min_side_displacement_px: float = 12.0
+
+    # ========================================================
+    # CANONICAL CROSSING-CANDIDATE DUPLICATE AUDIT
+    # ========================================================
+
+    # Duplicate identity detection is intentionally trajectory-aware.
+    # These parameters are NOT generic time-distance dedup thresholds.
+    candidate_duplicate_max_frame_gap: int = 8
+    candidate_duplicate_max_endpoint_distance_px: float = 55.0
+    candidate_duplicate_max_crossing_distance_px: float = 55.0
+    candidate_duplicate_min_direction_cosine: float = 0.75
+    candidate_duplicate_require_non_overlapping_tracks: bool = True
+
+
 
 # ============================================================
 # APPLICATION CONFIG
