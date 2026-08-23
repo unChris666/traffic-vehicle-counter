@@ -775,6 +775,8 @@ class TrafficCounter:
             "all_tracks_analyzed": int(tracks_phase2["track_id"].nunique()),
             "unique_physical_identities": int(len(identity_map)),
             "track_reconnections": int(identity_audit.get("track_reconnections", 0)),
+            "class_conflict_rejections": int(identity_audit.get("class_conflict_rejections", 0)),
+            "direction_conflict_rejections": int(identity_audit.get("direction_conflict_rejections", 0)),
             "canonical_crossing_candidates": int(len(crossing_events)),
             "count_eligible_candidates": int(len(eligible)),
             "person_crossings": int(len(crossing_person)),
@@ -799,3 +801,4 @@ class TrafficCounter:
             audit=audit,
             track_audit=track_audit,
         )
+

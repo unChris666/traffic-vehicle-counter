@@ -51,6 +51,8 @@ class TrackFragment:
 
     velocity_x: float
     velocity_y: float
+    first_normal_velocity: float
+    last_normal_velocity: float
 
     observation_count: int
     mean_confidence: float
@@ -83,6 +85,8 @@ class CrossingIdentity:
 
     last_velocity_x: float = 0.0
     last_velocity_y: float = 0.0
+    first_normal_velocity: float = 0.0
+    last_normal_velocity: float = 0.0
 
     stable_observations_before_crossing: int = 0
 
@@ -296,6 +300,45 @@ class CrossingIdentityEngine:
             min(1.0, cosine),
         )
 
+    def _normal_velocity(
+        self,
+        vx: float,
+        vy: float,
+    ) -> float:
+        """Velocity component perpendicular to the counting line."""
+        nx = -self.line_dy / self.line_length
+        ny = self.line_dx / self.line_length
+        return float(vx * nx + vy * ny)
+
+    @staticmethod
+    def _class_pair_compatible(
+        identity_class: str,
+        fragment_class: str,
+    ) -> tuple[bool, float]:
+        """Return (allowed, compatibility score).
+
+        Different vehicle classes are intentionally NOT reconnectable.
+        The one exception is person <-> motorcycle because rider/motorcycle
+        detector ambiguity is a known failure mode in this project.
+        """
+        a = str(identity_class).lower().strip()
+        b = str(fragment_class).lower().strip()
+
+        if not a or not b or a == b:
+            return True, 1.0
+
+        if a == "unknown" or b == "unknown":
+            return True, 0.75
+
+        if {a, b} == {"person", "motorcycle"}:
+            return True, 0.45
+
+        vehicle_classes = {"motorcycle", "car", "truck", "bus"}
+        if a in vehicle_classes and b in vehicle_classes and a != b:
+            return False, 0.0
+
+        return False, 0.0
+
     # ------------------------------------------------------------------
     # PREPARE
     # ------------------------------------------------------------------
@@ -433,6 +476,15 @@ class CrossingIdentityEngine:
                 tail=True,
             )
 
+            first_normal_velocity = self._normal_velocity(
+                first_velocity[0],
+                first_velocity[1],
+            )
+            last_normal_velocity = self._normal_velocity(
+                last_velocity[0],
+                last_velocity[1],
+            )
+
             class_counts = (
                 rows["track_class"]
                 .value_counts()
@@ -504,6 +556,12 @@ class CrossingIdentityEngine:
                     ),
                     velocity_y=float(
                         last_velocity[1]
+                    ),
+                    first_normal_velocity=float(
+                        first_normal_velocity
+                    ),
+                    last_normal_velocity=float(
+                        last_normal_velocity
                     ),
                     observation_count=int(
                         len(rows)
@@ -592,17 +650,16 @@ class CrossingIdentityEngine:
         ):
             return -1.0
 
-        # Class mismatch is SOFT evidence, not a hard rejection. A physical
-        # motorcycle can be detected as person in early/occluded frames.
-        # Temporal/spatial/velocity continuity still dominates, so two objects
-        # that overlap in time are never reconnected because gap_frames <= 0.
-        class_compatibility = 1.0
-        if (
-            identity.vehicle_class != "unknown"
-            and fragment.class_name
-            != identity.vehicle_class
-        ):
-            class_compatibility = 0.45
+        # Class compatibility is a HARD identity gate for different vehicle
+        # classes. This prevents a fragmented car from being attached to a
+        # motorcycle that happened to cross at the same place/time. The only
+        # intentional cross-class reconnect is person <-> motorcycle.
+        class_allowed, class_compatibility = self._class_pair_compatible(
+            identity.vehicle_class,
+            fragment.class_name,
+        )
+        if not class_allowed:
+            return -1.0
 
         # Spatial continuity
         spatial_score = max(
@@ -698,16 +755,44 @@ class CrossingIdentityEngine:
                 0.5 * speed_ratio
             )
 
+        # --------------------------------------------------------------
+        # Crossing-direction continuity.
+        # --------------------------------------------------------------
+        # When a fragment resumes on the opposite side, it must move in the
+        # corresponding normal direction. This blocks the common failure where
+        # two cars meet near the line and the second car gets attached to the
+        # first car's identity.
+        old_nv = float(identity.last_normal_velocity)
+        new_nv = float(fragment.first_normal_velocity)
+        direction_consistency = 1.0
+
+        old_side = int(identity.last_side)
+        new_side = int(fragment.first_side)
+
+        if old_side != 0 and new_side != 0 and old_side != new_side:
+            desired_sign = -1.0 if old_side > 0 and new_side < 0 else 1.0
+            if abs(old_nv) >= 0.75 and old_nv * desired_sign < 0:
+                return -1.0
+            if abs(new_nv) >= 0.75 and new_nv * desired_sign < 0:
+                return -1.0
+            direction_consistency = 0.85
+        elif abs(old_nv) >= 0.75 and abs(new_nv) >= 0.75:
+            if old_nv * new_nv < 0:
+                return -1.0
+            direction_consistency = 1.0
+
         score = (
-            0.45 * spatial_score
+            0.43 * spatial_score
             +
-            0.20 * temporal_score
+            0.18 * temporal_score
             +
-            0.20 * velocity_score
+            0.18 * velocity_score
             +
             0.10 * side_score
             +
-            0.05 * class_compatibility
+            0.06 * class_compatibility
+            +
+            0.05 * direction_consistency
         )
 
         return float(score)
@@ -738,6 +823,8 @@ class CrossingIdentityEngine:
             last_distance_px=fragment.last_distance_px,
             last_velocity_x=fragment.velocity_x,
             last_velocity_y=fragment.velocity_y,
+            first_normal_velocity=fragment.first_normal_velocity,
+            last_normal_velocity=fragment.last_normal_velocity,
         )
 
     @staticmethod
@@ -765,6 +852,7 @@ class CrossingIdentityEngine:
         identity.last_distance_px = fragment.last_distance_px
         identity.last_velocity_x = fragment.velocity_x
         identity.last_velocity_y = fragment.velocity_y
+        identity.last_normal_velocity = fragment.last_normal_velocity
 
         if (
             fragment.class_ratio
@@ -802,6 +890,8 @@ class CrossingIdentityEngine:
         track_to_identity: dict[int, int] = {}
 
         reconnection_count = 0
+        class_conflict_rejections = 0
+        direction_conflict_rejections = 0
 
         for fragment in fragments:
 
@@ -810,6 +900,14 @@ class CrossingIdentityEngine:
             ] = []
 
             for identity in identities:
+
+                allowed, _compat = self._class_pair_compatible(
+                    identity.vehicle_class,
+                    fragment.class_name,
+                )
+                if not allowed:
+                    class_conflict_rejections += 1
+                    continue
 
                 score = self._candidate_score(
                     identity,
@@ -937,5 +1035,7 @@ class CrossingIdentityEngine:
                         for identity in identities
                     )
                 ),
+                "class_conflict_rejections": int(class_conflict_rejections),
+                "direction_conflict_rejections": int(direction_conflict_rejections),
             },
         )

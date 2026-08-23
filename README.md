@@ -1,67 +1,85 @@
-# Phase 1-2 v4: Class Evidence + Short Track + Zone Stability
+# Traffic Counter Phase 1/2 v6 — Simultaneous Crossing / Identity Safety
 
-Architecture:
+This release fixes a failure mode where two vehicles cross the counting line at nearly the same time, especially when one object becomes fragmented or briefly occluded.
+
+## Core architecture
 
 TRACK
-  -> TRAJECTORY
-  -> CROSSING CANDIDATE
-  -> AUDIT
-  -> COUNTER
+  ↓
+TRAJECTORY
+  ↓
+CROSSING CANDIDATE
+  ↓
+CLASS EVIDENCE MERGE
+  ↓
+AUDIT
+  ↓
+COUNTER
 
-This release does NOT implement Phase 3 State Machine.
+`RobustCrossingEngine` remains the only crossing detector.
+`TrafficCounter` only consumes canonical crossing candidates.
 
-## 1. Class evidence
+## Main fixes
 
-`track_class` from the earlier track-level majority classifier is preserved as `detector_track_class`.
-The crossing engine computes `counting_class` using raw `class_name` observations near the crossing, confidence-weighted and recency-weighted.
+1. Vehicle-class reconnect safety
+   - `person ↔ motorcycle` reconnect remains allowed.
+   - `car ↔ motorcycle`, `car ↔ truck`, `car ↔ bus`, etc. are hard-rejected during identity reconnect.
+   - This prevents a fragmented vehicle from attaching to a different vehicle identity with a different vehicle class.
 
-Example:
+2. Direction-aware reconnect safety
+   - Fragment reconnect now uses velocity normal to the counting line.
+   - Opposite-direction fragments are rejected when the normal-motion evidence conflicts.
+   - This is designed for two vehicles meeting near the line from opposite directions.
 
-person -> person -> motorcycle -> motorcycle -> motorcycle
+3. Simultaneous crossing
+   - No deduplication by crossing frame.
+   - No deduplication by class.
+   - No generic time-distance deduplication.
+   - Each `crossing_id` is counted once.
+   - Two different `crossing_id`s at the same `crossing_frame` remain two events.
 
-can become:
+4. Audit additions
+   - `same_frame_max_crossings`
+   - `class_conflict_rejections`
+   - `direction_conflict_rejections`
+   - `canonical_crossing_candidates`
+   - `count_eligible_candidates`
 
-counting_class = motorcycle
-class_transition = person->motorcycle
+## Runtime contract
 
-The event still exposes `track_class` as `counting_class` for backward compatibility with the existing counter.
+All existing CountingConfig compatibility parameters are retained, including:
 
-## 2. Short-track eligibility
+- pre_crossing_distance_px
+- max_identity_reconnect_gap_sec
+- max_identity_reconnect_distance_px
+- identity_match_threshold
+- identity_match_margin
+- velocity_gate_px_per_frame
+- min_pre_crossing_observations
+- crossing_corridor_px
+- min_direction_displacement_px
+- direction_window
+- trajectory_smoothing_alpha
+- trajectory_velocity_window
+- max_velocity_px_per_frame
+- min_pre_zone_observations
+- min_corridor_observations
+- min_post_zone_observations
+- require_post_zone
 
-A short track is no longer an automatic invalid object.
+## Validation performed
 
-`short_track=True` is diagnostic. A geometric crossing can remain `count_eligibility=True` when direction and counting-class evidence are strong enough.
+- All replacement Python modules compile successfully.
+- Synthetic simultaneous motorcycle + car crossing: PASS (2 counts).
+- Synthetic simultaneous opposite-direction cars: PASS (2 counts; same_frame_max_crossings = 2).
+- Synthetic fragmented car vs motorcycle: PASS (1 motorcycle + 1 car).
 
-The engine records `short_track_crossing` and reasons in the audit.
+## Important interpretation
 
-## 3. Zone stability
+If the real video still produces only one count for two visible crossing objects after this release, inspect:
 
-Raw geometry continues to use raw bbox coordinates.
-Zone labels use temporal hysteresis:
+`canonical_crossing_candidates.csv`
 
-- `zone_enter_confirm_observations`
-- `zone_exit_confirm_observations`
+and compare `crossing_id`, `track_ids`, `crossing_frame`, `counting_class`, and `crossing_method` for the two physical objects.
 
-`PRE -> NEAR_LINE -> CORRIDOR` is normal progression and is NOT counted as chatter.
-Chatter means actual backtracking such as:
-
-`PRE -> NEAR_LINE -> PRE`
-
-or
-
-`CORRIDOR -> NEAR_LINE -> CORRIDOR`.
-
-## 4. Counter
-
-`TrafficCounter` uses `counting_class` exposed through `track_class` by `RobustCrossingEngine`, so the existing vehicle filter remains compatible.
-
-Additional class evidence columns are preserved in `final_crossings`.
-
-## 5. Required replacement files
-
-- app/counting/robust_crossing.py
-- app/counting/counter.py
-- app/core/config.py
-- app/inference/engine.py
-
-No changes to YOLO26 / BoT-SORT are required.
+That will tell us whether the loss happens in tracker identity continuity or in candidate generation, rather than hiding it inside final aggregation.
