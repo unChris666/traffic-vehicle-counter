@@ -212,6 +212,8 @@ class CountingConfig:
     # IDENTITY-GAP CROSSING
     # ========================================================
     identity_gap_crossing_enabled: bool = True
+    candidate_generation_per_raw_track: bool = True
+    canonical_candidate_id_by_event: bool = True
     identity_gap_max_frames: int = 8
     identity_gap_max_endpoint_distance_px: float = 140.0
     identity_gap_min_side_displacement_px: float = 12.0
@@ -287,3 +289,7 @@ def build_config() -> AppConfig:
     )
 
     return config
+
+# v9 raw-fragment fallback crossing
+IDENTITY_GAP_FALLBACK_ENABLED = True
+IDENTITY_GAP_FALLBACK_MIN_SCORE = 0.72

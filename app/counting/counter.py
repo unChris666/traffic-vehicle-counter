@@ -420,6 +420,7 @@ class TrafficCounter:
                 "gap_count",
                 "identity_gap_side_transition",
                 "identity_gap_frames",
+                "identity_gap_identity_confirmed",
                 "candidate_duplicate_of",
                 "candidate_duplicate_confidence",
                 "candidate_duplicate_reason",
@@ -679,7 +680,8 @@ class TrafficCounter:
         candidates_df, phase12_audit, prepared = (
             self.crossing_engine.process(
                 trajectory,
-                identity_column="crossing_id",
+                identity_column="track_id",
+                physical_identity_column="crossing_id",
                 return_diagnostics=True,
             )
         )
@@ -708,9 +710,10 @@ class TrafficCounter:
             ).fillna(False).astype(bool)
         ].copy()
 
-        # Keep exactly one event per physical identity. There is deliberately
-        # NO dedup by frame, class, distance, or direction. Simultaneous
-        # motorcycle + car therefore remain two independent events.
+        # `crossing_id` is now a canonical candidate/event id, not the raw
+        # physical-identity id. Duplicate candidate suppression has already
+        # happened inside RobustCrossingEngine. Never deduplicate by frame,
+        # class, direction, or proximity here.
         eligible = (
             eligible
             .drop_duplicates("crossing_id", keep="first")
