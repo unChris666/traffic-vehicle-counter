@@ -121,6 +121,22 @@ class CountingConfig:
     moto_dedup_distance_px: float = 30.0
 
     # ========================================================
+    # IDENTITY / FRAGMENT RECONNECT COMPATIBILITY
+    # ========================================================
+
+    # These fields are required by the existing TrafficCounter and
+    # CrossingIdentityEngine interfaces. They remain available even
+    # while Phase 1/2 development is being performed.
+
+    pre_crossing_distance_px: float = 100.0
+    max_identity_reconnect_gap_sec: float = 1.0
+    max_identity_reconnect_distance_px: float = 100.0
+    identity_match_threshold: float = 0.82
+    identity_match_margin: float = 0.08
+    velocity_gate_px_per_frame: float = 30.0
+    min_pre_crossing_observations: int = 2
+
+    # ========================================================
     # ROBUST CROSSING GEOMETRY
     # ========================================================
 

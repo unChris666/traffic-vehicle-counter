@@ -114,6 +114,11 @@ class TrafficCountingEngine:
         track_audit.to_csv(path, index=False)
         return path
 
+    def _counting_value(self, name: str, default):
+        """Safely read a CountingConfig value with backward-compatible fallback."""
+        counting = self.config.counting
+        return getattr(counting, name, default)
+
     def _build_counter(
         self,
         *,
@@ -130,22 +135,22 @@ class TrafficCountingEngine:
 
         line_x1 = (
             metadata.width
-            * self.config.counting.line_x1_ratio
+            * self._counting_value("line_x1_ratio", 0.95)
         )
 
         line_y1 = (
             metadata.height
-            * self.config.counting.line_y1_ratio
+            * self._counting_value("line_y1_ratio", 0.20)
         )
 
         line_x2 = (
             metadata.width
-            * self.config.counting.line_x2_ratio
+            * self._counting_value("line_x2_ratio", 0.05)
         )
 
         line_y2 = (
             metadata.height
-            * self.config.counting.line_y2_ratio
+            * self._counting_value("line_y2_ratio", 0.95)
         )
 
         candidate_kwargs = {
@@ -154,16 +159,16 @@ class TrafficCountingEngine:
             "line_x2": line_x2,
             "line_y2": line_y2,
             "line_deadband_px": (
-                self.config.counting.line_deadband_px
+                self._counting_value("line_deadband_px", 8.0)
             ),
             "max_trajectory_gap_sec": (
-                self.config.counting.max_trajectory_gap_sec
+                self._counting_value("max_trajectory_gap_sec", 1.50)
             ),
             "moto_dedup_time_sec": (
-                self.config.counting.moto_dedup_time_sec
+                self._counting_value("moto_dedup_time_sec", 0.25)
             ),
             "moto_dedup_distance_px": (
-                self.config.counting.moto_dedup_distance_px
+                self._counting_value("moto_dedup_distance_px", 30.0)
             ),
             "vehicle_classes": set(
                 self.config.vehicle_classes
@@ -172,69 +177,69 @@ class TrafficCountingEngine:
 
             # Crossing identity / fragmentation.
             "pre_crossing_distance_px": (
-                self.config.counting.pre_crossing_distance_px
+                self._counting_value("pre_crossing_distance_px", 100.0)
             ),
             "max_identity_reconnect_gap_sec": (
-                self.config.counting.max_identity_reconnect_gap_sec
+                self._counting_value("max_identity_reconnect_gap_sec", 1.0)
             ),
             "max_identity_reconnect_distance_px": (
-                self.config.counting.max_identity_reconnect_distance_px
+                self._counting_value("max_identity_reconnect_distance_px", 100.0)
             ),
             "identity_match_threshold": (
-                self.config.counting.identity_match_threshold
+                self._counting_value("identity_match_threshold", 0.82)
             ),
             "identity_match_margin": (
-                self.config.counting.identity_match_margin
+                self._counting_value("identity_match_margin", 0.08)
             ),
             "velocity_gate_px_per_frame": (
-                self.config.counting.velocity_gate_px_per_frame
+                self._counting_value("velocity_gate_px_per_frame", 30.0)
             ),
             "min_pre_crossing_observations": (
-                self.config.counting.min_pre_crossing_observations
+                self._counting_value("min_pre_crossing_observations", 2)
             ),
 
             # Robust crossing geometry.
             "crossing_corridor_px": (
-                self.config.counting.crossing_corridor_px
+                self._counting_value("crossing_corridor_px", 45.0)
             ),
             "min_direction_displacement_px": (
-                self.config.counting.min_direction_displacement_px
+                self._counting_value("min_direction_displacement_px", 8.0)
             ),
             "direction_window": (
-                self.config.counting.direction_window
+                self._counting_value("direction_window", 3)
             ),
 
             # Phase 1 — trajectory engine.
             "trajectory_smoothing_alpha": (
-                self.config.counting.trajectory_smoothing_alpha
+                self._counting_value("trajectory_smoothing_alpha", 0.35)
             ),
             "trajectory_velocity_window": (
-                self.config.counting.trajectory_velocity_window
+                self._counting_value("trajectory_velocity_window", 5)
             ),
             "max_velocity_px_per_frame": (
-                self.config.counting.max_velocity_px_per_frame
+                self._counting_value("max_velocity_px_per_frame", 80.0)
             ),
 
             # Phase 2 — crossing corridor.
             "min_pre_zone_observations": (
-                self.config.counting.min_pre_zone_observations
+                self._counting_value("min_pre_zone_observations", 2)
             ),
             "min_corridor_observations": (
-                self.config.counting.min_corridor_observations
+                self._counting_value("min_corridor_observations", 1)
             ),
             "min_post_zone_observations": (
-                self.config.counting.min_post_zone_observations
+                self._counting_value("min_post_zone_observations", 1)
             ),
             "require_post_zone": (
-                self.config.counting.require_post_zone
+                self._counting_value("require_post_zone", True)
             ),
 
             # Conservative final duplicate suppression.
             "duplicate_time_sec": (
-                self.config.counting.duplicate_time_sec
+                self._counting_value("duplicate_time_sec", 0.30)
             ),
             "duplicate_distance_px": (
-                self.config.counting.duplicate_distance_px
+                self._counting_value("duplicate_distance_px", 25.0)
             ),
         }
 
@@ -498,10 +503,10 @@ class TrafficCountingEngine:
             "Running robust vehicle crossing engine...",
         )
 
-        line_x1 = metadata.width * self.config.counting.line_x1_ratio
-        line_y1 = metadata.height * self.config.counting.line_y1_ratio
-        line_x2 = metadata.width * self.config.counting.line_x2_ratio
-        line_y2 = metadata.height * self.config.counting.line_y2_ratio
+        line_x1 = metadata.width * self._counting_value("line_x1_ratio", 0.95)
+        line_y1 = metadata.height * self._counting_value("line_y1_ratio", 0.20)
+        line_x2 = metadata.width * self._counting_value("line_x2_ratio", 0.05)
+        line_y2 = metadata.height * self._counting_value("line_y2_ratio", 0.95)
 
         # These are the parameters supported by the current
         # robust TrafficCounter implementation.
@@ -767,10 +772,10 @@ class TrafficCountingEngine:
             "configured_vid_stride": self.config.detection.vid_stride,
             "configured_conf_threshold": self.config.detection.conf_threshold,
             "configured_iou_threshold": self.config.detection.iou_threshold,
-            "crossing_corridor_px": self.config.counting.crossing_corridor_px,
-            "line_deadband_px": self.config.counting.line_deadband_px,
-            "duplicate_time_sec": self.config.counting.duplicate_time_sec,
-            "duplicate_distance_px": self.config.counting.duplicate_distance_px,
+            "crossing_corridor_px": self._counting_value("crossing_corridor_px", 45.0),
+            "line_deadband_px": self._counting_value("line_deadband_px", 8.0),
+            "duplicate_time_sec": self._counting_value("duplicate_time_sec", 0.30),
+            "duplicate_distance_px": self._counting_value("duplicate_distance_px", 25.0),
         }
 
         direction_counts = [
