@@ -113,6 +113,12 @@ class TrafficCounter:
         min_counting_class_confidence: float = 0.45,
         zone_enter_confirm_observations: int = 2,
         zone_exit_confirm_observations: int = 2,
+        gap_bridge_enabled: bool = True,
+        gap_bridge_max_frames: int = 12,
+        max_velocity_bridge_px_per_frame: float = 160.0,
+        fast_speed_multiplier: float = 0.80,
+        min_normal_velocity_px_per_frame: float = 1.0,
+        min_normal_displacement_px: float = 8.0,
 
     ) -> None:
 
@@ -272,6 +278,12 @@ class TrafficCounter:
                     zone_exit_confirm_observations=(
                         zone_exit_confirm_observations
                     ),
+                    gap_bridge_enabled=gap_bridge_enabled,
+                    gap_bridge_max_frames=gap_bridge_max_frames,
+                    max_velocity_bridge_px_per_frame=max_velocity_bridge_px_per_frame,
+                    fast_speed_multiplier=fast_speed_multiplier,
+                    min_normal_velocity_px_per_frame=min_normal_velocity_px_per_frame,
+                    min_normal_displacement_px=min_normal_displacement_px,
                     vehicle_classes=tuple(
                         sorted(self.vehicle_classes)
                     ),
@@ -392,6 +404,9 @@ class TrafficCounter:
                 "crossing_method",
                 "track_observations",
                 "counted",
+                "candidate_quality",
+                "geometry_crossing",
+                "gap_count",
             ]
         )
 
@@ -402,15 +417,33 @@ class TrafficCounter:
                 "crossing_id",
                 "track_ids",
                 "track_class",
+                "detector_track_class",
+                "counting_class",
+                "counting_class_confidence",
+                "class_transition",
+                "class_evidence",
                 "first_frame",
                 "last_frame",
                 "crossing_frame",
                 "direction",
+                "normal_direction",
                 "counted",
+                "counted_vehicle",
+                "crossing_candidate_class",
+                "geometry_crossing",
                 "crossing_method",
+                "candidate_quality",
                 "track_observations",
-                "duplicate_of_track_id",
-                "dedup_reason",
+                "gap_count",
+                "short_track",
+                "fast_crossing",
+                "sparse_crossing",
+                "zone_path",
+                "zone_chatter_count",
+                "pre_zone_evidence",
+                "corridor_evidence",
+                "post_zone_evidence",
+                "failure_reason",
             ]
         )
 
@@ -559,7 +592,17 @@ class TrafficCounter:
         self,
         tracks_phase2: pd.DataFrame,
     ) -> CountingResult:
+        """Consume canonical CrossingCandidate events.
 
+        IMPORTANT:
+            This method NEVER performs geometric crossing detection.
+            RobustCrossingEngine is the sole producer of CrossingCandidate.
+            Counter only consumes, classifies, and aggregates those candidates.
+
+        Consequence:
+            Two independent crossing_id values at the same frame are always
+            counted independently. There is no same-frame suppression.
+        """
         required = {
             "track_id",
             "frame_id",
@@ -568,13 +611,7 @@ class TrafficCounter:
             "bottom_center_y",
             "track_class",
         }
-
-        missing = (
-            required
-            -
-            set(tracks_phase2.columns)
-        )
-
+        missing = required - set(tracks_phase2.columns)
         if missing:
             raise ValueError(
                 "tracks_phase2 missing required "
@@ -583,14 +620,8 @@ class TrafficCounter:
 
         if tracks_phase2.empty:
             empty = self._empty_crossing_events()
-
             return CountingResult(
-                counts={
-                    "motorcycle": 0,
-                    "car": 0,
-                    "truck": 0,
-                    "bus": 0,
-                },
+                counts={"motorcycle": 0, "car": 0, "truck": 0, "bus": 0},
                 total=0,
                 trajectory=tracks_phase2.copy(),
                 phase12_trajectory=tracks_phase2.copy(),
@@ -605,350 +636,166 @@ class TrafficCounter:
                     "all_tracks_analyzed": 0,
                     "unique_physical_identities": 0,
                     "track_reconnections": 0,
-                    "person_crossings_excluded": 0,
+                    "canonical_crossing_candidates": 0,
+                    "count_eligible_candidates": 0,
+                    "person_crossings": 0,
                     "vehicle_crossings_before_filter": 0,
                     "final_vehicle_crossings": 0,
                     "final_vehicle_count": 0,
+                    "same_frame_max_crossings": 0,
                 },
                 track_audit=self._empty_track_audit(),
             )
 
-        # ==========================================================
+        # ----------------------------------------------------------
         # 1. PHYSICAL IDENTITY
-        # ==========================================================
-
-        (
-            trajectory,
-            identity_map,
-            track_to_identity,
-            identity_audit,
-        ) = self.identity_engine.run(
-            tracks_phase2
+        # ----------------------------------------------------------
+        trajectory, identity_map, track_to_identity, identity_audit = (
+            self.identity_engine.run(tracks_phase2)
         )
 
-        # ==========================================================
-        # 2. LINE GEOMETRY
-        # ==========================================================
-
-        trajectory = self._apply_line_geometry(
-            trajectory
-        )
-
-        # ==========================================================
-        # 3. GEOMETRIC CROSSING
-        # ==========================================================
-        #
-        # Use crossing_id as the grouping identity.
-        #
-        # This is the critical separation:
-        #
-        # raw track_id != physical vehicle identity
-        #
-        # Therefore fragmentation can reconnect without
-        # causing simultaneous independent motorcycles to merge.
-        # ==========================================================
-
-        (
-            events_df,
-            phase12_audit,
-            phase12_trajectory,
-        ) = self.crossing_engine.process(
-            trajectory,
-            identity_column="crossing_id",
-            return_diagnostics=True,
-        )
-
-        # Print a human-readable Phase 1/2 report in the Kaggle/Gradio
-        # backend logs. This does not modify the count.
-        self.crossing_engine.print_phase_report(
-            events_df,
-            phase12_audit,
-        )
-
-        if events_df.empty:
-            crossing_events = (
-                self._empty_crossing_events()
+        # ----------------------------------------------------------
+        # 2. GEOMETRY + CANDIDATE PRODUCTION
+        # ----------------------------------------------------------
+        # One and only one module performs crossing detection.
+        # This is the canonical CrossingCandidate dataframe.
+        candidates_df, phase12_audit, prepared = (
+            self.crossing_engine.process(
+                trajectory,
+                identity_column="crossing_id",
+                return_diagnostics=True,
             )
+        )
+
+        crossing_candidates = candidates_df.copy()
+        if crossing_candidates.empty:
+            crossing_events = crossing_candidates.copy()
         else:
             crossing_events = (
-                events_df.copy()
-                .sort_values(
-                    [
-                        "crossing_frame",
-                        "crossing_id",
-                    ],
-                    na_position="last",
-                )
-                .reset_index(drop=True)
-            )
-
-        # ==========================================================
-        # 4. VEHICLE / PERSON
-        # ==========================================================
-
-        crossing_vehicle = (
-            crossing_events[
-                crossing_events[
-                    "track_class"
-                ].isin(
-                    self.vehicle_classes
-                )
-                &
-                crossing_events[
-                    "counted"
-                ].astype(bool)
-            ]
-            .copy()
-        )
-
-        crossing_person = (
-            crossing_events[
-                (
-                    crossing_events[
-                        "track_class"
-                    ]
-                    ==
-                    "person"
-                )
-                &
-                crossing_events[
-                    "counted"
-                ].astype(bool)
-            ]
-            .copy()
-        )
-
-        # ==========================================================
-        # 5. FINAL VEHICLE EVENTS
-        # ==========================================================
-        #
-        # No generic time/distance dedup.
-        #
-        # Each physical crossing_id is already unique.
-        #
-        # This is intentionally different from the old motorcycle
-        # dedup implementation, which could merge two true
-        # motorcycles crossing close together.
-        # ==========================================================
-
-        vehicle_events = (
-            crossing_vehicle.copy()
-        )
-
-        if vehicle_events.empty:
-            final_crossings = (
-                self._empty_crossing_events()
-            )
-        else:
-            final_crossings = (
-                vehicle_events[
-                    [
-                        "crossing_id",
-                        "track_id",
-                        "track_ids",
-                        "first_frame",
-                        "last_frame",
-                        "crossing_frame",
-                        "crossing_time_sec",
-                        "crossing_x",
-                        "crossing_y",
-                        "direction",
-                        "side_transition",
-                        "track_class",
-                        "detector_track_class",
-                        "track_class_ratio",
-                        "class_ambiguous",
-                        "counting_class",
-                        "counting_class_confidence",
-                        "class_transition",
-                        "class_evidence",
-                        "line_distance_px",
-                        "previous_side",
-                        "current_side",
-                        "frame_gap",
-                        "crossing_method",
-                        "track_observations",
-                        "counted",
-                    ]
+                crossing_candidates[
+                    crossing_candidates["geometry_crossing"].astype(bool)
                 ]
-                .drop_duplicates(
-                    "crossing_id",
-                    keep="first",
-                )
-                .sort_values(
-                    "crossing_frame",
-                    na_position="last",
-                )
+                .copy()
+                .sort_values(["crossing_frame", "crossing_id"])
                 .reset_index(drop=True)
             )
 
-        # ==========================================================
-        # 5B. CANDIDATE CLASS / SHORT TRACK AUDIT
-        # ==========================================================
-        if not crossing_events.empty:
-            transitions = int(
-                crossing_events.get("class_transition", pd.Series(dtype=str))
-                .fillna("")
-                .astype(str)
-                .ne("")
-                .sum()
-            )
-            short_crossings = int(
-                crossing_events.get("short_track", pd.Series(dtype=bool))
-                .fillna(False)
-                .astype(bool)
-                .sum()
-            )
-        else:
-            transitions = 0
-            short_crossings = 0
+        # ----------------------------------------------------------
+        # 3. COUNTER CONSUMES CANDIDATES — NO RE-DETECTION
+        # ----------------------------------------------------------
+        eligible = crossing_events[
+            crossing_events["count_eligibility"].astype(bool)
+        ].copy()
 
-        # ==========================================================
-        # 6. COUNTS
-        # ==========================================================
+        # Keep exactly one event per physical identity. There is deliberately
+        # NO dedup by frame, class, distance, or direction. Simultaneous
+        # motorcycle + car therefore remain two independent events.
+        eligible = (
+            eligible
+            .drop_duplicates("crossing_id", keep="first")
+            .reset_index(drop=True)
+        )
 
+        if "counting_class" not in eligible.columns:
+            eligible["counting_class"] = eligible["track_class"]
+
+        eligible["counting_class"] = (
+            eligible["counting_class"]
+            .astype(str)
+            .str.lower()
+            .str.strip()
+        )
+
+        crossing_vehicle = eligible[
+            eligible["counting_class"].isin(self.vehicle_classes)
+        ].copy()
+
+        crossing_person = eligible[
+            eligible["counting_class"].eq("person")
+        ].copy()
+
+        # Canonical class becomes the counter-facing track_class for
+        # backward-compatible downstream modules.
+        if not crossing_vehicle.empty:
+            crossing_vehicle["track_class"] = crossing_vehicle["counting_class"]
+        if not crossing_person.empty:
+            crossing_person["track_class"] = crossing_person["counting_class"]
+
+        vehicle_events = crossing_vehicle.copy()
+        final_crossings = (
+            vehicle_events
+            .drop_duplicates("crossing_id", keep="first")
+            .sort_values("crossing_frame")
+            .reset_index(drop=True)
+            if not vehicle_events.empty
+            else self._empty_crossing_events()
+        )
+
+        # ----------------------------------------------------------
+        # 4. FINAL COUNTS
+        # ----------------------------------------------------------
         counts_series = (
-            final_crossings[
-                final_crossings[
-                    "counted"
-                ].astype(bool)
-            ]
-            .groupby("track_class")
+            final_crossings.groupby("counting_class")
             .size()
             .reindex(
-                [
-                    "motorcycle",
-                    "car",
-                    "truck",
-                    "bus",
-                ],
+                ["motorcycle", "car", "truck", "bus"],
                 fill_value=0,
             )
             .astype(int)
+            if not final_crossings.empty
+            else pd.Series(
+                {"motorcycle": 0, "car": 0, "truck": 0, "bus": 0},
+                dtype=int,
+            )
         )
 
         counts = {
-            "motorcycle": int(
-                counts_series[
-                    "motorcycle"
-                ]
-            ),
-            "car": int(
-                counts_series["car"]
-            ),
-            "truck": int(
-                counts_series["truck"]
-            ),
-            "bus": int(
-                counts_series["bus"]
-            ),
+            "motorcycle": int(counts_series["motorcycle"]),
+            "car": int(counts_series["car"]),
+            "truck": int(counts_series["truck"]),
+            "bus": int(counts_series["bus"]),
         }
+        total = int(sum(counts.values()))
 
-        total = int(
-            sum(counts.values())
-        )
-
-        # ==========================================================
-        # 7. AUDIT
-        # ==========================================================
-
-        track_audit = self._build_track_audit(
-            trajectory,
-            crossing_events,
-            identity_map,
-        )
-
-        # Counted status after vehicle/person filtering.
+        # ----------------------------------------------------------
+        # 5. AUDIT
+        # ----------------------------------------------------------
+        track_audit = phase12_audit.copy()
         if not track_audit.empty:
-            non_vehicle_crossings = set(
-                crossing_events[
-                    ~crossing_events[
-                        "track_class"
-                    ].isin(
-                        self.vehicle_classes
-                    )
-                ]["crossing_id"].dropna().astype(int)
-            )
+            counted_ids = set(final_crossings["crossing_id"].astype(int).tolist()) if not final_crossings.empty else set()
+            track_audit["counted_vehicle"] = track_audit["crossing_id"].isin(counted_ids)
+            track_audit["counter_class"] = track_audit["counting_class"]
 
-            for crossing_id in non_vehicle_crossings:
-                track_audit.loc[
-                    track_audit[
-                        "crossing_id"
-                    ]
-                    ==
-                    crossing_id,
-                    "counted",
-                ] = False
+        same_frame_max = 0
+        if not crossing_events.empty and "crossing_frame" in crossing_events.columns:
+            frame_counts = crossing_events.groupby("crossing_frame").size()
+            same_frame_max = int(frame_counts.max()) if not frame_counts.empty else 0
 
         audit = {
-            "all_tracks_analyzed": int(
-                trajectory[
-                    "track_id"
-                ].nunique()
-            ),
-            "unique_physical_identities": int(
-                len(identity_map)
-            ),
-            "track_reconnections": int(
-                identity_audit[
-                    "track_reconnections"
-                ]
-            ),
-            "fragmented_identities": int(
-                identity_audit[
-                    "fragmented_identities"
-                ]
-            ),
-            "all_crossing_events": int(
-                len(crossing_events)
-            ),
-            "person_crossings_excluded": int(
-                len(crossing_person)
-            ),
-            "vehicle_crossings_before_filter": int(
-                len(crossing_vehicle)
-            ),
-            "final_vehicle_crossings": int(
-                len(final_crossings)
-            ),
-            "final_vehicle_count": int(
-                total
-            ),
-            "class_transition_crossings": int(transitions),
-            "short_track_crossings": int(short_crossings),
-            "counting_class_available": bool(
-                "counting_class" in crossing_events.columns
-            ),
-
-            # Explicitly record that broad duplicate suppression
-            # is disabled by design.
-            "generic_time_distance_duplicates_removed": 0,
+            "all_tracks_analyzed": int(tracks_phase2["track_id"].nunique()),
+            "unique_physical_identities": int(len(identity_map)),
+            "track_reconnections": int(identity_audit.get("track_reconnections", 0)),
+            "canonical_crossing_candidates": int(len(crossing_events)),
+            "count_eligible_candidates": int(len(eligible)),
+            "person_crossings": int(len(crossing_person)),
+            "vehicle_crossings_before_filter": int(len(eligible)),
+            "final_vehicle_crossings": int(len(final_crossings)),
+            "final_vehicle_count": int(total),
+            "same_frame_max_crossings": int(same_frame_max),
         }
 
         return CountingResult(
             counts=counts,
             total=total,
-            trajectory=trajectory,
-            phase12_trajectory=phase12_trajectory,
+            trajectory=prepared,
+            phase12_trajectory=prepared,
             phase12_audit=phase12_audit,
-            crossing_candidates=(
-                crossing_events.copy()
-            ),
-            crossing_events=(
-                crossing_events
-            ),
-            crossing_vehicle=(
-                crossing_vehicle
-            ),
-            crossing_person=(
-                crossing_person
-            ),
-            vehicle_events=(
-                vehicle_events
-            ),
-            final_crossings=(
-                final_crossings
-            ),
+            crossing_candidates=crossing_candidates,
+            crossing_events=crossing_events,
+            crossing_vehicle=crossing_vehicle,
+            crossing_person=crossing_person,
+            vehicle_events=vehicle_events,
+            final_crossings=final_crossings,
             audit=audit,
             track_audit=track_audit,
         )

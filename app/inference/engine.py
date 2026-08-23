@@ -500,7 +500,7 @@ class TrafficCountingEngine:
         self._report(
             progress_callback,
             0.83,
-            "Running robust vehicle crossing engine...",
+            "Building canonical crossing candidates...",
         )
 
         line_x1 = metadata.width * self._counting_value("line_x1_ratio", 0.95)
@@ -541,6 +541,10 @@ class TrafficCountingEngine:
         )
         counting_result.final_crossings.to_csv(
             output_dir / "final_vehicle_crossings.csv",
+            index=False,
+        )
+        counting_result.crossing_candidates.to_csv(
+            output_dir / "crossing_candidates_canonical.csv",
             index=False,
         )
 
@@ -862,7 +866,7 @@ class TrafficCountingEngine:
             )
 
         print("\n" + "=" * 70)
-        print("FINAL VEHICLE COUNT")
+        print("FINAL VEHICLE COUNT (CANONICAL CANDIDATES)")
         print("=" * 70)
 
         for class_name, count in counting_result.counts.items():

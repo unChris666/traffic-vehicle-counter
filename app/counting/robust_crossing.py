@@ -216,6 +216,9 @@ class RobustCrossingEngine:
         "phase1_status",
         "phase2_status",
         "count_eligibility",
+        "candidate_quality",
+        "geometry_crossing",
+        "gap_count",
         "counted",
     ]
 
@@ -266,6 +269,9 @@ class RobustCrossingEngine:
         "phase1_pass",
         "phase2_pass",
         "count_eligibility",
+        "candidate_quality",
+        "geometry_crossing",
+        "gap_count",
         "counted",
         "failure_reason",
     ]
@@ -984,7 +990,11 @@ class RobustCrossingEngine:
         previous: pd.Series,
         current: pd.Series,
     ) -> tuple[bool, str]:
-        """Detect crossing across a sparse observation gap."""
+        """Bridge a short observation gap using side/distance/motion evidence.
+
+        This is intentionally per physical identity. It never compares two
+        objects in the same frame, so simultaneous crossings remain independent.
+        """
         if not self.config.gap_bridge_enabled:
             return False, ""
 
@@ -992,29 +1002,38 @@ class RobustCrossingEngine:
         if frame_gap <= 1 or frame_gap > self.config.gap_bridge_max_frames:
             return False, ""
 
-        previous_distance = float(previous["raw_signed_distance_px"])
-        current_distance = float(current["raw_signed_distance_px"])
+        prev_d = float(previous["raw_signed_distance_px"])
+        curr_d = float(current["raw_signed_distance_px"])
+        prev_side = int(previous.get("stable_side", previous.get("raw_side", 0)))
+        curr_side = int(current.get("stable_side", current.get("raw_side", 0)))
 
-        # The strongest sparse crossing evidence is a sign change.
+        distance_bridge = (
+            prev_side != 0
+            and curr_side != 0
+            and prev_side != curr_side
+            and min(abs(prev_d), abs(curr_d)) <= max(self.config.approach_distance_px, self.config.corridor_px * 2.0)
+        )
+
         sign_change = (
-            previous_distance != 0.0
-            and current_distance != 0.0
-            and np.sign(previous_distance) != np.sign(current_distance)
+            prev_d != 0.0
+            and curr_d != 0.0
+            and np.sign(prev_d) != np.sign(curr_d)
         )
 
         dx = float(current["raw_x"] - previous["raw_x"])
         dy = float(current["raw_y"] - previous["raw_y"])
         speed = math.hypot(dx, dy) / max(frame_gap, 1)
 
-        fast_motion = speed >= (
-            self.config.fast_speed_multiplier
-            * self.config.max_velocity_px_per_frame
+        normal_velocity = float(current.get("velocity_normal_px_per_frame", 0.0))
+        fast_motion = (
+            speed >= self.config.fast_speed_multiplier * self.config.max_velocity_px_per_frame
+            or abs(normal_velocity) >= self.config.min_normal_velocity_px_per_frame
         )
 
         if sign_change and fast_motion:
             return True, "gap_velocity_bridge"
-
-        # Even without high speed, a sparse sign transition is a valid bridge.
+        if distance_bridge:
+            return True, "gap_side_bridge"
         if sign_change:
             return True, "gap_side_transition"
 
@@ -1035,7 +1054,13 @@ class RobustCrossingEngine:
 
         max_gap_frames = max(
             1.0,
-            self.config.max_trajectory_gap_sec * self.fps,
+            min(
+                self.config.max_trajectory_gap_sec * self.fps,
+                max(
+                    self.config.gap_bridge_max_frames,
+                    self.config.max_trajectory_gap_sec * self.fps,
+                ),
+            ),
         )
 
         last_nonzero_index: int | None = None
@@ -1455,28 +1480,25 @@ class RobustCrossingEngine:
         phase1_status: str,
         phase1_reason: str,
         track_observations: int,
-    ) -> tuple[str, str, bool, bool]:
-        """Separate geometric truth from evidence completeness.
+    ) -> tuple[str, str, bool, bool, float]:
+        """Canonical candidate status.
 
-        A geometric crossing is never rejected solely because PRE/CORRIDOR/
-        POST evidence is incomplete. This is essential for short and fast
-        tracks. The returned count_eligibility is the pre-State-Machine gate.
+        Geometry creates the candidate. PRE/CORRIDOR/POST are evidence only.
+        A candidate is count-eligible when geometry + direction + class are
+        usable. Short/fast tracks do not fail solely because their evidence is
+        sparse.
         """
         if crossing is None:
-            return "NOT_CROSSING", "no_geometric_crossing_detected", False, False
+            return "NOT_CROSSING", "no_geometric_crossing_detected", False, False, 0.0
 
         reasons: list[str] = []
-
         if not evidence["pre_zone_evidence"]:
             reasons.append("insufficient_pre_zone_evidence")
         if not evidence["corridor_evidence"]:
             reasons.append("insufficient_corridor_evidence")
         if not evidence["post_zone_evidence"]:
             reasons.append("insufficient_post_zone_evidence")
-        if (
-            evidence["normal_direction"] == "UNKNOWN"
-            or evidence["direction_confidence"] < self.config.min_direction_confidence
-        ):
+        if evidence["normal_direction"] == "UNKNOWN" or evidence["direction_confidence"] < self.config.min_direction_confidence:
             reasons.append("low_crossing_direction_confidence")
         if crossing["fast_crossing"]:
             reasons.append("fast_or_sparse_crossing")
@@ -1486,9 +1508,29 @@ class RobustCrossingEngine:
             reasons.append("unknown_counting_class")
         elif class_evidence["counting_class_confidence"] < self.config.min_counting_class_confidence:
             reasons.append("low_counting_class_confidence")
+        if phase1_status == "REVIEW" and phase1_reason:
+            reasons.append(f"trajectory_review:{phase1_reason}")
 
-        # Geometric crossing + usable direction + usable class evidence is
-        # sufficient to remain count-eligible before Phase 3.
+        direction_score = float(evidence["direction_confidence"])
+        class_score = float(class_evidence["counting_class_confidence"])
+        continuity_score = float(group_quality := 0.0)  # replaced by caller via candidate_quality
+
+        geometry_score = 1.0
+        zone_score = float(np.clip(
+            0.45 * float(evidence["pre_zone_evidence"]) +
+            0.25 * float(evidence["corridor_evidence"]) +
+            0.30 * float(evidence["post_zone_evidence"]),
+            0.0, 1.0
+        ))
+        # Geometry + direction + class dominate. Zone evidence is intentionally secondary.
+        candidate_quality = float(np.clip(
+            0.40 * geometry_score +
+            0.25 * direction_score +
+            0.25 * class_score +
+            0.10 * zone_score,
+            0.0, 1.0,
+        ))
+
         count_eligible = bool(
             evidence["normal_direction"] != "UNKNOWN"
             and evidence["direction_confidence"] >= self.config.min_direction_confidence
@@ -1496,13 +1538,11 @@ class RobustCrossingEngine:
             and class_evidence["counting_class_confidence"] >= self.config.min_counting_class_confidence
         )
 
-        # A crossing with all required evidence can be PASS. Missing zone
-        # evidence remains REVIEW but does not destroy candidate eligibility.
-        if not reasons:
-            return "PASS", "", True, count_eligible
-
-        # Short/fast/sparse candidates stay REVIEW. They are not dropped.
-        return "REVIEW", ";".join(reasons), False, count_eligible
+        # PASS now means the canonical candidate is usable by the Counter.
+        # Zone evidence remains visible in review_reason but cannot suppress
+        # a real geometric crossing.
+        status = "PASS" if count_eligible else "REVIEW"
+        return status, ";".join(dict.fromkeys(reasons)), count_eligible, count_eligible, candidate_quality
 
     # ==================================================================
     # TRACK EVENT
@@ -1525,7 +1565,7 @@ class RobustCrossingEngine:
         evidence = self._zone_evidence(group, crossing_index)
         class_evidence = self._class_evidence(group, crossing_index)
 
-        phase2_status, phase2_reason, phase2_pass, count_eligibility = (
+        phase2_status, phase2_reason, phase2_pass, count_eligibility, candidate_quality = (
             self._phase2_status(
                 crossing,
                 evidence,
@@ -1622,6 +1662,9 @@ class RobustCrossingEngine:
             "phase1_status": phase1_status,
             "phase2_status": phase2_status,
             "count_eligibility": bool(count_eligibility),
+            "candidate_quality": round(float(candidate_quality), 4),
+            "geometry_crossing": bool(crossing is not None),
+            "gap_count": int((group["frame_delta"] > 1).sum()),
             "counted": bool(count_eligibility),
             "_phase1_pass": bool(phase1_pass),
             "_phase2_pass": bool(phase2_pass),
@@ -1818,8 +1861,8 @@ class RobustCrossingEngine:
         true_cross = int(candidate_counts.get("TRUE_CROSSING", 0))
         fast_cross = int(candidate_counts.get("FAST_CROSSING", 0))
 
-        p2_pass = int((audit_df["phase2_status"] == "PASS").sum())
-        p2_review = int((audit_df["phase2_status"] == "REVIEW").sum())
+        p2_pass = int(((audit_df["crossing_detected"].astype(bool)) & (audit_df["count_eligibility"].astype(bool))).sum())
+        p2_review = int(((audit_df["crossing_detected"].astype(bool)) & (~audit_df["count_eligibility"].astype(bool))).sum())
         p2_not_cross = int((audit_df["phase2_status"] == "NOT_CROSSING").sum())
 
         known_direction = int(
@@ -1928,6 +1971,20 @@ class RobustCrossingEngine:
             print("No class transitions detected.")
         else:
             print(transitioned.head(15).to_string(index=False))
+
+        print("\nCANONICAL CROSSING CANDIDATE SUMMARY:")
+        canonical = audit_df[audit_df["crossing_detected"].astype(bool)].copy()
+        if canonical.empty:
+            print("No canonical crossing candidates.")
+        else:
+            print(f"  Canonical candidates           : {len(canonical):,}")
+            print(f"  Count eligible                 : {int(canonical["count_eligibility"].astype(bool).sum()):,}")
+            print(f"  Not count eligible             : {int((~canonical["count_eligibility"].astype(bool)).sum()):,}")
+            if "candidate_quality" in canonical.columns:
+                print(f"  Mean candidate quality          : {pd.to_numeric(canonical["candidate_quality"], errors="coerce").mean():.3f}")
+            if "crossing_frame" in canonical.columns:
+                same_frame = canonical.groupby("crossing_frame").size()
+                print(f"  Max simultaneous crossings      : {int(same_frame.max()) if not same_frame.empty else 0}")
 
         print("\nCROSSING METHOD DISTRIBUTION:")
         crossing_rows = audit_df[

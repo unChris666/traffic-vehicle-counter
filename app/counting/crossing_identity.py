@@ -592,12 +592,17 @@ class CrossingIdentityEngine:
         ):
             return -1.0
 
+        # Class mismatch is SOFT evidence, not a hard rejection. A physical
+        # motorcycle can be detected as person in early/occluded frames.
+        # Temporal/spatial/velocity continuity still dominates, so two objects
+        # that overlap in time are never reconnected because gap_frames <= 0.
+        class_compatibility = 1.0
         if (
             identity.vehicle_class != "unknown"
             and fragment.class_name
             != identity.vehicle_class
         ):
-            return -1.0
+            class_compatibility = 0.45
 
         # Spatial continuity
         spatial_score = max(
@@ -694,13 +699,15 @@ class CrossingIdentityEngine:
             )
 
         score = (
-            0.50 * spatial_score
+            0.45 * spatial_score
             +
             0.20 * temporal_score
             +
             0.20 * velocity_score
             +
             0.10 * side_score
+            +
+            0.05 * class_compatibility
         )
 
         return float(score)

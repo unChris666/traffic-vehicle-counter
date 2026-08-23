@@ -129,8 +129,8 @@ class CountingConfig:
     # while Phase 1/2 development is being performed.
 
     pre_crossing_distance_px: float = 100.0
-    max_identity_reconnect_gap_sec: float = 1.0
-    max_identity_reconnect_distance_px: float = 100.0
+    max_identity_reconnect_gap_sec: float = 1.5
+    max_identity_reconnect_distance_px: float = 140.0
     identity_match_threshold: float = 0.82
     identity_match_margin: float = 0.08
     velocity_gate_px_per_frame: float = 30.0
@@ -175,7 +175,7 @@ class CountingConfig:
 
     # Require evidence that the object actually reaches the post-zone
     # before Phase 2 can be considered PASS.
-    require_post_zone: bool = True
+    require_post_zone: bool = False
 
     # ========================================================
     # FINAL DUPLICATE SUPPRESSION
@@ -191,6 +191,22 @@ class CountingConfig:
 
     duplicate_time_sec: float = 0.30
     duplicate_distance_px: float = 25.0
+
+    # Additional Phase 1/2 controls
+    corridor_exit_px: float = 60.0
+    approach_distance_px: float = 120.0
+    short_track_observation_threshold: int = 8
+    class_evidence_window_frames: int = 8
+    class_recency_decay: float = 0.18
+    min_counting_class_confidence: float = 0.45
+    zone_enter_confirm_observations: int = 2
+    zone_exit_confirm_observations: int = 2
+    gap_bridge_enabled: bool = True
+    gap_bridge_max_frames: int = 12
+    max_velocity_bridge_px_per_frame: float = 160.0
+    fast_speed_multiplier: float = 0.80
+    min_normal_velocity_px_per_frame: float = 1.0
+    min_normal_displacement_px: float = 8.0
 
 
 # ============================================================
