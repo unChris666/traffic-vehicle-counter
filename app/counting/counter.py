@@ -13,6 +13,10 @@ from app.counting.robust_crossing import (
     CrossingConfig,
     RobustCrossingEngine,
 )
+from app.counting.state_machine import (
+    CrossingStateMachine,
+    StateMachineConfig,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +31,9 @@ class CountingResult:
     # corridor behavior before moving to the state-machine phase.
     phase12_trajectory: pd.DataFrame
     phase12_audit: pd.DataFrame
+
+    phase3_candidates: pd.DataFrame
+    phase3_state_audit: pd.DataFrame
 
     crossing_candidates: pd.DataFrame
     crossing_events: pd.DataFrame
@@ -131,6 +138,24 @@ class TrafficCounter:
         candidate_duplicate_min_direction_cosine: float = 0.75,
         candidate_duplicate_require_non_overlapping_tracks: bool = True,
 
+        # Phase 3 state-machine controls
+        state_min_confirmed_observations: int = 2,
+        state_min_direction_confidence: float = 0.45,
+        state_count_threshold: float = 0.62,
+        state_review_threshold: float = 0.45,
+        state_weight_geometry: float = 0.32,
+        state_weight_direction: float = 0.16,
+        state_weight_continuity: float = 0.14,
+        state_weight_class: float = 0.12,
+        state_weight_pre: float = 0.08,
+        state_weight_corridor: float = 0.05,
+        state_weight_post: float = 0.07,
+        state_weight_fast_sparse: float = 0.06,
+        state_fast_crossing_floor: float = 0.55,
+        state_short_crossing_floor: float = 0.52,
+        state_person_count_threshold: float = 0.55,
+        state_person_review_threshold: float = 0.42,
+
     ) -> None:
 
         if fps <= 0:
@@ -177,6 +202,27 @@ class TrafficCounter:
         self.direction_window = max(
             1,
             int(direction_window),
+        )
+
+        self.state_machine = CrossingStateMachine(
+            StateMachineConfig(
+                min_confirmed_observations=max(1, int(state_min_confirmed_observations)),
+                min_direction_confidence=float(state_min_direction_confidence),
+                count_threshold=float(state_count_threshold),
+                review_threshold=float(state_review_threshold),
+                person_count_threshold=float(state_person_count_threshold),
+                person_review_threshold=float(state_person_review_threshold),
+                weight_geometry=float(state_weight_geometry),
+                weight_direction=float(state_weight_direction),
+                weight_continuity=float(state_weight_continuity),
+                weight_class=float(state_weight_class),
+                weight_pre=float(state_weight_pre),
+                weight_corridor=float(state_weight_corridor),
+                weight_post=float(state_weight_post),
+                weight_fast_sparse=float(state_weight_fast_sparse),
+                fast_crossing_floor=float(state_fast_crossing_floor),
+                short_crossing_floor=float(state_short_crossing_floor),
+            )
         )
 
         # ----------------------------------------------------------
@@ -644,6 +690,8 @@ class TrafficCounter:
                 trajectory=tracks_phase2.copy(),
                 phase12_trajectory=tracks_phase2.copy(),
                 phase12_audit=self._empty_track_audit(),
+                phase3_candidates=empty.copy(),
+                phase3_state_audit=pd.DataFrame(),
                 crossing_candidates=empty.copy(),
                 crossing_events=empty.copy(),
                 crossing_vehicle=empty.copy(),
@@ -700,13 +748,25 @@ class TrafficCounter:
             )
 
         # ----------------------------------------------------------
-        # 3. COUNTER CONSUMES CANDIDATES — NO RE-DETECTION
+        # 3. PHASE 3 STATE MACHINE
         # ----------------------------------------------------------
-        eligible = crossing_events[
-            crossing_events["count_eligibility"].astype(bool)
-            & ~crossing_events.get(
+        # The state machine is the ONLY place that converts a canonical
+        # crossing candidate into a count decision. It does not re-detect
+        # geometry.
+        # ----------------------------------------------------------
+        phase3_candidates, phase3_state_audit = self.state_machine.run(
+            crossing_events
+        )
+
+        # ----------------------------------------------------------
+        # 4. COUNTER CONSUMES STATE-MACHINE DECISIONS — NO RE-DETECTION
+        # ----------------------------------------------------------
+        eligible = phase3_candidates[
+            phase3_candidates["count_eligibility"].astype(bool)
+            & phase3_candidates["counted"].astype(bool)
+            & ~phase3_candidates.get(
                 "candidate_duplicate_suppressed",
-                pd.Series(False, index=crossing_events.index),
+                pd.Series(False, index=phase3_candidates.index),
             ).fillna(False).astype(bool)
         ].copy()
 
@@ -806,6 +866,18 @@ class TrafficCounter:
             "class_conflict_rejections": int(identity_audit.get("class_conflict_rejections", 0)),
             "direction_conflict_rejections": int(identity_audit.get("direction_conflict_rejections", 0)),
             "canonical_crossing_candidates": int(len(crossing_events)),
+            "phase3_counted_candidates": int(
+                phase3_candidates["counted"].astype(bool).sum()
+                if not phase3_candidates.empty else 0
+            ),
+            "phase3_review_candidates": int(
+                (phase3_candidates["phase3_state"] == "REVIEW").sum()
+                if not phase3_candidates.empty else 0
+            ),
+            "phase3_rejected_candidates": int(
+                (phase3_candidates["phase3_state"] == "REJECTED").sum()
+                if not phase3_candidates.empty else 0
+            ),
             "count_eligible_candidates": int(len(eligible)),
             "person_crossings": int(len(crossing_person)),
             "vehicle_crossings_before_filter": int(len(eligible)),
@@ -838,6 +910,8 @@ class TrafficCounter:
             trajectory=prepared,
             phase12_trajectory=prepared,
             phase12_audit=phase12_audit,
+            phase3_candidates=phase3_candidates,
+            phase3_state_audit=phase3_state_audit,
             crossing_candidates=crossing_candidates,
             crossing_events=crossing_events,
             crossing_vehicle=crossing_vehicle,
@@ -847,4 +921,3 @@ class TrafficCounter:
             audit=audit,
             track_audit=track_audit,
         )
-

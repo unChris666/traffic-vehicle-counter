@@ -632,6 +632,44 @@ class VideoRenderer:
             cv2.LINE_AA,
         )
 
+    @classmethod
+    def _draw_state_panel(
+        cls,
+        frame,
+        state_audit: pd.DataFrame,
+        frame_id: int,
+        width: int,
+        height: int,
+    ) -> None:
+        """Display compact Phase 3 state totals for visual audit."""
+        if state_audit is None or state_audit.empty or "phase3_state" not in state_audit.columns:
+            return
+
+        distribution = state_audit["phase3_state"].astype(str).value_counts().to_dict()
+        x1 = max(10, width - min(310, int(width * 0.26)))
+        y1 = max(10, int(height * 0.015))
+        x2 = width - 10
+        y2 = y1 + 130
+
+        cls._draw_transparent_panel(frame, x1, y1, x2, y2, alpha=0.72)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(frame, "PHASE 3 STATE", (x1 + 10, y1 + 22), font, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+
+        states = [
+            ("COUNTED", (0, 220, 0)),
+            ("CROSSED", (0, 200, 255)),
+            ("CROSSING", (0, 165, 255)),
+            ("REVIEW", (0, 165, 255)),
+            ("REJECTED", (80, 80, 255)),
+        ]
+        y = y1 + 47
+        for state, color in states:
+            value = int(distribution.get(state, 0))
+            cv2.putText(frame, f"{state}: {value}", (x1 + 10, y), font, 0.36, color, 1, cv2.LINE_AA)
+            y += 20
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (160, 160, 160), 1, cv2.LINE_AA)
+
     # ==========================================================
     # ENCODE H264
     # ==========================================================
@@ -701,6 +739,7 @@ class VideoRenderer:
         tracks_phase2: pd.DataFrame,
         final_crossings: pd.DataFrame,
         crossing_audit: pd.DataFrame | None = None,
+        phase3_state_audit: pd.DataFrame | None = None,
         progress_callback=None,
     ) -> Path:
 
@@ -775,10 +814,10 @@ class VideoRenderer:
         audit_lookup = {}
         if crossing_audit is not None and not crossing_audit.empty:
             id_column = (
-                "crossing_id"
-                if "crossing_id" in crossing_audit.columns
-                else "track_id"
+                "track_id"
                 if "track_id" in crossing_audit.columns
+                else "crossing_id"
+                if "crossing_id" in crossing_audit.columns
                 else None
             )
             if id_column is not None:
@@ -787,6 +826,34 @@ class VideoRenderer:
                         audit_lookup[int(audit_row[id_column])] = audit_row
                     except (TypeError, ValueError):
                         continue
+
+        state_by_crossing = {}
+        if phase3_state_audit is not None and not phase3_state_audit.empty and "crossing_id" in phase3_state_audit.columns:
+            for _, state_row in phase3_state_audit.iterrows():
+                try:
+                    state_by_crossing[int(state_row["crossing_id"])] = state_row
+                except (TypeError, ValueError):
+                    continue
+
+        track_to_state = {}
+        if crossing_audit is not None and not crossing_audit.empty and "crossing_id" in crossing_audit.columns:
+            for _, row in crossing_audit.iterrows():
+                try:
+                    cid = int(row["crossing_id"])
+                except (TypeError, ValueError):
+                    continue
+                raw_ids = row.get("track_ids", "")
+                if pd.isna(raw_ids):
+                    continue
+                text = str(raw_ids).strip().strip("[]")
+                if not text:
+                    continue
+                for token in text.replace("'", "").split(","):
+                    token = token.strip()
+                    try:
+                        track_to_state[int(token)] = cid
+                    except ValueError:
+                        pass
 
         # ======================================================
         # OPEN INPUT VIDEO
@@ -1042,50 +1109,47 @@ class VideoRenderer:
                             )
                         )
 
-                        # Optional crossing audit overlay.
+                        # Optional Phase 1/2 + Phase 3 audit overlay.
                         audit_text = ""
+                        state_text = ""
+
                         audit_row = audit_lookup.get(track_id)
                         if audit_row is not None:
                             status = str(
                                 audit_row.get(
                                     "crossing_candidate_class",
-                                    audit_row.get(
-                                        "phase2_status",
-                                        "",
-                                    ),
+                                    audit_row.get("phase2_status", ""),
                                 )
                             ).strip()
-
-                            direction_value = (
-                                audit_row.get(
-                                    "crossing_direction",
-                                    audit_row.get(
-                                        "direction",
-                                        "",
-                                    ),
-                                )
+                            direction_value = audit_row.get(
+                                "crossing_direction",
+                                audit_row.get("direction", ""),
                             )
-
                             if status:
                                 audit_text = f" | {status}"
-
-                            normalized = self._normalize_direction(
-                                direction_value
-                            )
+                            normalized = self._normalize_direction(direction_value)
                             if normalized is not None:
-                                direction_text = (
-                                    self.DIRECTION_DISPLAY_NAMES.get(
-                                        normalized,
-                                        normalized,
-                                    )
-                                )
+                                direction_text = self.DIRECTION_DISPLAY_NAMES.get(normalized, normalized)
                                 audit_text += f" | {direction_text}"
+
+                        candidate_id = track_to_state.get(track_id)
+                        if candidate_id is not None:
+                            state_row = state_by_crossing.get(candidate_id)
+                            if state_row is not None:
+                                state = str(state_row.get("phase3_state", "")).strip()
+                                score = state_row.get("decision_score", None)
+                                if state:
+                                    if score is None or pd.isna(score):
+                                        state_text = f" | {state}"
+                                    else:
+                                        state_text = f" | {state}:{float(score):.2f}"
 
                         label = (
                             f"ID {track_id} | "
                             f"{display_name} | "
                             f"{confidence:.0%}"
                             f"{audit_text}"
+                            f"{state_text}"
                         )
 
                         self._draw_label(
@@ -1095,6 +1159,19 @@ class VideoRenderer:
                             y1,
                             color,
                         )
+
+                # ==================================================
+                # PHASE 3 STATE PANEL
+                # ==================================================
+
+                if phase3_state_audit is not None and not phase3_state_audit.empty:
+                    self._draw_state_panel(
+                        frame,
+                        phase3_state_audit,
+                        frame_id,
+                        width,
+                        height,
+                    )
 
                 # ==================================================
                 # COUNT PANEL

@@ -230,10 +230,37 @@ class CountingConfig:
     candidate_duplicate_min_direction_cosine: float = 0.75
     candidate_duplicate_require_non_overlapping_tracks: bool = True
 
+    # ========================================================
+    # PHASE 3 — STATE MACHINE
+    # ========================================================
 
+    state_min_confirmed_observations: int = 2
+    state_min_direction_confidence: float = 0.45
+    state_count_threshold: float = 0.62
+    state_review_threshold: float = 0.45
 
-# ============================================================
-# APPLICATION CONFIG
+    # Evidence weights. These sum to 1.0.
+    state_weight_geometry: float = 0.32
+    state_weight_direction: float = 0.16
+    state_weight_continuity: float = 0.14
+    state_weight_class: float = 0.12
+    state_weight_pre: float = 0.08
+    state_weight_corridor: float = 0.05
+    state_weight_post: float = 0.07
+    state_weight_fast_sparse: float = 0.06
+
+    # Short / fast crossings are allowed to pass with less zone evidence
+    # when geometric crossing + direction + continuity are strong.
+    state_fast_crossing_floor: float = 0.55
+    state_short_crossing_floor: float = 0.52
+
+    # Pedestrians get a slightly lower evidence floor because their tracks
+    # are often shorter / more irregular than vehicles.
+    state_person_count_threshold: float = 0.55
+    state_person_review_threshold: float = 0.42
+
+    # ========================================================
+    # APPLICATION CONFIG
 # ============================================================
 
 @dataclass(frozen=True)
