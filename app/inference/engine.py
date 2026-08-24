@@ -197,6 +197,18 @@ class TrafficCountingEngine:
             "min_pre_crossing_observations": (
                 self._counting_value("min_pre_crossing_observations", 2)
             ),
+            "identity_same_side_near_line_block": (
+                self._counting_value("identity_same_side_near_line_block", True)
+            ),
+            "identity_prediction_gate_max_px": (
+                self._counting_value("identity_prediction_gate_max_px", 220.0)
+            ),
+            "identity_min_velocity_cosine": (
+                self._counting_value("identity_min_velocity_cosine", 0.35)
+            ),
+            "identity_min_normal_velocity_px_per_frame": (
+                self._counting_value("identity_min_normal_velocity_px_per_frame", 1.0)
+            ),
 
             # Robust crossing geometry.
             "crossing_corridor_px": (
@@ -268,8 +280,14 @@ class TrafficCountingEngine:
             "candidate_duplicate_require_non_overlapping_tracks": (
                 self._counting_value("candidate_duplicate_require_non_overlapping_tracks", True)
             ),
+            "multi_crossing_max_candidates_per_track": (
+                self._counting_value("multi_crossing_max_candidates_per_track", 32)
+            ),
+            "multi_crossing_min_separation_frames": (
+                self._counting_value("multi_crossing_min_separation_frames", 2)
+            ),
 
-            # Phase 3 — state machine.
+            # Phase 3 state machine.
             "state_min_confirmed_observations": (
                 self._counting_value("state_min_confirmed_observations", 2)
             ),
@@ -282,42 +300,18 @@ class TrafficCountingEngine:
             "state_review_threshold": (
                 self._counting_value("state_review_threshold", 0.45)
             ),
-            "state_weight_geometry": (
-                self._counting_value("state_weight_geometry", 0.32)
-            ),
-            "state_weight_direction": (
-                self._counting_value("state_weight_direction", 0.16)
-            ),
-            "state_weight_continuity": (
-                self._counting_value("state_weight_continuity", 0.14)
-            ),
-            "state_weight_class": (
-                self._counting_value("state_weight_class", 0.12)
-            ),
-            "state_weight_pre": (
-                self._counting_value("state_weight_pre", 0.08)
-            ),
-            "state_weight_corridor": (
-                self._counting_value("state_weight_corridor", 0.05)
-            ),
-            "state_weight_post": (
-                self._counting_value("state_weight_post", 0.07)
-            ),
-            "state_weight_fast_sparse": (
-                self._counting_value("state_weight_fast_sparse", 0.06)
-            ),
-            "state_fast_crossing_floor": (
-                self._counting_value("state_fast_crossing_floor", 0.55)
-            ),
-            "state_short_crossing_floor": (
-                self._counting_value("state_short_crossing_floor", 0.52)
-            ),
-            "state_person_count_threshold": (
-                self._counting_value("state_person_count_threshold", 0.55)
-            ),
-            "state_person_review_threshold": (
-                self._counting_value("state_person_review_threshold", 0.42)
-            ),
+            "state_weight_geometry": self._counting_value("state_weight_geometry", 0.32),
+            "state_weight_direction": self._counting_value("state_weight_direction", 0.16),
+            "state_weight_continuity": self._counting_value("state_weight_continuity", 0.14),
+            "state_weight_class": self._counting_value("state_weight_class", 0.12),
+            "state_weight_pre": self._counting_value("state_weight_pre", 0.08),
+            "state_weight_corridor": self._counting_value("state_weight_corridor", 0.05),
+            "state_weight_post": self._counting_value("state_weight_post", 0.07),
+            "state_weight_fast_sparse": self._counting_value("state_weight_fast_sparse", 0.06),
+            "state_fast_crossing_floor": self._counting_value("state_fast_crossing_floor", 0.55),
+            "state_short_crossing_floor": self._counting_value("state_short_crossing_floor", 0.52),
+            "state_person_count_threshold": self._counting_value("state_person_count_threshold", 0.55),
+            "state_person_review_threshold": self._counting_value("state_person_review_threshold", 0.42),
         }
 
         signature = inspect.signature(
@@ -373,6 +367,12 @@ class TrafficCountingEngine:
             "crossing_corridor_px",
             "min_direction_displacement_px",
             "direction_window",
+            "identity_same_side_near_line_block",
+            "identity_prediction_gate_max_px",
+            "identity_min_velocity_cosine",
+            "identity_min_normal_velocity_px_per_frame",
+            "multi_crossing_max_candidates_per_track",
+            "multi_crossing_min_separation_frames",
         }
 
         missing_robust = (
@@ -620,14 +620,6 @@ class TrafficCountingEngine:
             output_dir / "final_vehicle_crossings.csv",
             index=False,
         )
-        counting_result.phase3_candidates.to_csv(
-            output_dir / "phase3_candidates_state_machine.csv",
-            index=False,
-        )
-        counting_result.phase3_state_audit.to_csv(
-            output_dir / "phase3_state_audit.csv",
-            index=False,
-        )
         counting_result.crossing_candidates.to_csv(
             output_dir / "crossing_candidates_canonical.csv",
             index=False,
@@ -805,8 +797,6 @@ class TrafficCountingEngine:
                 total_frames=metadata.frame_count,
                 tracks_phase2=tracks_phase2,
                 final_crossings=counting_result.final_crossings,
-                crossing_audit=counting_result.phase12_audit,
-                phase3_state_audit=counting_result.phase3_state_audit,
                 progress_callback=(
                     lambda p, d: self._report(
                         progress_callback,
@@ -846,12 +836,6 @@ class TrafficCountingEngine:
             "vehicle_events_csv": str(output_dir / "vehicle_events.csv"),
             "final_crossings_csv": str(
                 output_dir / "final_vehicle_crossings.csv"
-            ),
-            "phase3_candidates_state_machine_csv": str(
-                output_dir / "phase3_candidates_state_machine.csv"
-            ),
-            "phase3_state_audit_csv": str(
-                output_dir / "phase3_state_audit.csv"
             ),
             "phase12_trajectory_csv": (
                 str(phase12_trajectory_path)
@@ -977,22 +961,6 @@ class TrafficCountingEngine:
             print(
                 f"\nPhase 1/2 audit: {phase12_audit_path}"
             )
-
-        phase3_candidates = getattr(counting_result, "phase3_candidates", pd.DataFrame())
-        phase3_state_audit = getattr(counting_result, "phase3_state_audit", pd.DataFrame())
-        if isinstance(phase3_candidates, pd.DataFrame):
-            print("\n" + "=" * 80)
-            print("PHASE 3 STATE MACHINE AUDIT")
-            print("=" * 80)
-            print(f"Canonical candidates : {len(phase3_candidates):,}")
-            if not phase3_state_audit.empty and "phase3_state" in phase3_state_audit.columns:
-                print("State distribution:")
-                print(phase3_state_audit["phase3_state"].value_counts().to_string())
-                print("\nTransition examples:")
-                cols = ["crossing_id", "phase3_state", "state_history", "decision_score", "count_eligibility", "review_reason", "reject_reason"]
-                cols = [c for c in cols if c in phase3_state_audit.columns]
-                print(phase3_state_audit[cols].head(20).to_string(index=False))
-            print(f"State audit: {output_dir / 'phase3_state_audit.csv'}")
             if isinstance(canonical, pd.DataFrame) and not canonical.empty:
                 duplicate_flags = canonical.get(
                     "candidate_duplicate_suppressed",

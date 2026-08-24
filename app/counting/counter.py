@@ -98,6 +98,10 @@ class TrafficCounter:
         identity_match_margin: float = 0.08,
         velocity_gate_px_per_frame: float = 30.0,
         min_pre_crossing_observations: int = 2,
+        identity_same_side_near_line_block: bool = True,
+        identity_prediction_gate_max_px: float = 220.0,
+        identity_min_velocity_cosine: float = 0.35,
+        identity_min_normal_velocity_px_per_frame: float = 1.0,
 
         # Robust geometry parameters
         crossing_corridor_px: float = 45.0,
@@ -137,6 +141,8 @@ class TrafficCounter:
         candidate_duplicate_max_crossing_distance_px: float = 55.0,
         candidate_duplicate_min_direction_cosine: float = 0.75,
         candidate_duplicate_require_non_overlapping_tracks: bool = True,
+        multi_crossing_max_candidates_per_track: int = 32,
+        multi_crossing_min_separation_frames: int = 2,
 
         # Phase 3 state-machine controls
         state_min_confirmed_observations: int = 2,
@@ -222,6 +228,7 @@ class TrafficCounter:
                 weight_fast_sparse=float(state_weight_fast_sparse),
                 fast_crossing_floor=float(state_fast_crossing_floor),
                 short_crossing_floor=float(state_short_crossing_floor),
+                vehicle_classes=tuple(sorted(self.vehicle_classes)),
             )
         )
 
@@ -261,6 +268,18 @@ class TrafficCounter:
                 ),
                 min_pre_crossing_observations=(
                     min_pre_crossing_observations
+                ),
+                identity_same_side_near_line_block=(
+                    identity_same_side_near_line_block
+                ),
+                identity_prediction_gate_max_px=(
+                    identity_prediction_gate_max_px
+                ),
+                identity_min_velocity_cosine=(
+                    identity_min_velocity_cosine
+                ),
+                identity_min_normal_velocity_px_per_frame=(
+                    identity_min_normal_velocity_px_per_frame
                 ),
                 max_crossing_gap_sec=(
                     max_trajectory_gap_sec
@@ -865,6 +884,11 @@ class TrafficCounter:
             "track_reconnections": int(identity_audit.get("track_reconnections", 0)),
             "class_conflict_rejections": int(identity_audit.get("class_conflict_rejections", 0)),
             "direction_conflict_rejections": int(identity_audit.get("direction_conflict_rejections", 0)),
+            "same_side_near_line_blocks": int(identity_audit.get("same_side_near_line_blocks", 0)),
+            "prediction_gate_used": int(identity_audit.get("prediction_gate_used", 0)),
+            "prediction_gate_rejections": int(identity_audit.get("prediction_gate_rejections", 0)),
+            "velocity_conflict_rejections": int(identity_audit.get("velocity_conflict_rejections", 0)),
+            "ambiguous_identity_matches": int(identity_audit.get("ambiguous_identity_matches", 0)),
             "canonical_crossing_candidates": int(len(crossing_events)),
             "phase3_counted_candidates": int(
                 phase3_candidates["counted"].astype(bool).sum()
@@ -880,6 +904,7 @@ class TrafficCounter:
             ),
             "count_eligible_candidates": int(len(eligible)),
             "person_crossings": int(len(crossing_person)),
+            "person_counted": int((crossing_person.get("counted", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not crossing_person.empty else 0),
             "vehicle_crossings_before_filter": int(len(eligible)),
             "final_vehicle_crossings": int(len(final_crossings)),
             "final_vehicle_count": int(total),

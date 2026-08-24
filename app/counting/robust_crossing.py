@@ -102,6 +102,12 @@ class CrossingConfig:
     candidate_duplicate_min_direction_cosine: float = 0.75
     candidate_duplicate_require_non_overlapping_tracks: bool = True
 
+    # Multi-crossing resolution. A raw track may produce several geometric
+    # crossings because of zone chatter; only the strongest physical crossing
+    # is canonical for that raw track, while all alternatives remain in audit.
+    multi_crossing_max_candidates_per_track: int = 32
+    multi_crossing_min_separation_frames: int = 2
+
 
     # Short tracks are diagnostic, not automatic rejection.
     short_track_observation_threshold: int = 8
@@ -247,6 +253,9 @@ class RobustCrossingEngine:
         "candidate_duplicate_confidence",
         "candidate_duplicate_reason",
         "candidate_duplicate_suppressed",
+        "crossing_candidate_count",
+        "multi_crossing_resolved",
+        "alternative_crossing_count",
         "gap_count",
         "counted",
     ]
@@ -1639,6 +1648,36 @@ class RobustCrossingEngine:
     # TRACK EVENT
     # ==================================================================
 
+    def _resolve_track_crossing(self, candidates: list[dict]) -> tuple[dict | None, list[dict]]:
+        """Resolve multiple geometric crossings within one raw track.
+
+        This is intentionally PER TRACK. It never compares candidates from
+        different raw tracks, so simultaneous vehicles are preserved.
+        """
+        if not candidates:
+            return None, []
+        candidates = list(candidates[: max(1, int(self.config.multi_crossing_max_candidates_per_track))])
+
+        def score(c: dict) -> float:
+            method = str(c.get("crossing_method", ""))
+            stable = 1.0 if "stable_side_transition" in method else 0.0
+            intersection = 1.0 if "raw_segment_intersection" in method else 0.0
+            deadband = 1.0 if "deadband_aware_transition" in method else 0.0
+            identity_gap = 1.0 if "identity_gap_side_transition" in method else 0.0
+            gap = int(c.get("frame_gap", 1))
+            return (
+                0.35 * stable
+                + 0.25 * intersection
+                + 0.15 * deadband
+                + 0.10 * identity_gap
+                + 0.15 * (1.0 / max(gap, 1))
+            )
+
+        ranked = sorted(candidates, key=lambda c: (score(c), -int(c.get("crossing_frame", 0))), reverse=True)
+        selected = ranked[0]
+        alternatives = [c for c in candidates if c is not selected]
+        return selected, alternatives
+
     def _build_event_for_track(
         self,
         group: pd.DataFrame,
@@ -1650,8 +1689,8 @@ class RobustCrossingEngine:
         class_ambiguous = bool(group.iloc[0].get("class_ambiguous", False))
 
         phase1_status, phase1_reason, phase1_pass = self._phase1_status(group)
-        candidates = self._detect_crossing_candidates(group)
-        crossing = candidates[0] if candidates else None
+        all_crossing_candidates = self._detect_crossing_candidates(group)
+        crossing, alternative_crossings = self._resolve_track_crossing(all_crossing_candidates)
         crossing_index = crossing["index"] if crossing else None
 
         evidence = self._zone_evidence(group, crossing_index)
@@ -1777,7 +1816,11 @@ class RobustCrossingEngine:
             "_mean_abs_normal": mean_abs_normal,
             "_mean_abs_tangent": mean_abs_tangent,
             "_trajectory_direction": trajectory_direction,
-            "_candidates": candidates,
+            "_candidates": all_crossing_candidates,
+            "crossing_candidate_count": int(len(all_crossing_candidates)),
+            "multi_crossing_resolved": bool(len(all_crossing_candidates) > 1),
+            "alternative_crossing_count": int(len(alternative_crossings)),
+            "alternative_crossings": alternative_crossings,
         }
 
     # ==================================================================
@@ -1811,6 +1854,9 @@ class RobustCrossingEngine:
             "class_transition": event["class_transition"],
             "class_evidence": event["class_evidence"],
             "track_observations": int(len(group)),
+            "crossing_candidate_count": int(event.get("crossing_candidate_count", 0)),
+            "multi_crossing_resolved": bool(event.get("multi_crossing_resolved", False)),
+            "alternative_crossing_count": int(event.get("alternative_crossing_count", 0)),
             "short_track": bool(event["short_track"]),
             "first_side": first_side,
             "last_side": last_side,
@@ -1913,6 +1959,10 @@ class RobustCrossingEngine:
         fa = int(a["crossing_frame"])
         fb = int(b["crossing_frame"])
         if fa == fb:
+            a_tracks = set(self._event_track_id_list(a))
+            b_tracks = set(self._event_track_id_list(b))
+            if a_tracks and b_tracks and a_tracks.intersection(b_tracks):
+                return True, 1.0, "same_frame_same_raw_track_duplicate"
             return False, 0.0, "same_frame_independent_candidate"
 
         if fa < fb:
@@ -2570,4 +2620,3 @@ class RobustCrossingEngine:
         if return_diagnostics:
             return events_df, audit_df, prepared
         return events_df, audit_df
-

@@ -136,6 +136,12 @@ class CountingConfig:
     velocity_gate_px_per_frame: float = 30.0
     min_pre_crossing_observations: int = 2
 
+    # Conservative identity reconstruction.
+    identity_same_side_near_line_block: bool = True
+    identity_prediction_gate_max_px: float = 220.0
+    identity_min_velocity_cosine: float = 0.35
+    identity_min_normal_velocity_px_per_frame: float = 1.0
+
     # ========================================================
     # ROBUST CROSSING GEOMETRY
     # ========================================================
@@ -230,6 +236,11 @@ class CountingConfig:
     candidate_duplicate_min_direction_cosine: float = 0.75
     candidate_duplicate_require_non_overlapping_tracks: bool = True
 
+    # Multi-crossing resolver. Candidates are preserved across raw tracks;
+    # these values only resolve repeated geometric crossings of ONE raw track.
+    multi_crossing_max_candidates_per_track: int = 32
+    multi_crossing_min_separation_frames: int = 2
+
     # ========================================================
     # PHASE 3 — STATE MACHINE
     # ========================================================
@@ -254,6 +265,16 @@ class CountingConfig:
     state_fast_crossing_floor: float = 0.55
     state_short_crossing_floor: float = 0.52
 
+    # Hard business rule: only these classes can reach COUNTED.
+    state_vehicle_classes: tuple[str, ...] = (
+        "motorcycle",
+        "car",
+        "truck",
+        "bus",
+    )
+
+    # Retained for backward compatibility; ignored by the vehicle-only
+    # state machine for person candidates.
     # Pedestrians get a slightly lower evidence floor because their tracks
     # are often shorter / more irregular than vehicles.
     state_person_count_threshold: float = 0.55
