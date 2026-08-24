@@ -787,7 +787,7 @@ class TrafficCountingEngine:
             )
             render_start = time.perf_counter()
 
-            from app.inference.renderer import VideoRenderer
+            from app.video.renderer import VideoRenderer
 
             renderer = VideoRenderer(
                 line_x1=line_x1,
