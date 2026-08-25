@@ -114,228 +114,98 @@ class TrafficCountingEngine:
         track_audit.to_csv(path, index=False)
         return path
 
+    def _counting_value(self, name: str, default):
+        """Safely read a CountingConfig value with backward-compatible fallback."""
+        counting = self.config.counting
+        return getattr(counting, name, default)
+
     def _build_counter(
         self,
         *,
         metadata: VideoMetadata,
     ) -> TrafficCounter:
+        """Build TrafficCounter from the single CountingConfig contract.
+
+        Every CountingConfig field is considered automatically; only fields
+        explicitly accepted by TrafficCounter are passed. This prevents the
+        recurring stale-parameter problem between config.py, engine.py and
+        counter.py.
         """
-        Build TrafficCounter using only parameters supported by the
-        runtime counter.py.
-
-        This protects the orchestration layer from stale/mismatched
-        counter implementations while still enforcing the required
-        baseline counting interface.
-        """
-
-        line_x1 = (
-            metadata.width
-            * self.config.counting.line_x1_ratio
-        )
-
-        line_y1 = (
-            metadata.height
-            * self.config.counting.line_y1_ratio
-        )
-
-        line_x2 = (
-            metadata.width
-            * self.config.counting.line_x2_ratio
-        )
-
-        line_y2 = (
-            metadata.height
-            * self.config.counting.line_y2_ratio
-        )
+        counting = self.config.counting
 
         candidate_kwargs = {
-            "line_x1": line_x1,
-            "line_y1": line_y1,
-            "line_x2": line_x2,
-            "line_y2": line_y2,
-            "line_deadband_px": (
-                self.config.counting.line_deadband_px
-            ),
-            "max_trajectory_gap_sec": (
-                self.config.counting.max_trajectory_gap_sec
-            ),
-            "moto_dedup_time_sec": (
-                self.config.counting.moto_dedup_time_sec
-            ),
-            "moto_dedup_distance_px": (
-                self.config.counting.moto_dedup_distance_px
-            ),
-            "vehicle_classes": set(
-                self.config.vehicle_classes
-            ),
-            "fps": metadata.fps,
-
-            # Crossing identity / fragmentation.
-            "pre_crossing_distance_px": (
-                self.config.counting.pre_crossing_distance_px
-            ),
-            "max_identity_reconnect_gap_sec": (
-                self.config.counting.max_identity_reconnect_gap_sec
-            ),
-            "max_identity_reconnect_distance_px": (
-                self.config.counting.max_identity_reconnect_distance_px
-            ),
-            "identity_match_threshold": (
-                self.config.counting.identity_match_threshold
-            ),
-            "identity_match_margin": (
-                self.config.counting.identity_match_margin
-            ),
-            "velocity_gate_px_per_frame": (
-                self.config.counting.velocity_gate_px_per_frame
-            ),
-            "min_pre_crossing_observations": (
-                self.config.counting.min_pre_crossing_observations
-            ),
-
-            # Concurrent duplicate-track resolver
-            "concurrent_duplicate_enabled": self.config.counting.concurrent_duplicate_enabled,
-            "concurrent_duplicate_min_overlap_frames": self.config.counting.concurrent_duplicate_min_overlap_frames,
-            "concurrent_duplicate_min_overlap_ratio": self.config.counting.concurrent_duplicate_min_overlap_ratio,
-            "concurrent_duplicate_min_mean_iou": self.config.counting.concurrent_duplicate_min_mean_iou,
-            "concurrent_duplicate_min_max_iou": self.config.counting.concurrent_duplicate_min_max_iou,
-            "concurrent_duplicate_max_center_distance_px": self.config.counting.concurrent_duplicate_max_center_distance_px,
-            "concurrent_duplicate_min_motion_cosine": self.config.counting.concurrent_duplicate_min_motion_cosine,
-            "concurrent_duplicate_max_motion_speed_ratio": self.config.counting.concurrent_duplicate_max_motion_speed_ratio,
-            "concurrent_duplicate_allow_class_mismatch": self.config.counting.concurrent_duplicate_allow_class_mismatch,
-
-            # Phase 3.1 class arbitration
-            "identity_class_min_confidence": self.config.counting.identity_class_min_confidence,
-            "identity_class_stable_track_ratio": self.config.counting.identity_class_stable_track_ratio,
-            "identity_class_ambiguous_penalty": self.config.counting.identity_class_ambiguous_penalty,
-            "identity_class_alias_bonus": self.config.counting.identity_class_alias_bonus,
-            "identity_class_pre_weight": self.config.counting.identity_class_pre_weight,
-            "identity_class_crossing_weight": self.config.counting.identity_class_crossing_weight,
-            "identity_class_post_weight": self.config.counting.identity_class_post_weight,
-            "identity_class_confidence_floor": self.config.counting.identity_class_confidence_floor,
-            "identity_class_margin_floor": self.config.counting.identity_class_margin_floor,
-            "identity_class_min_evidence_frames": self.config.counting.identity_class_min_evidence_frames,
-            "identity_class_ambiguous_confidence": self.config.counting.identity_class_ambiguous_confidence,
-
-            # Phase 3.1 state-machine gates
-            "state_identity_class_confidence_floor": self.config.counting.state_identity_class_confidence_floor,
-            "state_identity_class_margin_floor": self.config.counting.state_identity_class_margin_floor,
-            "state_identity_class_ambiguous_review": self.config.counting.state_identity_class_ambiguous_review,
-            "state_identity_class_allow_strong_rescue": self.config.counting.state_identity_class_allow_strong_rescue,
-            "state_fast_crossing_min_score": self.config.counting.state_fast_crossing_min_score,
-            "state_fast_crossing_min_direction_confidence": self.config.counting.state_fast_crossing_min_direction_confidence,
-            "state_fast_crossing_min_normal_displacement_px": self.config.counting.state_fast_crossing_min_normal_displacement_px,
-            "state_fast_crossing_min_continuity": self.config.counting.state_fast_crossing_min_continuity,
-
-            # Robust crossing geometry.
-            "crossing_corridor_px": (
-                self.config.counting.crossing_corridor_px
-            ),
-            "min_direction_displacement_px": (
-                self.config.counting.min_direction_displacement_px
-            ),
-            "direction_window": (
-                self.config.counting.direction_window
-            ),
-
-            # Conservative final duplicate suppression.
-            "duplicate_time_sec": (
-                self.config.counting.duplicate_time_sec
-            ),
-            "duplicate_distance_px": (
-                self.config.counting.duplicate_distance_px
-            ),
+            key: getattr(counting, key)
+            for key in counting.__dataclass_fields__
         }
 
-        signature = inspect.signature(
-            TrafficCounter.__init__
-        )
+        candidate_kwargs.update({
+            "line_x1": metadata.width * counting.line_x1_ratio,
+            "line_y1": metadata.height * counting.line_y1_ratio,
+            "line_x2": metadata.width * counting.line_x2_ratio,
+            "line_y2": metadata.height * counting.line_y2_ratio,
+            "vehicle_classes": set(self.config.vehicle_classes),
+            "fps": metadata.fps,
+        })
 
-        supported_parameters = {
-            name
-            for name in signature.parameters
+        # Ratio fields belong to engine geometry, not TrafficCounter.
+        for key in (
+            "line_x1_ratio", "line_y1_ratio",
+            "line_x2_ratio", "line_y2_ratio",
+        ):
+            candidate_kwargs.pop(key, None)
+
+        signature = inspect.signature(TrafficCounter.__init__)
+        supported = {
+            name for name in signature.parameters
             if name != "self"
         }
-
         kwargs = {
             key: value
             for key, value in candidate_kwargs.items()
-            if key in supported_parameters
+            if key in supported
         }
 
-        required_parameters = {
-            "line_x1",
-            "line_y1",
-            "line_x2",
-            "line_y2",
-            "line_deadband_px",
-            "max_trajectory_gap_sec",
-            "moto_dedup_time_sec",
-            "moto_dedup_distance_px",
-            "vehicle_classes",
-            "fps",
+        required = {
+            "line_x1", "line_y1", "line_x2", "line_y2",
+            "line_deadband_px", "max_trajectory_gap_sec",
+            "moto_dedup_time_sec", "moto_dedup_distance_px",
+            "vehicle_classes", "fps",
         }
-
-        missing_required = (
-            required_parameters
-            - set(kwargs)
-        )
-
-        if missing_required:
+        missing = required - set(kwargs)
+        if missing:
             raise RuntimeError(
-                "Runtime TrafficCounter interface is incompatible.\n\n"
-                f"Missing required parameters: "
-                f"{sorted(missing_required)}\n\n"
-                f"Actual signature:\n{signature}"
+                "TrafficCounter contract mismatch. Missing required "
+                f"parameters: {sorted(missing)}\nSignature: {signature}"
             )
 
-        optional_robust = {
-            "pre_crossing_distance_px",
-            "max_identity_reconnect_gap_sec",
-            "max_identity_reconnect_distance_px",
-            "identity_match_threshold",
-            "identity_match_margin",
-            "velocity_gate_px_per_frame",
-            "min_pre_crossing_observations",
-            "crossing_corridor_px",
-            "min_direction_displacement_px",
-            "direction_window",
+        # Fail early instead of allowing a partially wired Phase 3.1.
+        phase31 = {
+            "identity_same_side_near_line_block",
+            "identity_prediction_gate_max_px",
+            "identity_min_velocity_cosine",
+            "identity_min_normal_velocity_px_per_frame",
             "concurrent_duplicate_enabled",
-            "identity_class_confidence_floor",
-            "identity_class_margin_floor",
-            "state_fast_crossing_min_score",
+            "identity_class_min_confidence",
+            "identity_gap_crossing_enabled",
+            "candidate_duplicate_max_frame_gap",
+            "multi_crossing_max_candidates_per_track",
         }
-
-        missing_robust = (
-            optional_robust
-            - set(kwargs)
-        )
-
-        print()
-        print("=" * 80)
-        print("TRAFFIC COUNTER RUNTIME INTERFACE")
-        print("=" * 80)
-        print(
-            f"Module: {TrafficCounter.__module__}"
-        )
-        print(
-            f"Signature: {signature}"
-        )
-
-        if missing_robust:
-            print(
-                "WARNING: runtime TrafficCounter is missing "
-                "robust parameters:"
+        missing_phase31 = phase31 - set(kwargs)
+        if missing_phase31:
+            raise RuntimeError(
+                "Phase 3.1 TrafficCounter contract mismatch. Missing: "
+                f"{sorted(missing_phase31)}\nSignature: {signature}"
             )
-            for name in sorted(missing_robust):
-                print(f"  - {name}")
 
         print("=" * 80)
-        print()
+        print("TRAFFIC COUNTER RUNTIME INTERFACE — PHASE 3.1")
+        print("=" * 80)
+        print(f"Module: {TrafficCounter.__module__}")
+        print(f"Signature: {signature}")
+        print("Phase 3.1 contract: PASS")
+        print("=" * 80)
 
-        return TrafficCounter(
-            **kwargs
-        )
+        return TrafficCounter(**kwargs)
 
     @staticmethod
     def _normalize_confidence_inputs(
@@ -508,13 +378,13 @@ class TrafficCountingEngine:
         self._report(
             progress_callback,
             0.83,
-            "Running robust vehicle crossing engine...",
+            "Building canonical crossing candidates...",
         )
 
-        line_x1 = metadata.width * self.config.counting.line_x1_ratio
-        line_y1 = metadata.height * self.config.counting.line_y1_ratio
-        line_x2 = metadata.width * self.config.counting.line_x2_ratio
-        line_y2 = metadata.height * self.config.counting.line_y2_ratio
+        line_x1 = metadata.width * self._counting_value("line_x1_ratio", 0.95)
+        line_y1 = metadata.height * self._counting_value("line_y1_ratio", 0.20)
+        line_x2 = metadata.width * self._counting_value("line_x2_ratio", 0.05)
+        line_y2 = metadata.height * self._counting_value("line_y2_ratio", 0.95)
 
         # These are the parameters supported by the current
         # robust TrafficCounter implementation.
@@ -551,6 +421,71 @@ class TrafficCountingEngine:
             output_dir / "final_vehicle_crossings.csv",
             index=False,
         )
+        counting_result.phase3_candidates.to_csv(
+            output_dir / "phase3_candidates_state_machine.csv",
+            index=False,
+        )
+        counting_result.phase3_state_audit.to_csv(
+            output_dir / "phase3_state_audit.csv",
+            index=False,
+        )
+        counting_result.crossing_candidates.to_csv(
+            output_dir / "crossing_candidates_canonical.csv",
+            index=False,
+        )
+
+        # Dedicated identity-duplicate audit. The canonical candidate CSV
+        # remains the source of truth; this file is a convenient filtered view
+        # for debugging duplicate physical identities.
+        canonical = counting_result.crossing_candidates
+        duplicate_path = output_dir / "trajectory_duplicate_identity_audit.csv"
+        if (
+            isinstance(canonical, pd.DataFrame)
+            and not canonical.empty
+            and "candidate_duplicate_of" in canonical.columns
+        ):
+            canonical[
+                canonical["candidate_duplicate_of"].notna()
+                | canonical.get(
+                    "candidate_duplicate_suppressed",
+                    pd.Series(False, index=canonical.index),
+                ).fillna(False).astype(bool)
+            ].to_csv(duplicate_path, index=False)
+        else:
+            pd.DataFrame().to_csv(duplicate_path, index=False)
+
+        # =====================================================
+        # PHASE 1/2 DIAGNOSTIC ARTIFACTS
+        # =====================================================
+        phase12_trajectory_path = output_dir / "phase12_trajectory.csv"
+        phase12_audit_path = output_dir / "phase12_crossing_corridor_audit.csv"
+
+        phase12_trajectory = getattr(
+            counting_result,
+            "phase12_trajectory",
+            None,
+        )
+        phase12_audit = getattr(
+            counting_result,
+            "phase12_audit",
+            None,
+        )
+
+        if isinstance(phase12_trajectory, pd.DataFrame):
+            phase12_trajectory.to_csv(
+                phase12_trajectory_path,
+                index=False,
+            )
+        else:
+            phase12_trajectory_path = None
+
+        if isinstance(phase12_audit, pd.DataFrame):
+            phase12_audit.to_csv(
+                phase12_audit_path,
+                index=False,
+            )
+        else:
+            phase12_audit_path = None
 
         direction_counts_df = self._safe_direction_counts(
             counting_result.final_crossings
@@ -671,6 +606,8 @@ class TrafficCountingEngine:
                 total_frames=metadata.frame_count,
                 tracks_phase2=tracks_phase2,
                 final_crossings=counting_result.final_crossings,
+                crossing_audit=counting_result.phase12_audit,
+                phase3_state_audit=counting_result.phase3_state_audit,
                 progress_callback=(
                     lambda p, d: self._report(
                         progress_callback,
@@ -711,6 +648,22 @@ class TrafficCountingEngine:
             "final_crossings_csv": str(
                 output_dir / "final_vehicle_crossings.csv"
             ),
+            "phase3_candidates_state_machine_csv": str(
+                output_dir / "phase3_candidates_state_machine.csv"
+            ),
+            "phase3_state_audit_csv": str(
+                output_dir / "phase3_state_audit.csv"
+            ),
+            "phase12_trajectory_csv": (
+                str(phase12_trajectory_path)
+                if phase12_trajectory_path is not None
+                else None
+            ),
+            "phase12_crossing_corridor_audit_csv": (
+                str(phase12_audit_path)
+                if phase12_audit_path is not None
+                else None
+            ),
             "track_crossing_audit_csv": (
                 str(track_audit_path)
                 if track_audit_path is not None
@@ -737,10 +690,10 @@ class TrafficCountingEngine:
             "configured_vid_stride": self.config.detection.vid_stride,
             "configured_conf_threshold": self.config.detection.conf_threshold,
             "configured_iou_threshold": self.config.detection.iou_threshold,
-            "crossing_corridor_px": self.config.counting.crossing_corridor_px,
-            "line_deadband_px": self.config.counting.line_deadband_px,
-            "duplicate_time_sec": self.config.counting.duplicate_time_sec,
-            "duplicate_distance_px": self.config.counting.duplicate_distance_px,
+            "crossing_corridor_px": self._counting_value("crossing_corridor_px", 45.0),
+            "line_deadband_px": self._counting_value("line_deadband_px", 8.0),
+            "duplicate_time_sec": self._counting_value("duplicate_time_sec", 0.30),
+            "duplicate_distance_px": self._counting_value("duplicate_distance_px", 25.0),
         }
 
         direction_counts = [
@@ -787,8 +740,73 @@ class TrafficCountingEngine:
         # =====================================================
         # CONSOLE REPORT
         # =====================================================
+        if isinstance(phase12_trajectory, pd.DataFrame) and isinstance(phase12_audit, pd.DataFrame):
+            print("\n" + "=" * 70)
+            print("PHASE 1/2 TRAJECTORY + CROSSING CORRIDOR AUDIT")
+            print("=" * 70)
+            print(
+                f"Tracks analyzed      : {len(phase12_audit):,}"
+            )
+            print(
+                f"Phase 1 PASS         : {int((phase12_audit['phase1_status'] == 'PASS').sum()):,}"
+            )
+            print(
+                f"Phase 1 REVIEW       : {int((phase12_audit['phase1_status'] == 'REVIEW').sum()):,}"
+            )
+            print(
+                f"Phase 1 FAIL         : {int((phase12_audit['phase1_status'] == 'FAIL').sum()):,}"
+            )
+            print(
+                f"Phase 2 PASS         : {int((phase12_audit['phase2_status'] == 'PASS').sum()):,}"
+            )
+            print(
+                f"Phase 2 REVIEW       : {int((phase12_audit['phase2_status'] == 'REVIEW').sum()):,}"
+            )
+            print(
+                f"Phase 2 FAIL         : {int((phase12_audit['phase2_status'] == 'FAIL').sum()):,}"
+            )
+            print(
+                f"P1 + P2 PASS         : {int(phase12_audit['counted'].sum()):,}"
+            )
+            print("\nZone path examples:")
+            print(
+                phase12_audit["zone_path"]
+                .value_counts()
+                .head(10)
+                .to_string()
+            )
+            print(
+                f"\nPhase 1/2 audit: {phase12_audit_path}"
+            )
+
+        phase3_candidates = getattr(counting_result, "phase3_candidates", pd.DataFrame())
+        phase3_state_audit = getattr(counting_result, "phase3_state_audit", pd.DataFrame())
+        if isinstance(phase3_candidates, pd.DataFrame):
+            print("\n" + "=" * 80)
+            print("PHASE 3 STATE MACHINE AUDIT")
+            print("=" * 80)
+            print(f"Canonical candidates : {len(phase3_candidates):,}")
+            if not phase3_state_audit.empty and "phase3_state" in phase3_state_audit.columns:
+                print("State distribution:")
+                print(phase3_state_audit["phase3_state"].value_counts().to_string())
+                print("\nTransition examples:")
+                cols = ["crossing_id", "phase3_state", "state_history", "decision_score", "count_eligibility", "review_reason", "reject_reason"]
+                cols = [c for c in cols if c in phase3_state_audit.columns]
+                print(phase3_state_audit[cols].head(20).to_string(index=False))
+            print(f"State audit: {output_dir / 'phase3_state_audit.csv'}")
+            if isinstance(canonical, pd.DataFrame) and not canonical.empty:
+                duplicate_flags = canonical.get(
+                    "candidate_duplicate_suppressed",
+                    pd.Series(False, index=canonical.index),
+                ).fillna(False).astype(bool)
+                print(
+                    "Canonical duplicate identities : "
+                    f"{int(duplicate_flags.sum()):,}"
+                )
+            print(f"Trajectory duplicate audit: {duplicate_path}")
+
         print("\n" + "=" * 70)
-        print("FINAL VEHICLE COUNT")
+        print("FINAL VEHICLE COUNT (CANONICAL CANDIDATES)")
         print("=" * 70)
 
         for class_name, count in counting_result.counts.items():

@@ -48,33 +48,19 @@ class StateMachineConfig:
 
     min_vehicle_class_confidence: float = 0.45
 
-    # Backward-compatible person gates. These are kept because counter.py
-    # passes them from the existing CountingConfig. Person tracks are never
-    # eligible for vehicle COUNTED decisions, but the thresholds remain part
-    # of the public StateMachineConfig contract.
+    # Backward-compatible Phase 3 parameters.
     person_count_threshold: float = 0.55
     person_review_threshold: float = 0.42
 
-    # Backward-compatible evidence controls used by earlier Phase 3 wiring.
-    weight_fast_sparse: float = 0.06
-    fast_crossing_floor: float = 0.55
-    short_crossing_floor: float = 0.52
+    fast_crossing_floor: float = 0.58
+    short_crossing_floor: float = 0.58
 
-    # Keep the vehicle class set in the state-machine config for compatibility
-    # with the counter wiring.
-    vehicle_classes: tuple[str, ...] = tuple(sorted(VEHICLE_CLASSES))
-
-    # Phase 3.1 class arbitration gates.
+    # Phase 3.1 identity arbitration.
     identity_class_confidence_floor: float = 0.65
     identity_class_margin_floor: float = 0.15
     identity_class_ambiguous_review: bool = True
-    identity_class_allow_strong_rescue: bool = True
 
-    # Fast crossing gates.
     fast_crossing_min_score: float = 0.58
-    fast_crossing_min_direction_confidence: float = 0.50
-    fast_crossing_min_normal_displacement_px: float = 8.0
-    fast_crossing_min_continuity: float = 0.50
 
     short_crossing_min_score: float = 0.58
 
@@ -93,6 +79,14 @@ class StateMachineConfig:
     weight_post: float = 0.04
 
     weight_fast_evidence: float = 0.05
+    weight_fast_sparse: float = 0.05
+
+    vehicle_classes: tuple[str, ...] = (
+        "motorcycle",
+        "car",
+        "truck",
+        "bus",
+    )
 
 
 class CrossingStateMachine:
@@ -107,13 +101,6 @@ class CrossingStateMachine:
         "counted",
         "review_reason",
         "reject_reason",
-        # Phase 3.1 audit
-        "identity_class_confidence",
-        "identity_class_margin",
-        "identity_class_ambiguous",
-        "fast_crossing",
-        "fast_crossing_confidence",
-        "fast_crossing_reason",
     ]
 
     def __init__(
@@ -206,10 +193,10 @@ class CrossingStateMachine:
 
         cls = str(
             row.get(
-                "counting_class",
+                "identity_class",
                 row.get(
-                    "track_class",
-                    "unknown",
+                    "counting_class",
+                    row.get("track_class", "unknown"),
                 ),
             )
         ).lower().strip()
@@ -386,23 +373,15 @@ class CrossingStateMachine:
         row: pd.Series,
     ) -> float:
 
-        identity_conf = self._float(
-            row,
-            "identity_class_confidence",
-            -1.0,
-        )
-        if identity_conf >= 0.0:
-            return float(np.clip(identity_conf, 0.0, 1.0))
-
         return float(
             np.clip(
                 self._float(
                     row,
-                    "counting_class_confidence",
+                    "identity_class_confidence",
                     self._float(
                         row,
-                        "track_class_ratio",
-                        0.0,
+                        "counting_class_confidence",
+                        self._float(row, "track_class_ratio", 0.0),
                     ),
                 ),
                 0.0,
@@ -794,20 +773,21 @@ class CrossingStateMachine:
         )
 
         identity_class_conf = self._float(
-            row,
-            "identity_class_confidence",
-            class_score,
+            row, "identity_class_confidence", class_score
         )
         identity_class_margin = self._float(
-            row,
-            "identity_class_margin",
-            1.0,
+            row, "identity_class_margin", 1.0
         )
         identity_class_ambiguous = self._bool(
-            row,
-            "identity_class_ambiguous",
-            False,
+            row, "identity_class_ambiguous", False
         )
+
+        if identity_class_conf < self.config.identity_class_confidence_floor:
+            review_reasons.append("low_identity_class_confidence")
+        if identity_class_margin < self.config.identity_class_margin_floor:
+            review_reasons.append("low_identity_class_margin")
+        if identity_class_ambiguous and self.config.identity_class_ambiguous_review:
+            review_reasons.append("ambiguous_identity_class")
 
         fast = self._bool(
             row,
@@ -861,15 +841,6 @@ class CrossingStateMachine:
                 "low_vehicle_class_confidence"
             )
 
-        if identity_class_ambiguous and self.config.identity_class_ambiguous_review:
-            review_reasons.append("ambiguous_identity_class")
-
-        if identity_class_conf < self.config.identity_class_confidence_floor:
-            review_reasons.append("identity_class_confidence_below_floor")
-
-        if identity_class_margin < self.config.identity_class_margin_floor:
-            review_reasons.append("identity_class_margin_below_floor")
-
         # --------------------------------------------------------
         # Fast crossing:
         #
@@ -897,36 +868,16 @@ class CrossingStateMachine:
                 abs(
                     self._float(
                         row,
-                        "fast_normal_displacement_px",
-                        self._float(row, "normal_displacement_px", 0.0),
+                        "normal_displacement_px",
+                        0.0,
                     )
                 )
                 <
-                self.config.fast_crossing_min_normal_displacement_px
+                8.0
             ):
 
                 review_reasons.append(
                     "insufficient_normal_displacement"
-                )
-
-            if (
-                self._float(row, "fast_direction_confidence", direction_confidence)
-                <
-                self.config.fast_crossing_min_direction_confidence
-            ):
-
-                review_reasons.append(
-                    "fast_crossing_low_direction_confidence"
-                )
-
-            if (
-                self._float(row, "trajectory_continuity", self._continuity_score(row))
-                <
-                self.config.fast_crossing_min_continuity
-            ):
-
-                review_reasons.append(
-                    "fast_crossing_low_continuity"
                 )
 
         # --------------------------------------------------------
@@ -947,13 +898,6 @@ class CrossingStateMachine:
                 class_score
                 >=
                 self.config.min_vehicle_class_confidence
-                and
-                (
-                    not identity_class_ambiguous
-                    or self.config.identity_class_allow_strong_rescue
-                    and identity_class_conf >= self.config.identity_class_confidence_floor
-                    and identity_class_margin >= self.config.identity_class_margin_floor
-                )
                 and
                 score
                 >=
@@ -1085,10 +1029,7 @@ class CrossingStateMachine:
         counted,
         review_reason,
         reject_reason,
-        row: pd.Series | None = None,
     ):
-
-        row = row if row is not None else pd.Series(dtype=object)
 
         return {
             "crossing_id": int(
@@ -1125,30 +1066,6 @@ class CrossingStateMachine:
 
             "reject_reason": (
                 reject_reason
-            ),
-            "identity_class_confidence": float(
-                row.get("identity_class_confidence", row.get("counting_class_confidence", 0.0))
-                if row is not None else 0.0
-            ),
-            "identity_class_margin": float(
-                row.get("identity_class_margin", 0.0)
-                if row is not None else 0.0
-            ),
-            "identity_class_ambiguous": bool(
-                row.get("identity_class_ambiguous", False)
-                if row is not None else False
-            ),
-            "fast_crossing": bool(
-                row.get("fast_crossing", False)
-                if row is not None else False
-            ),
-            "fast_crossing_confidence": float(
-                row.get("fast_crossing_confidence", 0.0)
-                if row is not None else 0.0
-            ),
-            "fast_crossing_reason": str(
-                row.get("fast_crossing_reason", "")
-                if row is not None else ""
             ),
         }
 
@@ -1188,21 +1105,6 @@ class CrossingStateMachine:
             results
         )
 
-        # Phase 3.1 audit columns are copied from the canonical candidate.
-        # This keeps the decision table self-contained even when _result()
-        # is called by legacy branches.
-        audit_cols = [
-            "identity_class_confidence",
-            "identity_class_margin",
-            "identity_class_ambiguous",
-            "fast_crossing",
-            "fast_crossing_confidence",
-            "fast_crossing_reason",
-        ]
-        for col in audit_cols:
-            if col in candidates.columns:
-                state_df[col] = candidates[col].values
-
         enriched = candidates.merge(
             state_df,
             on="crossing_id",
@@ -1235,9 +1137,10 @@ class CrossingStateMachine:
 
         # Final safety gate.
         person_mask = (
-            enriched[
-                "counting_class"
-            ]
+            enriched.get(
+                "identity_class",
+                enriched.get("counting_class", pd.Series("unknown", index=enriched.index))
+            )
             .astype(str)
             .str.lower()
             ==

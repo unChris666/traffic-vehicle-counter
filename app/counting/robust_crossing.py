@@ -102,6 +102,12 @@ class CrossingConfig:
     candidate_duplicate_min_direction_cosine: float = 0.75
     candidate_duplicate_require_non_overlapping_tracks: bool = True
 
+    # Multi-crossing resolution. A raw track may produce several geometric
+    # crossings because of zone chatter; only the strongest physical crossing
+    # is canonical for that raw track, while all alternatives remain in audit.
+    multi_crossing_max_candidates_per_track: int = 32
+    multi_crossing_min_separation_frames: int = 2
+
 
     # Short tracks are diagnostic, not automatic rejection.
     short_track_observation_threshold: int = 8
@@ -243,14 +249,13 @@ class RobustCrossingEngine:
         "identity_gap_side_transition",
         "identity_gap_frames",
         "identity_gap_identity_confirmed",
-        "identity_class", "identity_class_confidence", "identity_class_margin",
-        "identity_class_ambiguous", "identity_class_source", "identity_class_evidence",
-        "fast_crossing_confidence", "fast_crossing_reason", "fast_normal_displacement_px",
-        "fast_speed_ratio", "fast_direction_confidence", "fast_sparse",
         "candidate_duplicate_of",
         "candidate_duplicate_confidence",
         "candidate_duplicate_reason",
         "candidate_duplicate_suppressed",
+        "crossing_candidate_count",
+        "multi_crossing_resolved",
+        "alternative_crossing_count",
         "gap_count",
         "counted",
     ]
@@ -1643,6 +1648,36 @@ class RobustCrossingEngine:
     # TRACK EVENT
     # ==================================================================
 
+    def _resolve_track_crossing(self, candidates: list[dict]) -> tuple[dict | None, list[dict]]:
+        """Resolve multiple geometric crossings within one raw track.
+
+        This is intentionally PER TRACK. It never compares candidates from
+        different raw tracks, so simultaneous vehicles are preserved.
+        """
+        if not candidates:
+            return None, []
+        candidates = list(candidates[: max(1, int(self.config.multi_crossing_max_candidates_per_track))])
+
+        def score(c: dict) -> float:
+            method = str(c.get("crossing_method", ""))
+            stable = 1.0 if "stable_side_transition" in method else 0.0
+            intersection = 1.0 if "raw_segment_intersection" in method else 0.0
+            deadband = 1.0 if "deadband_aware_transition" in method else 0.0
+            identity_gap = 1.0 if "identity_gap_side_transition" in method else 0.0
+            gap = int(c.get("frame_gap", 1))
+            return (
+                0.35 * stable
+                + 0.25 * intersection
+                + 0.15 * deadband
+                + 0.10 * identity_gap
+                + 0.15 * (1.0 / max(gap, 1))
+            )
+
+        ranked = sorted(candidates, key=lambda c: (score(c), -int(c.get("crossing_frame", 0))), reverse=True)
+        selected = ranked[0]
+        alternatives = [c for c in candidates if c is not selected]
+        return selected, alternatives
+
     def _build_event_for_track(
         self,
         group: pd.DataFrame,
@@ -1654,48 +1689,12 @@ class RobustCrossingEngine:
         class_ambiguous = bool(group.iloc[0].get("class_ambiguous", False))
 
         phase1_status, phase1_reason, phase1_pass = self._phase1_status(group)
-        candidates = self._detect_crossing_candidates(group)
-        crossing = candidates[0] if candidates else None
+        all_crossing_candidates = self._detect_crossing_candidates(group)
+        crossing, alternative_crossings = self._resolve_track_crossing(all_crossing_candidates)
         crossing_index = crossing["index"] if crossing else None
 
         evidence = self._zone_evidence(group, crossing_index)
         class_evidence = self._class_evidence(group, crossing_index)
-
-        # Phase 3.1: physical-identity class arbitration is authoritative
-        # when available. Raw detector evidence remains preserved separately.
-        identity_class = str(
-            group.get("identity_class", pd.Series(["unknown"])).iloc[0]
-        ).lower().strip()
-        identity_class_conf = float(
-            pd.to_numeric(
-                group.get("identity_class_confidence", pd.Series([0.0])),
-                errors="coerce",
-            ).iloc[0]
-        )
-        identity_class_margin = float(
-            pd.to_numeric(
-                group.get("identity_class_margin", pd.Series([0.0])),
-                errors="coerce",
-            ).iloc[0]
-        )
-        identity_class_ambiguous = bool(
-            group.get("identity_class_ambiguous", pd.Series([False])).iloc[0]
-        )
-        identity_class_source = str(
-            group.get("identity_class_source", pd.Series([""])).iloc[0]
-        )
-        identity_class_evidence = str(
-            group.get("identity_class_evidence", pd.Series([""])).iloc[0]
-        )
-
-        if identity_class not in {"", "unknown", "nan", "none"}:
-            class_evidence = dict(class_evidence)
-            class_evidence["counting_class"] = identity_class
-            class_evidence["counting_class_confidence"] = identity_class_conf
-            class_evidence["class_evidence"] = (
-                identity_class_evidence
-                or class_evidence.get("class_evidence", "")
-            )
 
         phase2_status, phase2_reason, phase2_pass, count_eligibility, candidate_quality = (
             self._phase2_status(
@@ -1716,48 +1715,6 @@ class RobustCrossingEngine:
         trajectory_direction = self._infer_trajectory_direction(group)
         trajectory_quality = float(group["trajectory_quality"].mean())
         short_track = len(group) < self.config.short_track_observation_threshold
-
-        # Phase 3.1 fast-crossing evidence. This is an audit score, not a
-        # free pass: geometry remains mandatory and direction/normal motion
-        # must remain usable.
-        fast_flag = bool(crossing["fast_crossing"]) if crossing else False
-        sparse_flag = bool(crossing["sparse_crossing"]) if crossing else False
-        normal_disp = abs(float(evidence["normal_displacement_px"]))
-        dir_conf = float(evidence["direction_confidence"])
-        continuity_score = float(
-            np.clip(group["trajectory_continuity"].mean(), 0.0, 1.0)
-        )
-        speed_signal = float(np.clip(
-            max_speed / max(self.config.max_velocity_px_per_frame, 1.0),
-            0.0, 1.0
-        ))
-        normal_signal = float(np.clip(
-            normal_disp / max(self.config.min_normal_displacement_px * 4.0, 1.0),
-            0.0, 1.0
-        ))
-        median_speed = float(group["speed_px_per_frame"].median())
-        speed_ratio = float(
-            median_speed / max(max_speed, 1e-6)
-        )
-        fast_confidence = float(np.clip(
-            0.30 * dir_conf
-            + 0.25 * continuity_score
-            + 0.20 * normal_signal
-            + 0.15 * speed_signal
-            + 0.10 * (1.0 if sparse_flag or short_track else 0.0),
-            0.0, 1.0
-        ))
-        fast_reasons = []
-        if fast_flag or sparse_flag or short_track:
-            if dir_conf < self.config.min_direction_confidence:
-                fast_reasons.append("low_direction_confidence")
-            if normal_disp < self.config.min_normal_displacement_px:
-                fast_reasons.append("weak_normal_displacement")
-            if continuity_score < 0.50:
-                fast_reasons.append("weak_trajectory_continuity")
-            if not fast_reasons:
-                fast_reasons.append("strong_fast_crossing_evidence")
-        fast_reason = ";".join(fast_reasons)
 
         candidate_class = (
             "TRUE_CROSSING"
@@ -1842,18 +1799,6 @@ class RobustCrossingEngine:
             "identity_gap_side_transition": bool(crossing.get("identity_gap_side_transition", False)) if crossing else False,
             "identity_gap_frames": int(crossing.get("identity_gap_frames", 0)) if crossing else 0,
             "identity_gap_identity_confirmed": bool(crossing.get("identity_gap_identity_confirmed", False)) if crossing else False,
-            "identity_class": identity_class,
-            "identity_class_confidence": identity_class_conf,
-            "identity_class_margin": identity_class_margin,
-            "identity_class_ambiguous": identity_class_ambiguous,
-            "identity_class_source": identity_class_source,
-            "identity_class_evidence": identity_class_evidence,
-            "fast_crossing_confidence": fast_confidence,
-            "fast_crossing_reason": fast_reason,
-            "fast_normal_displacement_px": normal_disp,
-            "fast_speed_ratio": speed_ratio,
-            "fast_direction_confidence": dir_conf,
-            "fast_sparse": bool(sparse_flag or short_track),
             "candidate_duplicate_of": pd.NA,
             "candidate_duplicate_confidence": 0.0,
             "candidate_duplicate_reason": "",
@@ -1871,7 +1816,11 @@ class RobustCrossingEngine:
             "_mean_abs_normal": mean_abs_normal,
             "_mean_abs_tangent": mean_abs_tangent,
             "_trajectory_direction": trajectory_direction,
-            "_candidates": candidates,
+            "_candidates": all_crossing_candidates,
+            "crossing_candidate_count": int(len(all_crossing_candidates)),
+            "multi_crossing_resolved": bool(len(all_crossing_candidates) > 1),
+            "alternative_crossing_count": int(len(alternative_crossings)),
+            "alternative_crossings": alternative_crossings,
         }
 
     # ==================================================================
@@ -1905,6 +1854,9 @@ class RobustCrossingEngine:
             "class_transition": event["class_transition"],
             "class_evidence": event["class_evidence"],
             "track_observations": int(len(group)),
+            "crossing_candidate_count": int(event.get("crossing_candidate_count", 0)),
+            "multi_crossing_resolved": bool(event.get("multi_crossing_resolved", False)),
+            "alternative_crossing_count": int(event.get("alternative_crossing_count", 0)),
             "short_track": bool(event["short_track"]),
             "first_side": first_side,
             "last_side": last_side,
@@ -1936,17 +1888,6 @@ class RobustCrossingEngine:
             "crossing_method": event["crossing_method"],
             "identity_gap_side_transition": bool(event.get("identity_gap_side_transition", False)),
             "identity_gap_frames": int(event.get("identity_gap_frames", 0)),
-            "identity_class": event.get("identity_class", "unknown"),
-            "identity_class_confidence": float(event.get("identity_class_confidence", 0.0)),
-            "identity_class_margin": float(event.get("identity_class_margin", 0.0)),
-            "identity_class_ambiguous": bool(event.get("identity_class_ambiguous", False)),
-            "identity_class_source": event.get("identity_class_source", ""),
-            "identity_class_evidence": event.get("identity_class_evidence", ""),
-            "fast_crossing_confidence": float(event.get("fast_crossing_confidence", 0.0)),
-            "fast_crossing_reason": event.get("fast_crossing_reason", ""),
-            "fast_normal_displacement_px": float(event.get("fast_normal_displacement_px", 0.0)),
-            "fast_speed_ratio": float(event.get("fast_speed_ratio", 0.0)),
-            "fast_direction_confidence": float(event.get("fast_direction_confidence", 0.0)),
             "candidate_duplicate_of": event.get("candidate_duplicate_of", pd.NA),
             "candidate_duplicate_confidence": float(event.get("candidate_duplicate_confidence", 0.0)),
             "candidate_duplicate_reason": event.get("candidate_duplicate_reason", ""),
@@ -2018,6 +1959,10 @@ class RobustCrossingEngine:
         fa = int(a["crossing_frame"])
         fb = int(b["crossing_frame"])
         if fa == fb:
+            a_tracks = set(self._event_track_id_list(a))
+            b_tracks = set(self._event_track_id_list(b))
+            if a_tracks and b_tracks and a_tracks.intersection(b_tracks):
+                return True, 1.0, "same_frame_same_raw_track_duplicate"
             return False, 0.0, "same_frame_independent_candidate"
 
         if fa < fb:
@@ -2532,16 +2477,9 @@ class RobustCrossingEngine:
         next_candidate_id = 1
 
         # --------------------------------------------------------------
-        # A. DIRECT CANDIDATES: one source candidate per CANONICAL TRACK.
-        # Concurrent aliases therefore cannot create duplicate crossing
-        # candidates, while independent vehicles keep separate canonical IDs.
+        # A. DIRECT CANDIDATES: one source candidate per RAW TRACK.
         # --------------------------------------------------------------
-        candidate_column = (
-            "canonical_track_id"
-            if "canonical_track_id" in prepared.columns
-            else identity_column
-        )
-        for _canonical_track_id, group in prepared.groupby(candidate_column, sort=False):
+        for raw_track_id, group in prepared.groupby(identity_column, sort=False):
             group = group.sort_values("frame_id").reset_index(drop=True)
             identity_id = int(group["identity_id"].iloc[0])
 
@@ -2610,20 +2548,7 @@ class RobustCrossingEngine:
                     ok, score, _info = self._fragment_gap_score(early, late)
                     if ok and score > best_score:
                         # Fallback only for physically different identities.
-                        early_canonical = int(
-                            early.get("canonical_track_id", early["track_id"]).iloc[0]
-                            if isinstance(early.get("canonical_track_id", None), pd.Series)
-                            else early["track_id"].iloc[0]
-                        )
-                        late_canonical = int(
-                            late.get("canonical_track_id", late["track_id"]).iloc[0]
-                            if isinstance(late.get("canonical_track_id", None), pd.Series)
-                            else late["track_id"].iloc[0]
-                        )
-                        if (
-                            int(early["identity_id"].iloc[0]) != int(late["identity_id"].iloc[0])
-                            and early_canonical != late_canonical
-                        ):
+                        if int(early["identity_id"].iloc[0]) != int(late["identity_id"].iloc[0]):
                             best = early
                             best_score = score
                 if best is not None and best_score >= 0.60:
