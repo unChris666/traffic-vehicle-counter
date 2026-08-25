@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-import math
 
+import math
 import pandas as pd
+import numpy as np
 
 
 class CrossingState(str, Enum):
@@ -20,13 +21,11 @@ class CrossingState(str, Enum):
 @dataclass
 class TrackFragment:
     """
-    One tracker track_id.
-
-    A physical vehicle can consist of multiple fragments.
-    This object is used only for identity association.
+    One raw track_id can be one fragment of a physical vehicle.
     """
 
     track_id: int
+
     class_name: str
     class_ratio: float
     class_ambiguous: bool
@@ -53,6 +52,7 @@ class TrackFragment:
     velocity_y: float
 
     observation_count: int
+
     mean_confidence: float
 
     rows: pd.DataFrame
@@ -61,12 +61,17 @@ class TrackFragment:
 @dataclass
 class CrossingIdentity:
     crossing_id: int
-    track_ids: list[int] = field(default_factory=list)
+
+    track_ids: list[int] = field(
+        default_factory=list
+    )
 
     state: CrossingState = CrossingState.NOT_SEEN
 
     vehicle_class: str = "unknown"
+
     class_ratio: float = 0.0
+
     class_ambiguous: bool = False
 
     first_frame: int | None = None
@@ -79,6 +84,7 @@ class CrossingIdentity:
     last_y: float | None = None
 
     last_side: int = 0
+
     last_distance_px: float = 0.0
 
     last_velocity_x: float = 0.0
@@ -86,48 +92,95 @@ class CrossingIdentity:
 
     stable_observations_before_crossing: int = 0
 
-    # Reconstruction audit
-    last_match_score: float = 0.0
-    last_match_reason: str = ""
-    reconnect_count: int = 0
+    crossing_frame: int | None = None
+    crossing_time_sec: float | None = None
 
+    crossing_x: float | None = None
+    crossing_y: float | None = None
+
+    crossing_track_id: int | None = None
+
+    # Required by existing confidence.py
+    crossing_line_distance_px: float | None = None
+    crossing_previous_side: int | None = None
+    crossing_frame_gap: int | None = None
+
+    direction: str | None = None
+
+    counted: bool = False
+
+    # Canonical physical-identity / alias resolution.
+    canonical_track_id: int | None = None
+    alias_track_ids: list[int] = field(default_factory=list)
+    identity_class: str = "unknown"
+    identity_class_confidence: float = 0.0
+    identity_class_source: str = ""
+    concurrent_duplicate_resolved: bool = False
+    concurrent_duplicate_confidence: float = 0.0
+    concurrent_duplicate_reason: str = ""
 
 class CrossingIdentityEngine:
     """
-    Converts raw tracker IDs into conservative physical crossing IDs.
+    Phase 1:
 
-    Critical rule:
-        Overlapping tracks are NEVER reconnected.
+        track_id fragments
+                ↓
+        crossing identity
+                ↓
+        crossing state machine
 
-    This prevents:
-        motor A = track 101
-        motor B = track 102
-
-    from being merged merely because they enter the line area
-    at nearly the same time.
+    Important:
+    track_id is NOT the final counting identity.
+    crossing_id is.
     """
 
     def __init__(
         self,
         *,
         fps: float,
+
         line_x1: float,
         line_y1: float,
         line_x2: float,
         line_y2: float,
+
         line_deadband_px: float = 20.0,
+
         pre_crossing_distance_px: float = 100.0,
+
         max_reconnect_gap_sec: float = 1.0,
+
         max_reconnect_distance_px: float = 100.0,
+
         identity_match_threshold: float = 0.82,
+
         identity_match_margin: float = 0.08,
+
         velocity_gate_px_per_frame: float = 30.0,
-        min_pre_crossing_observations: int = 2,
-        identity_same_side_near_line_block: bool = True,
-        identity_prediction_gate_max_px: float = 220.0,
-        identity_min_velocity_cosine: float = 0.35,
-        identity_min_normal_velocity_px_per_frame: float = 1.0,
+
+        min_pre_crossing_observations: int = 3,
+
         max_crossing_gap_sec: float = 1.0,
+
+        # Concurrent duplicate-track resolver. These are deliberately
+        # conservative: overlap must be extremely strong before two active
+        # tracker IDs are treated as one physical object.
+        concurrent_duplicate_enabled: bool = True,
+        concurrent_duplicate_min_overlap_frames: int = 3,
+        concurrent_duplicate_min_overlap_ratio: float = 0.50,
+        concurrent_duplicate_min_mean_iou: float = 0.65,
+        concurrent_duplicate_min_max_iou: float = 0.80,
+        concurrent_duplicate_max_center_distance_px: float = 25.0,
+        concurrent_duplicate_min_motion_cosine: float = 0.80,
+        concurrent_duplicate_max_motion_speed_ratio: float = 2.50,
+        concurrent_duplicate_allow_class_mismatch: bool = True,
+
+        # Physical class resolver. Detector class is evidence, never identity
+        # truth by itself.
+        identity_class_min_confidence: float = 0.45,
+        identity_class_stable_track_ratio: float = 0.70,
+        identity_class_ambiguous_penalty: float = 0.55,
+        identity_class_alias_bonus: float = 1.20,
     ) -> None:
 
         if fps <= 0:
@@ -199,28 +252,27 @@ class CrossingIdentityEngine:
             velocity_gate_px_per_frame
         )
 
-        self.min_pre_crossing_observations = max(
-            1,
-            int(min_pre_crossing_observations),
+        self.min_pre_crossing_observations = int(
+            min_pre_crossing_observations
         )
-        self.identity_same_side_near_line_block = bool(identity_same_side_near_line_block)
-        self.identity_prediction_gate_max_px = float(identity_prediction_gate_max_px)
-        self.identity_min_velocity_cosine = float(identity_min_velocity_cosine)
-        self.identity_min_normal_velocity_px_per_frame = float(identity_min_normal_velocity_px_per_frame)
 
-        self._audit_counters = {
-            "same_side_near_line_blocks": 0,
-            "prediction_gate_used": 0,
-            "prediction_gate_rejections": 0,
-            "velocity_conflict_rejections": 0,
-            "direction_conflict_rejections": 0,
-            "class_conflict_rejections": 0,
-            "ambiguous_identity_matches": 0,
-        }
+        self.concurrent_duplicate_enabled = bool(concurrent_duplicate_enabled)
+        self.concurrent_duplicate_min_overlap_frames = max(1, int(concurrent_duplicate_min_overlap_frames))
+        self.concurrent_duplicate_min_overlap_ratio = float(concurrent_duplicate_min_overlap_ratio)
+        self.concurrent_duplicate_min_mean_iou = float(concurrent_duplicate_min_mean_iou)
+        self.concurrent_duplicate_min_max_iou = float(concurrent_duplicate_min_max_iou)
+        self.concurrent_duplicate_max_center_distance_px = float(concurrent_duplicate_max_center_distance_px)
+        self.concurrent_duplicate_min_motion_cosine = float(concurrent_duplicate_min_motion_cosine)
+        self.concurrent_duplicate_max_motion_speed_ratio = float(concurrent_duplicate_max_motion_speed_ratio)
+        self.concurrent_duplicate_allow_class_mismatch = bool(concurrent_duplicate_allow_class_mismatch)
+        self.identity_class_min_confidence = float(identity_class_min_confidence)
+        self.identity_class_stable_track_ratio = float(identity_class_stable_track_ratio)
+        self.identity_class_ambiguous_penalty = float(identity_class_ambiguous_penalty)
+        self.identity_class_alias_bonus = float(identity_class_alias_bonus)
 
-    # ------------------------------------------------------------------
+    # =========================================================
     # GEOMETRY
-    # ------------------------------------------------------------------
+    # =========================================================
 
     def _line_geometry(
         self,
@@ -229,8 +281,10 @@ class CrossingIdentityEngine:
     ) -> tuple[float, float, int]:
 
         line_value = (
-            self.line_dx * (y - self.y1)
-            - self.line_dy * (x - self.x1)
+            self.line_dx
+            * (y - self.y1)
+            - self.line_dy
+            * (x - self.x1)
         )
 
         distance = (
@@ -240,8 +294,10 @@ class CrossingIdentityEngine:
 
         if distance <= self.line_deadband_px:
             side = 0
+
         elif line_value > 0:
             side = 1
+
         else:
             side = -1
 
@@ -250,6 +306,10 @@ class CrossingIdentityEngine:
             float(distance),
             int(side),
         )
+
+    # =========================================================
+    # VELOCITY
+    # =========================================================
 
     @staticmethod
     def _estimate_velocity(
@@ -261,11 +321,11 @@ class CrossingIdentityEngine:
         if len(rows) < 2:
             return 0.0, 0.0
 
-        sample = (
-            rows.tail(5)
-            if tail
-            else rows.head(5)
-        )
+        if tail:
+            sample = rows.tail(5)
+
+        else:
+            sample = rows.head(5)
 
         dx = sample[
             "bottom_center_x"
@@ -285,19 +345,20 @@ class CrossingIdentityEngine:
             return 0.0, 0.0
 
         vx = float(
-            (dx[valid] / dt[valid]).median()
+            (
+                dx[valid]
+                / dt[valid]
+            ).median()
         )
 
         vy = float(
-            (dy[valid] / dt[valid]).median()
+            (
+                dy[valid]
+                / dt[valid]
+            ).median()
         )
 
         return vx, vy
-
-    def _normal_velocity(self, vx: float, vy: float) -> float:
-        nx = -self.line_dy / self.line_length
-        ny = self.line_dx / self.line_length
-        return float(vx * nx + vy * ny)
 
     @staticmethod
     def _velocity_similarity(
@@ -307,16 +368,28 @@ class CrossingIdentityEngine:
         by: float,
     ) -> float:
 
-        norm_a = math.hypot(ax, ay)
-        norm_b = math.hypot(bx, by)
+        norm_a = math.hypot(
+            ax,
+            ay,
+        )
 
-        if norm_a < 1e-6 or norm_b < 1e-6:
+        norm_b = math.hypot(
+            bx,
+            by,
+        )
+
+        if (
+            norm_a < 1e-6
+            or norm_b < 1e-6
+        ):
             return 0.5
 
         cosine = (
-            ax * bx + ay * by
+            ax * bx
+            + ay * by
         ) / (
-            norm_a * norm_b
+            norm_a
+            * norm_b
         )
 
         return max(
@@ -324,9 +397,9 @@ class CrossingIdentityEngine:
             min(1.0, cosine),
         )
 
-    # ------------------------------------------------------------------
-    # PREPARE
-    # ------------------------------------------------------------------
+    # =========================================================
+    # PREPARE TRACK OBSERVATIONS
+    # =========================================================
 
     def prepare(
         self,
@@ -342,17 +415,21 @@ class CrossingIdentityEngine:
             "track_class",
             "track_class_ratio",
             "class_ambiguous",
+            "class_name",
+            "confidence",
         }
 
         missing = (
             required
-            - set(tracks_phase2.columns)
+            - set(
+                tracks_phase2.columns
+            )
         )
 
         if missing:
             raise ValueError(
-                "tracks_phase2 missing required "
-                f"columns: {sorted(missing)}"
+                "tracks_phase2 missing "
+                f"required columns: {sorted(missing)}"
             )
 
         trajectory = (
@@ -366,18 +443,18 @@ class CrossingIdentityEngine:
             .reset_index(drop=True)
         )
 
-        if "confidence" not in trajectory.columns:
-            trajectory["confidence"] = 1.0
-
-        if "class_name" not in trajectory.columns:
-            trajectory["class_name"] = (
-                trajectory["track_class"]
-            )
-
         geometry = trajectory.apply(
             lambda row: self._line_geometry(
-                float(row["bottom_center_x"]),
-                float(row["bottom_center_y"]),
+                float(
+                    row[
+                        "bottom_center_x"
+                    ]
+                ),
+                float(
+                    row[
+                        "bottom_center_y"
+                    ]
+                ),
             ),
             axis=1,
             result_type="expand",
@@ -389,8 +466,19 @@ class CrossingIdentityEngine:
             "side",
         ]
 
+        # Phase-2 CSVs may already contain these diagnostic geometry columns.
+        # Remove them before concatenation so pandas never creates duplicate
+        # column labels (which later break boolean indexing).
+        trajectory = trajectory.drop(
+            columns=["line_value", "line_distance_px", "side"],
+            errors="ignore",
+        )
+
         trajectory = pd.concat(
-            [trajectory, geometry],
+            [
+                trajectory,
+                geometry,
+            ],
             axis=1,
         )
 
@@ -414,21 +502,27 @@ class CrossingIdentityEngine:
 
         return trajectory
 
-    # ------------------------------------------------------------------
-    # FRAGMENTS
-    # ------------------------------------------------------------------
+    # =========================================================
+    # BUILD TRACK FRAGMENTS
+    # =========================================================
 
     def build_fragments(
         self,
         trajectory: pd.DataFrame,
     ) -> list[TrackFragment]:
 
-        fragments: list[TrackFragment] = []
+        fragments: list[
+            TrackFragment
+        ] = []
 
-        for track_id, rows in trajectory.groupby(
+        for (
+            track_id,
+            rows,
+        ) in trajectory.groupby(
             "track_id",
             sort=False,
         ):
+
             rows = (
                 rows
                 .sort_values("frame_id")
@@ -439,106 +533,158 @@ class CrossingIdentityEngine:
                 rows["side"] != 0
             ]
 
-            first_side = (
-                int(stable.iloc[0]["side"])
-                if not stable.empty
-                else 0
+            if stable.empty:
+
+                first_side = 0
+                last_side = 0
+
+            else:
+
+                first_side = int(
+                    stable.iloc[0]["side"]
+                )
+
+                last_side = int(
+                    stable.iloc[-1]["side"]
+                )
+
+            first_velocity = (
+                self._estimate_velocity(
+                    rows,
+                    tail=False,
+                )
             )
 
-            last_side = (
-                int(stable.iloc[-1]["side"])
-                if not stable.empty
-                else 0
-            )
-
-            first_velocity = self._estimate_velocity(
-                rows,
-                tail=False,
-            )
-
-            last_velocity = self._estimate_velocity(
-                rows,
-                tail=True,
+            last_velocity = (
+                self._estimate_velocity(
+                    rows,
+                    tail=True,
+                )
             )
 
             class_counts = (
-                rows["track_class"]
+                rows["class_name"]
                 .value_counts()
             )
 
-            class_name = str(
-                class_counts.index[0]
-            )
+            if class_counts.empty:
 
-            class_ratio = float(
-                class_counts.iloc[0]
-                / class_counts.sum()
-            )
+                class_name = str(
+                    rows.iloc[0][
+                        "track_class"
+                    ]
+                )
+
+                class_ratio = float(
+                    rows.iloc[0][
+                        "track_class_ratio"
+                    ]
+                )
+
+            else:
+
+                class_name = str(
+                    class_counts
+                    .index[0]
+                )
+
+                class_ratio = float(
+                    class_counts.iloc[0]
+                    / class_counts.sum()
+                )
 
             fragments.append(
                 TrackFragment(
-                    track_id=int(track_id),
+                    track_id=int(
+                        track_id
+                    ),
+
                     class_name=class_name,
+
                     class_ratio=class_ratio,
+
                     class_ambiguous=(
                         class_ratio < 0.70
                     ),
+
                     first_frame=int(
                         rows["frame_id"].min()
                     ),
+
                     last_frame=int(
                         rows["frame_id"].max()
                     ),
+
                     first_time_sec=float(
-                        rows["timestamp_sec"].min()
+                        rows[
+                            "timestamp_sec"
+                        ].min()
                     ),
+
                     last_time_sec=float(
-                        rows["timestamp_sec"].max()
+                        rows[
+                            "timestamp_sec"
+                        ].max()
                     ),
+
                     first_x=float(
                         rows.iloc[0][
                             "bottom_center_x"
                         ]
                     ),
+
                     first_y=float(
                         rows.iloc[0][
                             "bottom_center_y"
                         ]
                     ),
+
                     last_x=float(
                         rows.iloc[-1][
                             "bottom_center_x"
                         ]
                     ),
+
                     last_y=float(
                         rows.iloc[-1][
                             "bottom_center_y"
                         ]
                     ),
+
                     first_side=first_side,
+
                     last_side=last_side,
+
                     first_distance_px=float(
                         rows.iloc[0][
                             "line_distance_px"
                         ]
                     ),
+
                     last_distance_px=float(
                         rows.iloc[-1][
                             "line_distance_px"
                         ]
                     ),
+
                     velocity_x=float(
-                        last_velocity[0]
+                        first_velocity[0]
                     ),
+
                     velocity_y=float(
-                        last_velocity[1]
+                        first_velocity[1]
                     ),
+
                     observation_count=int(
                         len(rows)
                     ),
+
                     mean_confidence=float(
-                        rows["confidence"].mean()
+                        rows[
+                            "confidence"
+                        ].mean()
                     ),
+
                     rows=rows,
                 )
             )
@@ -552,135 +698,198 @@ class CrossingIdentityEngine:
 
         return fragments
 
-    # ------------------------------------------------------------------
-    # MATCH SCORE
-    # ------------------------------------------------------------------
+    # =========================================================
+    # CROSSING IDENTITY MATCH
+    # =========================================================
 
     def _candidate_score(
         self,
         identity: CrossingIdentity,
         fragment: TrackFragment,
-    ) -> tuple[float, str]:
-        """Conservative trajectory-aware fragment reconstruction.
+    ) -> float:
 
-        A reconnect is accepted only when temporal continuity, predicted
-        position, class compatibility, velocity direction and counting-line
-        geometry agree. Near-line same-side fragments are deliberately NOT
-        merged: that pattern is more consistent with two vehicles arriving
-        close together than with one fragmented vehicle.
-        """
-        if identity.last_frame is None or identity.last_x is None or identity.last_y is None:
-            return -1.0, "missing_identity_state"
+        if (
+            identity.last_frame is None
+            or identity.last_x is None
+            or identity.last_y is None
+        ):
+            return -1.0
 
-        gap = int(fragment.first_frame - identity.last_frame)
-        if gap <= 0 or gap > self.max_reconnect_gap_frames:
-            return -1.0, "temporal_overlap_or_gap"
+        gap_frames = (
+            fragment.first_frame
+            - identity.last_frame
+        )
 
-        # Hard same-side near-line guard. This is the most important anti-merge
-        # rule for two vehicles entering the counting corridor together.
-        near_old = identity.last_distance_px <= self.pre_crossing_distance_px
-        near_new = fragment.first_distance_px <= self.pre_crossing_distance_px
-        same_side = (
+        if (
+            gap_frames <= 0
+            or gap_frames
+            > self.max_reconnect_gap_frames
+        ):
+            return -1.0
+
+        distance = math.hypot(
+            fragment.first_x
+            - identity.last_x,
+
+            fragment.first_y
+            - identity.last_y,
+        )
+
+        if (
+            distance
+            > self.max_reconnect_distance_px
+        ):
+            return -1.0
+
+        # -----------------------------------------------------
+        # Class gate
+        # -----------------------------------------------------
+
+        if (
+            identity.vehicle_class
+            != "unknown"
+            and fragment.class_name
+            != identity.vehicle_class
+        ):
+            return -1.0
+
+        # -----------------------------------------------------
+        # Spatial score
+        # -----------------------------------------------------
+
+        spatial_score = max(
+            0.0,
+            1.0
+            - (
+                distance
+                / self.max_reconnect_distance_px
+            ),
+        )
+
+        # -----------------------------------------------------
+        # Temporal score
+        # -----------------------------------------------------
+
+        temporal_score = max(
+            0.0,
+            1.0
+            - (
+                gap_frames
+                / self.max_reconnect_gap_frames
+            ),
+        )
+
+        # -----------------------------------------------------
+        # Side compatibility
+        # -----------------------------------------------------
+
+        side_score = 1.0
+
+        if (
             identity.last_side != 0
             and fragment.first_side != 0
-            and identity.last_side == fragment.first_side
-        )
-        if self.identity_same_side_near_line_block and near_old and near_new and same_side:
-            self._audit_counters["same_side_near_line_blocks"] += 1
-            return -1.0, "same_side_near_line_block"
-
-        # Class compatibility. Unknown is weakly compatible; person↔motorcycle
-        # is retained as a rider/vehicle ambiguity case but never preferred over
-        # a same-class match. Different vehicle classes are hard incompatible.
-        a = str(identity.vehicle_class).strip().lower()
-        b = str(fragment.class_name).strip().lower()
-        if a not in {"", "unknown"} and b not in {"", "unknown"}:
-            if a != b and {a, b} != {"person", "motorcycle"}:
-                self._audit_counters["class_conflict_rejections"] += 1
-                return -1.0, "class_incompatible"
-
-        old_v = (float(identity.last_velocity_x), float(identity.last_velocity_y))
-        new_v = (float(fragment.velocity_x), float(fragment.velocity_y))
-        old_speed = math.hypot(*old_v)
-        new_speed = math.hypot(*new_v)
-
-        # Predict forward when velocity is reliable. Raw endpoint distance is
-        # only used as a fallback for nearly stationary fragments.
-        if old_speed >= self.velocity_gate_px_per_frame or new_speed >= self.velocity_gate_px_per_frame:
-            predicted_x = identity.last_x + old_v[0] * gap
-            predicted_y = identity.last_y + old_v[1] * gap
-            continuity_distance = math.hypot(fragment.first_x - predicted_x, fragment.first_y - predicted_y)
-            self._audit_counters["prediction_gate_used"] += 1
-        else:
-            continuity_distance = math.hypot(fragment.first_x - identity.last_x, fragment.first_y - identity.last_y)
-
-        expected_motion = max(old_speed, new_speed, 1.0) * gap
-        dynamic_gate = max(
-            self.max_reconnect_distance_px,
-            min(self.identity_prediction_gate_max_px, self.velocity_gate_px_per_frame * gap * 1.25),
-            min(self.identity_prediction_gate_max_px, expected_motion * 1.15),
-        )
-        if continuity_distance > dynamic_gate:
-            self._audit_counters["prediction_gate_rejections"] += 1
-            return -1.0, f"prediction_gate:{continuity_distance:.1f}>{dynamic_gate:.1f}"
-
-        spatial_score = max(0.0, 1.0 - continuity_distance / max(dynamic_gate, 1e-6))
-        temporal_score = max(0.0, 1.0 - gap / max(self.max_reconnect_gap_frames, 1))
-
-        velocity_score = 0.55
-        cosine = 0.5
-        if old_speed > 1.0 and new_speed > 1.0:
-            cosine = self._velocity_similarity(old_v[0], old_v[1], new_v[0], new_v[1])
-            if cosine < self.identity_min_velocity_cosine:
-                self._audit_counters["velocity_conflict_rejections"] += 1
-                return -1.0, f"velocity_direction_conflict:{cosine:.3f}"
-            speed_ratio = min(old_speed, new_speed) / max(old_speed, new_speed)
-            velocity_score = 0.60 * ((cosine + 1.0) / 2.0) + 0.40 * speed_ratio
-
-        old_side = identity.last_side
-        new_side = fragment.first_side
-        side_score = 1.0
-        if old_side != 0 and new_side != 0 and old_side != new_side:
-            # A side transition is plausible only when at least one endpoint
-            # is in the pre-crossing corridor. Otherwise it is an implausible
-            # identity jump.
-            if not (near_old or near_new):
-                self._audit_counters["direction_conflict_rejections"] += 1
-                return -1.0, "implausible_side_change"
-            side_score = 0.90
-
-        # Normal velocity must not reverse across a short gap. A reversal
-        # indicates two different objects or a noisy identity jump.
-        old_nv = self._normal_velocity(*old_v)
-        new_nv = self._normal_velocity(*new_v)
-        if (
-            abs(old_nv) >= self.identity_min_normal_velocity_px_per_frame
-            and abs(new_nv) >= self.identity_min_normal_velocity_px_per_frame
-            and old_nv * new_nv < 0
         ):
-            self._audit_counters["direction_conflict_rejections"] += 1
-            return -1.0, "normal_velocity_reverse"
 
-        normal_score = 1.0 if old_nv * new_nv >= 0 else 0.85
-        class_score = 1.0 if a == b else 0.55 if {a, b} == {"person", "motorcycle"} else 0.65
+            if (
+                identity.last_side
+                == fragment.first_side
+            ):
+                side_score = 1.0
+
+            else:
+
+                # Side can change across an occlusion,
+                # but only when both fragments are close
+                # to the counting line.
+                if (
+                    identity.last_distance_px
+                    > self.line_deadband_px * 3
+                    and
+                    fragment.first_distance_px
+                    > self.line_deadband_px * 3
+                ):
+                    return -1.0
+
+                side_score = 0.35
+
+        # -----------------------------------------------------
+        # Velocity compatibility
+        # -----------------------------------------------------
+
+        velocity_score = 0.5
+
+        old_speed = math.hypot(
+            identity.last_velocity_x,
+            identity.last_velocity_y,
+        )
+
+        new_speed = math.hypot(
+            fragment.velocity_x,
+            fragment.velocity_y,
+        )
+
+        if (
+            old_speed
+            > 1.0
+            and new_speed
+            > 1.0
+        ):
+
+            cosine = (
+                self._velocity_similarity(
+                    identity.last_velocity_x,
+                    identity.last_velocity_y,
+
+                    fragment.velocity_x,
+                    fragment.velocity_y,
+                )
+            )
+
+            if cosine < 0.50:
+                return -1.0
+
+            speed_ratio = (
+                min(
+                    old_speed,
+                    new_speed,
+                )
+                /
+                max(
+                    old_speed,
+                    new_speed,
+                )
+            )
+
+            velocity_score = (
+                0.5
+                * (
+                    (cosine + 1.0)
+                    / 2.0
+                )
+                +
+                0.5
+                * speed_ratio
+            )
+
+        # -----------------------------------------------------
+        # Final score
+        # -----------------------------------------------------
 
         score = (
-            0.38 * spatial_score
-            + 0.18 * temporal_score
-            + 0.18 * velocity_score
-            + 0.12 * side_score
-            + 0.09 * normal_score
-            + 0.05 * class_score
+            0.45 * spatial_score
+            +
+            0.20 * temporal_score
+            +
+            0.20 * velocity_score
+            +
+            0.15 * side_score
         )
 
-        if score < self.identity_match_threshold:
-            return float(score), f"below_threshold:{score:.3f}"
+        return float(score)
 
-        return float(score), "accepted"
-
-    # ------------------------------------------------------------------
-    # IDENTITY
-    # ------------------------------------------------------------------
+    # =========================================================
+    # CREATE IDENTITY
+    # =========================================================
 
     @staticmethod
     def _create_identity(
@@ -690,68 +899,606 @@ class CrossingIdentityEngine:
 
         return CrossingIdentity(
             crossing_id=crossing_id,
-            track_ids=[fragment.track_id],
-            vehicle_class=fragment.class_name,
-            class_ratio=fragment.class_ratio,
-            class_ambiguous=fragment.class_ambiguous,
-            first_frame=fragment.first_frame,
-            last_frame=fragment.last_frame,
-            first_time_sec=fragment.first_time_sec,
-            last_time_sec=fragment.last_time_sec,
-            last_x=fragment.last_x,
-            last_y=fragment.last_y,
-            last_side=fragment.last_side,
-            last_distance_px=fragment.last_distance_px,
-            last_velocity_x=fragment.velocity_x,
-            last_velocity_y=fragment.velocity_y,
+
+            track_ids=[
+                fragment.track_id
+            ],
+
+            state=CrossingState.NOT_SEEN,
+
+            vehicle_class=(
+                fragment.class_name
+            ),
+
+            class_ratio=(
+                fragment.class_ratio
+            ),
+
+            class_ambiguous=(
+                fragment.class_ambiguous
+            ),
+
+            first_frame=(
+                fragment.first_frame
+            ),
+
+            last_frame=(
+                fragment.last_frame
+            ),
+
+            first_time_sec=(
+                fragment.first_time_sec
+            ),
+
+            last_time_sec=(
+                fragment.last_time_sec
+            ),
+
+            last_x=(
+                fragment.last_x
+            ),
+
+            last_y=(
+                fragment.last_y
+            ),
+
+            last_side=(
+                fragment.last_side
+            ),
+
+            last_distance_px=(
+                fragment.last_distance_px
+            ),
+
+            last_velocity_x=(
+                fragment.velocity_x
+            ),
+
+            last_velocity_y=(
+                fragment.velocity_y
+            ),
         )
 
-    @staticmethod
+    # =========================================================
+    # UPDATE IDENTITY META
+    # =========================================================
+
     def _update_identity_meta(
+        self,
         identity: CrossingIdentity,
         fragment: TrackFragment,
     ) -> None:
 
-        if fragment.track_id not in identity.track_ids:
+        if (
+            fragment.track_id
+            not in identity.track_ids
+        ):
             identity.track_ids.append(
                 fragment.track_id
             )
 
+        # Keep original identity class,
+        # but mark ambiguity if fragments disagree.
         if (
             fragment.class_name
             != identity.vehicle_class
         ):
             identity.class_ambiguous = True
 
-        identity.last_frame = fragment.last_frame
-        identity.last_time_sec = fragment.last_time_sec
-        identity.last_x = fragment.last_x
-        identity.last_y = fragment.last_y
-        identity.last_side = fragment.last_side
-        identity.last_distance_px = fragment.last_distance_px
-        identity.last_velocity_x = fragment.velocity_x
-        identity.last_velocity_y = fragment.velocity_y
+        else:
 
-        if (
-            fragment.class_ratio
-            >
-            identity.class_ratio
-        ):
-            identity.class_ratio = (
-                fragment.class_ratio
+            identity.class_ratio = float(
+                (
+                    identity.class_ratio
+                    + fragment.class_ratio
+                )
+                / 2.0
             )
 
-    # ------------------------------------------------------------------
-    # RUN
-    # ------------------------------------------------------------------
+        identity.last_velocity_x = (
+            fragment.velocity_x
+        )
+
+        identity.last_velocity_y = (
+            fragment.velocity_y
+        )
+
+    # =========================================================
+    # STATE MACHINE
+    # =========================================================
+
+    def _process_observation(
+        self,
+        identity: CrossingIdentity,
+        row: pd.Series,
+        previous_frame: int | None,
+    ) -> None:
+
+        frame_id = int(
+            row["frame_id"]
+        )
+
+        timestamp_sec = float(
+            row["timestamp_sec"]
+        )
+
+        x = float(
+            row["bottom_center_x"]
+        )
+
+        y = float(
+            row["bottom_center_y"]
+        )
+
+        side = int(
+            row["side"]
+        )
+
+        distance_px = float(
+            row["line_distance_px"]
+        )
+
+        # -----------------------------------------------------
+        # If already counted, remain post-crossing.
+        # -----------------------------------------------------
+
+        if identity.counted:
+
+            identity.state = (
+                CrossingState.POST_CROSSING
+            )
+
+            identity.last_frame = frame_id
+            identity.last_time_sec = timestamp_sec
+            identity.last_x = x
+            identity.last_y = y
+            identity.last_side = (
+                side
+                if side != 0
+                else identity.last_side
+            )
+            identity.last_distance_px = (
+                distance_px
+            )
+
+            return
+
+        # -----------------------------------------------------
+        # Deadband: keep state but don't change side.
+        # -----------------------------------------------------
+
+        if side == 0:
+
+            identity.last_frame = frame_id
+            identity.last_time_sec = timestamp_sec
+            identity.last_x = x
+            identity.last_y = y
+            identity.last_distance_px = distance_px
+
+            return
+
+        # -----------------------------------------------------
+        # Temporal validity.
+        # -----------------------------------------------------
+
+        valid_temporal_transition = True
+
+        if previous_frame is not None:
+
+            frame_gap = (
+                frame_id
+                - previous_frame
+            )
+
+            if (
+                frame_gap
+                > self.max_crossing_gap_frames
+            ):
+                valid_temporal_transition = False
+
+        # -----------------------------------------------------
+        # NOT_SEEN → APPROACHING
+        # -----------------------------------------------------
+
+        if (
+            identity.state
+            == CrossingState.NOT_SEEN
+        ):
+
+            identity.state = (
+                CrossingState.APPROACHING
+            )
+
+            identity.last_side = side
+            identity.last_frame = frame_id
+            identity.last_time_sec = timestamp_sec
+            identity.last_x = x
+            identity.last_y = y
+            identity.last_distance_px = distance_px
+
+            return
+
+        # -----------------------------------------------------
+        # APPROACHING → PRE_CROSSING
+        # -----------------------------------------------------
+
+        if (
+            identity.state
+            == CrossingState.APPROACHING
+        ):
+
+            same_side = (
+                side
+                == identity.last_side
+            )
+
+            close_to_line = (
+                distance_px
+                <= self.pre_crossing_distance_px
+            )
+
+            if (
+                same_side
+                and close_to_line
+            ):
+
+                identity.stable_observations_before_crossing += 1
+
+                if (
+                    identity.stable_observations_before_crossing
+                    >= self.min_pre_crossing_observations
+                ):
+
+                    identity.state = (
+                        CrossingState.PRE_CROSSING
+                    )
+
+            else:
+
+                identity.stable_observations_before_crossing = 0
+
+        # -----------------------------------------------------
+        # PRE_CROSSING → CROSSING → COUNTED
+        # -----------------------------------------------------
+
+        elif (
+            identity.state
+            == CrossingState.PRE_CROSSING
+        ):
+
+            if (
+                valid_temporal_transition
+                and identity.last_side != 0
+                and side != identity.last_side
+            ):
+            
+                identity.state = (
+                    CrossingState.CROSSING
+                )
+            
+                identity.crossing_frame = (
+                    frame_id
+                )
+            
+                identity.crossing_time_sec = (
+                    timestamp_sec
+                )
+            
+                identity.crossing_x = x
+                identity.crossing_y = y
+            
+                identity.crossing_track_id = (
+                    int(row["track_id"])
+                )
+            
+                # --------------------------------------------------
+                # Compatibility with existing ConfidenceEngine
+                # --------------------------------------------------
+            
+                identity.crossing_line_distance_px = (
+                    distance_px
+                )
+            
+                identity.crossing_previous_side = (
+                    identity.last_side
+                )
+            
+                identity.crossing_frame_gap = (
+                    frame_id - previous_frame
+                    if previous_frame is not None
+                    else 1
+                )
+            
+                identity.direction = (
+                    f"side_{identity.last_side:+d}"
+                    f"_to_{side:+d}"
+                )
+            
+                identity.counted = True
+            
+                identity.state = (
+                    CrossingState.POST_CROSSING
+                )
+
+        # -----------------------------------------------------
+        # Update previous pose
+        # -----------------------------------------------------
+
+        identity.last_frame = frame_id
+        identity.last_time_sec = timestamp_sec
+        identity.last_x = x
+        identity.last_y = y
+        identity.last_side = side
+        identity.last_distance_px = distance_px
+
+    # =========================================================
+    # CONCURRENT DUPLICATE TRACK RESOLVER
+    # =========================================================
+
+    @staticmethod
+    def _bbox_iou(a: pd.Series, b: pd.Series) -> float:
+        cols = ("bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2")
+        if not all(c in a.index and c in b.index for c in cols):
+            cols = ("x1", "y1", "x2", "y2")
+        if not all(c in a.index and c in b.index for c in cols):
+            return 0.0
+        ax1, ay1, ax2, ay2 = [float(a[c]) for c in cols]
+        bx1, by1, bx2, by2 = [float(b[c]) for c in cols]
+        iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+        aa = max(0.0, ax2-ax1) * max(0.0, ay2-ay1)
+        ab = max(0.0, bx2-bx1) * max(0.0, by2-by1)
+        union = aa + ab - inter
+        return float(inter / union) if union > 1e-9 else 0.0
+
+    @staticmethod
+    def _row_motion(rows: pd.DataFrame) -> tuple[float, float]:
+        if len(rows) < 2:
+            return 0.0, 0.0
+        tail = rows.sort_values("frame_id").tail(5)
+        vx = pd.to_numeric(tail["bottom_center_x"], errors="coerce").diff()
+        vy = pd.to_numeric(tail["bottom_center_y"], errors="coerce").diff()
+        dt = pd.to_numeric(tail["frame_id"], errors="coerce").diff()
+        valid = dt > 0
+        if not valid.any():
+            return 0.0, 0.0
+        return float((vx[valid] / dt[valid]).median()), float((vy[valid] / dt[valid]).median())
+
+    def _concurrent_duplicate_score(self, a: pd.DataFrame, b: pd.DataFrame) -> tuple[bool, float, dict]:
+        if a.empty or b.empty:
+            return False, 0.0, {}
+        if int(a["track_id"].iloc[0]) == int(b["track_id"].iloc[0]):
+            return False, 0.0, {}
+
+        aa = a.sort_values("frame_id").copy()
+        bb = b.sort_values("frame_id").copy()
+        common = sorted(set(aa["frame_id"].astype(int)) & set(bb["frame_id"].astype(int)))
+        if len(common) < self.concurrent_duplicate_min_overlap_frames:
+            return False, 0.0, {"reason": "insufficient_overlap_frames", "overlap_frames": len(common)}
+
+        amap = {int(r.frame_id): r for r in aa.itertuples(index=False)}
+        bmap = {int(r.frame_id): r for r in bb.itertuples(index=False)}
+        ious=[]; centers=[]
+        for f in common:
+            ra, rb = amap[f], bmap[f]
+            sa = pd.Series(ra._asdict())
+            sb = pd.Series(rb._asdict())
+            ious.append(self._bbox_iou(sa, sb))
+            centers.append(math.hypot(float(sa["bottom_center_x"])-float(sb["bottom_center_x"]), float(sa["bottom_center_y"])-float(sb["bottom_center_y"])))
+
+        mean_iou=float(sum(ious)/len(ious)); max_iou=float(max(ious)); mean_center=float(sum(centers)/len(centers))
+        shorter=min(len(aa),len(bb)); overlap_ratio=len(common)/max(shorter,1)
+        strong = [i >= self.concurrent_duplicate_min_mean_iou for i in ious]
+        max_run=run=0
+        for flag in strong:
+            run = run + 1 if flag else 0
+            max_run=max(max_run,run)
+        strong_count=sum(strong)
+        strong_ratio=strong_count/max(len(common),1)
+        # A duplicate tracker can diverge after the initial overlap. Do not
+        # require high IoU for the entire lifetime; require a short, contiguous
+        # burst of very strong overlap instead. This is exactly what catches the
+        # 288/321 hand-off (six consecutive near-identical boxes).
+        if overlap_ratio < self.concurrent_duplicate_min_overlap_ratio:
+            return False, 0.0, {"reason":"overlap_ratio_too_low", "overlap_ratio":overlap_ratio}
+        if max_iou < self.concurrent_duplicate_min_max_iou or max_run < self.concurrent_duplicate_min_overlap_frames:
+            return False, 0.0, {"reason":"insufficient_strong_overlap", "mean_iou":mean_iou, "max_iou":max_iou, "max_consecutive_strong_frames":max_run}
+        strong_centers=[c for c,i in zip(centers,ious) if i >= self.concurrent_duplicate_min_mean_iou]
+        strong_center=float(sum(strong_centers)/len(strong_centers)) if strong_centers else mean_center
+        if strong_center > self.concurrent_duplicate_max_center_distance_px:
+            return False, 0.0, {"reason":"center_distance_too_large", "mean_strong_center_distance_px":strong_center}
+
+        avx, avy = self._row_motion(aa); bvx, bvy = self._row_motion(bb)
+        an=math.hypot(avx,avy); bn=math.hypot(bvx,bvy)
+        cosine=1.0 if an < 1e-6 or bn < 1e-6 else (avx*bvx+avy*bvy)/(an*bn)
+        speed_ratio=max(an,bn)/max(min(an,bn),1e-6)
+        if an > 1.0 and bn > 1.0 and cosine < self.concurrent_duplicate_min_motion_cosine:
+            return False, 0.0, {"reason":"motion_direction_incompatible", "motion_cosine":cosine}
+        if an > 1.0 and bn > 1.0 and speed_ratio > self.concurrent_duplicate_max_motion_speed_ratio:
+            return False, 0.0, {"reason":"motion_speed_ratio_too_large", "speed_ratio":speed_ratio}
+
+        class_a=str(aa.get("track_class",pd.Series(["unknown"])).iloc[0]).lower()
+        class_b=str(bb.get("track_class",pd.Series(["unknown"])).iloc[0]).lower()
+        class_mismatch=class_a != class_b
+        if class_mismatch and not self.concurrent_duplicate_allow_class_mismatch:
+            return False, 0.0, {"reason":"class_mismatch"}
+
+        score=float(np.clip(0.35*max_iou + 0.25*min(1.0,strong_ratio) + 0.20*max(0.0,1.0-strong_center/max(self.concurrent_duplicate_max_center_distance_px,1e-6)) + 0.20*((cosine+1.0)/2.0),0.0,1.0))
+        return score >= 0.65, score, {
+            "reason":"concurrent_duplicate_track" if class_mismatch else "concurrent_duplicate_track_same_class",
+            "overlap_frames":len(common), "overlap_ratio":overlap_ratio,
+            "mean_iou":mean_iou, "max_iou":max_iou, "strong_overlap_frames":strong_count, "max_consecutive_strong_frames":max_run,
+            "mean_center_distance_px":mean_center, "mean_strong_center_distance_px":strong_center,
+            "motion_cosine":cosine, "speed_ratio":speed_ratio,
+            "class_a":class_a, "class_b":class_b,
+        }
+
+    def _resolve_identity_class(self, rows: pd.DataFrame, track_ids: list[int]) -> tuple[str,float,str,dict]:
+        if rows.empty:
+            return "unknown",0.0,"",{}
+        df=rows.copy()
+        df["class_name"]=df.get("class_name",df.get("track_class","unknown")).astype(str).str.lower().str.strip()
+        df["confidence"]=pd.to_numeric(df.get("confidence",1.0),errors="coerce").fillna(1.0).clip(0,1)
+        scores={}
+        source_weights={}
+        for tid,g in df.groupby("track_id",sort=False):
+            ratio=float(g.get("track_class_ratio",pd.Series([1.0])).iloc[0])
+            ambiguous=bool(g.get("class_ambiguous",pd.Series([False])).iloc[0])
+            reliability=max(0.25,min(1.0,ratio))
+            if ambiguous:
+                reliability*=self.identity_class_ambiguous_penalty
+            # A stable fragment is stronger evidence than an ambiguous fragment.
+            if ratio >= self.identity_class_stable_track_ratio and not ambiguous:
+                reliability*=self.identity_class_alias_bonus
+            weights=np.exp(-0.10*(float(g["frame_id"].max())-g["frame_id"].astype(float))) * g["confidence"] * reliability
+            by_class=weights.groupby(g["class_name"]).sum()
+            for cls,val in by_class.items():
+                scores[cls]=scores.get(cls,0.0)+float(val)
+                source_weights[(int(tid),str(cls))]=source_weights.get((int(tid),str(cls)),0.0)+float(val)
+        if not scores:
+            return "unknown",0.0,"",{}
+        ordered=sorted(scores.items(),key=lambda x:x[1],reverse=True)
+        top,top_score=ordered[0]; total=sum(scores.values()); conf=float(top_score/max(total,1e-9))
+        source_tid=max(track_ids,key=lambda tid: source_weights.get((int(tid),top),0.0)) if track_ids else -1
+        evidence=" | ".join(f"{k}:{v:.3f}" for k,v in ordered)
+        return str(top),conf,str(source_tid),{"scores":scores,"evidence":evidence}
+
+    def _merge_concurrent_aliases(self, trajectory, identities, track_to_identity):
+        if not self.concurrent_duplicate_enabled or len(identities) < 2:
+            trajectory = trajectory.copy()
+            trajectory["canonical_track_id"] = trajectory["track_id"].astype(int)
+            return trajectory, identities, track_to_identity, 0, 0
+
+        # ------------------------------------------------------------------
+        # Candidate pair discovery: only compare tracker IDs that are close
+        # together in the SAME FRAME. This replaces the previous all-track
+        # interval cross-product and keeps runtime bounded on long videos.
+        # ------------------------------------------------------------------
+        work = trajectory[[
+            "frame_id", "track_id", "bottom_center_x", "bottom_center_y"
+        ]].copy()
+        work["frame_id"] = pd.to_numeric(work["frame_id"], errors="coerce").astype("Int64")
+        work["track_id"] = pd.to_numeric(work["track_id"], errors="coerce").astype("Int64")
+        work = work.dropna(subset=["frame_id","track_id","bottom_center_x","bottom_center_y"])
+        work["track_id"] = work["track_id"].astype(int)
+        proximity_px = max(self.concurrent_duplicate_max_center_distance_px * 2.0, 50.0)
+        candidate_pairs=set()
+        for _, g in work.groupby("frame_id", sort=False):
+            if len(g) < 2: continue
+            arr=g.sort_values("bottom_center_x").to_numpy()
+            for i in range(len(arr)-1):
+                xi=float(arr[i,2]); yi=float(arr[i,3]); ti=int(arr[i,1])
+                j=i+1
+                while j<len(arr) and float(arr[j,2])-xi <= proximity_px:
+                    tj=int(arr[j,1])
+                    if ti != tj:
+                        d=math.hypot(float(arr[j,2])-xi,float(arr[j,3])-yi)
+                        if d <= proximity_px:
+                            candidate_pairs.add((min(ti,tj),max(ti,tj)))
+                    j+=1
+
+        by_track={int(tid):trajectory.loc[trajectory["track_id"].eq(tid)].sort_values("frame_id").copy()
+                  for tid in trajectory["track_id"].dropna().unique()}
+        identity_by_id={int(x.crossing_id):x for x in identities}
+        parent={tid:tid for tid in by_track}
+        rank={tid:0 for tid in parent}
+        edge_info=[]
+        def find(x):
+            while parent[x]!=x:
+                parent[x]=parent[parent[x]]; x=parent[x]
+            return x
+        def union(a,b):
+            ra,rb=find(a),find(b)
+            if ra==rb:return
+            if rank[ra]<rank[rb]: ra,rb=rb,ra
+            parent[rb]=ra
+            if rank[ra]==rank[rb]: rank[ra]+=1
+
+        for ta,tb in candidate_pairs:
+            if ta not in by_track or tb not in by_track: continue
+            ia=int(track_to_identity.get(ta,-1)); ib=int(track_to_identity.get(tb,-1))
+            if ia<0 or ib<0 or ia==ib: continue
+            a=by_track[ta]; b=by_track[tb]
+            overlap_start=max(int(a.frame_id.min()),int(b.frame_id.min()))
+            overlap_end=min(int(a.frame_id.max()),int(b.frame_id.max()))
+            if overlap_end-overlap_start+1 < self.concurrent_duplicate_min_overlap_frames: continue
+            ok,score,info=self._concurrent_duplicate_score(a,b)
+            if ok:
+                union(ta,tb); edge_info.append((ta,tb,score,info))
+
+        components={}
+        for tid in parent: components.setdefault(find(tid),[]).append(tid)
+        components=[sorted(v,key=lambda t:(int(by_track[t].frame_id.min()),t)) for v in components.values() if len(v)>1]
+
+        concurrent_aliases=0; merge_count=0
+        for tids in components:
+            idents=[]
+            for tid in tids:
+                iid=int(track_to_identity.get(tid,-1))
+                ident=identity_by_id.get(iid)
+                if ident is not None and ident.track_ids and ident not in idents:
+                    idents.append(ident)
+            if not idents: continue
+            primary=min(idents,key=lambda x:(x.first_frame if x.first_frame is not None else 10**12,x.crossing_id))
+            all_ids=list(dict.fromkeys(tids))
+            rows=trajectory[trajectory["track_id"].isin(all_ids)].copy()
+            cls,conf,source,_=self._resolve_identity_class(rows,all_ids)
+            primary.track_ids=all_ids; primary.canonical_track_id=int(all_ids[0])
+            primary.alias_track_ids=[int(t) for t in all_ids[1:]]
+            primary.identity_class=cls; primary.identity_class_confidence=conf; primary.identity_class_source=source
+            primary.vehicle_class=cls; primary.class_ratio=conf; primary.class_ambiguous=conf < self.identity_class_min_confidence
+            edges=[e for e in edge_info if e[0] in all_ids and e[1] in all_ids]
+            primary.concurrent_duplicate_resolved=True
+            primary.concurrent_duplicate_confidence=max([float(e[2]) for e in edges] or [0.0])
+            primary.concurrent_duplicate_reason="concurrent_duplicate_component"
+            crossing_idents=[x for x in idents if x.counted and x.crossing_frame is not None]
+            if crossing_idents:
+                chosen=min(crossing_idents,key=lambda x:x.crossing_frame)
+                primary.counted=True; primary.state=chosen.state; primary.crossing_frame=chosen.crossing_frame
+                primary.crossing_time_sec=chosen.crossing_time_sec; primary.crossing_x=chosen.crossing_x; primary.crossing_y=chosen.crossing_y
+                primary.crossing_track_id=chosen.crossing_track_id; primary.crossing_line_distance_px=chosen.crossing_line_distance_px
+                primary.crossing_previous_side=chosen.crossing_previous_side; primary.crossing_frame_gap=chosen.crossing_frame_gap; primary.direction=chosen.direction
+            for ident in idents:
+                for tid in ident.track_ids: track_to_identity[int(tid)]=primary.crossing_id
+                if ident is not primary:
+                    ident.track_ids=[]; ident.counted=False; ident.state=CrossingState.REVIEW
+            concurrent_aliases += len(all_ids)-1; merge_count += 1
+
+        identities=[x for x in identities if x.track_ids]
+        identity_by_id={int(x.crossing_id):x for x in identities}
+        canonical_map={}
+        for ident in identities:
+            if ident.canonical_track_id is None and ident.track_ids: ident.canonical_track_id=int(ident.track_ids[0])
+            for tid in ident.track_ids: canonical_map[int(tid)]=int(ident.canonical_track_id)
+        trajectory["canonical_track_id"]=trajectory["track_id"].map(canonical_map).fillna(trajectory["track_id"]).astype(int)
+        trajectory["crossing_id"]=trajectory["track_id"].map(track_to_identity)
+        for ident in identities:
+            rows=trajectory[trajectory["track_id"].isin(ident.track_ids)]
+            cls,conf,source,_=self._resolve_identity_class(rows,ident.track_ids)
+            ident.identity_class=cls; ident.identity_class_confidence=conf; ident.identity_class_source=source
+            ident.vehicle_class=cls; ident.class_ratio=conf; ident.class_ambiguous=conf < self.identity_class_min_confidence
+        trajectory["identity_class"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class if pd.notna(v) and int(v) in identity_by_id else "unknown")
+        trajectory["identity_class_confidence"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_confidence if pd.notna(v) and int(v) in identity_by_id else 0.0).astype(float)
+        trajectory["identity_class_source"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_source if pd.notna(v) and int(v) in identity_by_id else "")
+        trajectory["alias_track_ids"]=trajectory["crossing_id"].map(lambda v: ",".join(map(str,identity_by_id.get(int(v)).alias_track_ids)) if pd.notna(v) and int(v) in identity_by_id else "")
+        trajectory["concurrent_duplicate_resolved"]=trajectory["crossing_id"].map(lambda v: bool(identity_by_id.get(int(v)).concurrent_duplicate_resolved) if pd.notna(v) and int(v) in identity_by_id else False)
+        trajectory["concurrent_duplicate_confidence"]=trajectory["crossing_id"].map(lambda v: float(identity_by_id.get(int(v)).concurrent_duplicate_confidence) if pd.notna(v) and int(v) in identity_by_id else 0.0).astype(float)
+        trajectory["concurrent_duplicate_reason"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).concurrent_duplicate_reason if pd.notna(v) and int(v) in identity_by_id else "")
+        return trajectory, identities, track_to_identity, concurrent_aliases, merge_count
+
+    # =========================================================
+    # MAIN
+    # =========================================================
 
     def run(
         self,
         tracks_phase2: pd.DataFrame,
     ) -> tuple[
         pd.DataFrame,
-        dict[int, CrossingIdentity],
-        dict[int, int],
+        pd.DataFrame,
         dict[str, int],
     ]:
 
@@ -763,28 +1510,45 @@ class CrossingIdentityEngine:
             trajectory
         )
 
-        identities: list[CrossingIdentity] = []
+        identities: list[
+            CrossingIdentity
+        ] = []
 
-        track_to_identity: dict[int, int] = {}
+        track_to_identity: dict[
+            int,
+            int,
+        ] = {}
 
         reconnection_count = 0
+
+        # -----------------------------------------------------
+        # Fragment → crossing identity
+        # -----------------------------------------------------
 
         for fragment in fragments:
 
             candidates: list[
-                tuple[float, CrossingIdentity, str]
+                tuple[
+                    float,
+                    CrossingIdentity,
+                ]
             ] = []
 
             for identity in identities:
 
-                score, reason = self._candidate_score(
-                    identity,
-                    fragment,
+                score = (
+                    self._candidate_score(
+                        identity,
+                        fragment,
+                    )
                 )
 
                 if score >= 0:
                     candidates.append(
-                        (score, identity, reason)
+                        (
+                            score,
+                            identity,
+                        )
                     )
 
             candidates.sort(
@@ -796,7 +1560,8 @@ class CrossingIdentityEngine:
 
             if candidates:
 
-                best_score, best_identity, best_reason = candidates[0]
+                best_score = candidates[0][0]
+                best_identity = candidates[0][1]
 
                 second_score = (
                     candidates[1][0]
@@ -804,34 +1569,40 @@ class CrossingIdentityEngine:
                     else -1.0
                 )
 
-                margin_ok = (
+                sufficient_margin = (
                     second_score < 0
-                    or
-                    (
+                    or (
                         best_score
-                        -
-                        second_score
-                        >=
-                        self.identity_match_margin
+                        - second_score
+                        >= self.identity_match_margin
                     )
                 )
 
-                # Conservative identity merge.
                 if (
-                    best_score >= self.identity_match_threshold
-                    and margin_ok
+                    best_score
+                    >= self.identity_match_threshold
+                    and sufficient_margin
                 ):
-                    assigned_identity = best_identity
-                    assigned_identity.last_match_score = float(best_score)
-                    assigned_identity.last_match_reason = str(best_reason)
-                elif best_score >= self.identity_match_threshold and not margin_ok:
-                    self._audit_counters["ambiguous_identity_matches"] += 1
 
-            if assigned_identity is None:
+                    assigned_identity = (
+                        best_identity
+                    )
+
+            # -------------------------------------------------
+            # New crossing identity
+            # -------------------------------------------------
+
+            if (
+                assigned_identity
+                is None
+            ):
 
                 assigned_identity = (
                     self._create_identity(
-                        crossing_id=len(identities) + 1,
+                        crossing_id=(
+                            len(identities)
+                            + 1
+                        ),
                         fragment=fragment,
                     )
                 )
@@ -840,12 +1611,22 @@ class CrossingIdentityEngine:
                     assigned_identity
                 )
 
+            # -------------------------------------------------
+            # Reconnected fragment
+            # -------------------------------------------------
+
             else:
 
-                if fragment.track_id not in assigned_identity.track_ids:
-                    assigned_identity.track_ids.append(fragment.track_id)
-                assigned_identity.reconnect_count += 1
-                reconnection_count += 1
+                if (
+                    fragment.track_id
+                    not in assigned_identity.track_ids
+                ):
+
+                    assigned_identity.track_ids.append(
+                        fragment.track_id
+                    )
+
+                    reconnection_count += 1
 
                 self._update_identity_meta(
                     assigned_identity,
@@ -854,18 +1635,45 @@ class CrossingIdentityEngine:
 
             track_to_identity[
                 fragment.track_id
-            ] = assigned_identity.crossing_id
+            ] = (
+                assigned_identity.crossing_id
+            )
 
-        # ------------------------------------------------------
-        # Identity metadata maps.
-        # ------------------------------------------------------
+            # -------------------------------------------------
+            # Replay observations
+            # -------------------------------------------------
 
-        identity_map = {
-            identity.crossing_id: identity
-            for identity in identities
-        }
+            previous_frame = None
 
-        trajectory = trajectory.copy()
+            for _, row in (
+                fragment.rows
+                .sort_values("frame_id")
+                .iterrows()
+            ):
+
+                self._process_observation(
+                    assigned_identity,
+                    row,
+                    previous_frame,
+                )
+
+                previous_frame = int(
+                    row["frame_id"]
+                )
+
+        # -----------------------------------------------------
+        # Resolve concurrently-overlapping duplicate tracker IDs.
+        # This happens BEFORE candidate generation so aliases become one
+        # canonical trajectory while independent simultaneous vehicles stay
+        # independent.
+        # -----------------------------------------------------
+        trajectory, identities, track_to_identity, concurrent_aliases, concurrent_merges = (
+            self._merge_concurrent_aliases(trajectory, identities, track_to_identity)
+        )
+
+        # -----------------------------------------------------
+        # Attach crossing ID to each observation.
+        # -----------------------------------------------------
 
         trajectory[
             "crossing_id"
@@ -874,31 +1682,205 @@ class CrossingIdentityEngine:
             .map(track_to_identity)
         )
 
-        # Useful aliases for downstream code.
+        # -----------------------------------------------------
+        # Identity-level state
+        # -----------------------------------------------------
+
+        identity_state_map = {
+            identity.crossing_id:
+                identity.state.value
+            for identity in identities
+        }
+
         trajectory[
-            "raw_track_id"
-        ] = trajectory["track_id"]
+            "crossing_state"
+        ] = (
+            trajectory["crossing_id"]
+            .map(identity_state_map)
+        )
+
+        # -----------------------------------------------------
+        # Build crossing events
+        # -----------------------------------------------------
+
+        crossing_rows = []
+
+        for identity in identities:
+
+            if not identity.counted:
+                continue
+
+            crossing_rows.append(
+            {
+                "crossing_id": (
+                    identity.crossing_id
+                ),
+        
+                "track_id": (
+                    identity.crossing_track_id
+                ),
+        
+                "track_ids": ",".join(
+                    map(
+                        str,
+                        identity.track_ids,
+                    )
+                ),
+        
+                # ----------------------------------------------
+                # Fields required by ConfidenceEngine
+                # ----------------------------------------------
+        
+                "frame_gap": (
+                    identity.crossing_frame_gap
+                ),
+        
+                "line_distance_px": (
+                    identity.crossing_line_distance_px
+                ),
+        
+                "previous_side": (
+                    identity.crossing_previous_side
+                ),
+        
+                "crossing_frame": (
+                    identity.crossing_frame
+                ),
+        
+                "crossing_time_sec": (
+                    identity.crossing_time_sec
+                ),
+        
+                "crossing_x": (
+                    identity.crossing_x
+                ),
+        
+                "crossing_y": (
+                    identity.crossing_y
+                ),
+        
+                "direction": (
+                    identity.direction
+                ),
+        
+                "track_class": (
+                    identity.vehicle_class
+                ),
+                "detector_track_class": str(identity.vehicle_class),
+                "identity_class": identity.identity_class,
+                "identity_class_confidence": identity.identity_class_confidence,
+                "identity_class_source": identity.identity_class_source,
+                "alias_track_ids": ",".join(map(str, identity.alias_track_ids)),
+                "concurrent_duplicate_resolved": identity.concurrent_duplicate_resolved,
+                "concurrent_duplicate_confidence": identity.concurrent_duplicate_confidence,
+                "concurrent_duplicate_reason": identity.concurrent_duplicate_reason,
+        
+                "track_class_ratio": (
+                    identity.class_ratio
+                ),
+        
+                "class_ambiguous": (
+                    identity.class_ambiguous
+                ),
+        
+                "state": (
+                    identity.state.value
+                ),
+        
+                "num_track_fragments": (
+                    len(
+                        identity.track_ids
+                    )
+                ),
+            }
+        )
+
+        crossing_events = pd.DataFrame(
+            crossing_rows
+        )
+
+        if crossing_events.empty:
+
+            crossing_events = pd.DataFrame(
+                columns=[
+                    "crossing_id",
+                    "track_id",
+                    "track_ids",
+        
+                    "frame_gap",
+                    "line_distance_px",
+                    "previous_side",
+        
+                    "crossing_frame",
+                    "crossing_time_sec",
+                    "crossing_x",
+                    "crossing_y",
+                    "direction",
+                    "track_class",
+                    "track_class_ratio",
+                    "class_ambiguous",
+                    "state",
+                    "num_track_fragments",
+                ]
+            )
+
+        # -----------------------------------------------------
+        # Audit
+        # -----------------------------------------------------
+
+        audit = {
+            "unique_track_ids": int(
+                trajectory["track_id"]
+                .nunique()
+            ),
+
+            "crossing_identities": int(
+                len(identities)
+            ),
+
+            "track_reconnections": int(
+                reconnection_count
+            ),
+
+            "fragmented_identities": int(
+                sum(
+                    len(
+                        identity.track_ids
+                    ) > 1
+                    for identity
+                    in identities
+                )
+            ),
+
+            "counted_crossing_identities": int(
+                sum(
+                    identity.counted
+                    for identity
+                    in identities
+                )
+            ),
+
+            "not_crossed_identities": int(
+                sum(
+                    not identity.counted
+                    for identity
+                    in identities
+                )
+            ),
+
+            "concurrent_duplicate_track_aliases": int(concurrent_aliases),
+            "concurrent_duplicate_identity_merges": int(concurrent_merges),
+            "identity_class_conflict_identities": int(sum(identity.class_ambiguous for identity in identities)),
+        }
+
+        identity_map = {
+            int(identity.crossing_id): identity
+            for identity in identities
+        }
 
         return (
             trajectory,
             identity_map,
             track_to_identity,
-            {
-                "unique_track_ids": int(
-                    trajectory["track_id"].nunique()
-                ),
-                "crossing_identities": int(
-                    len(identities)
-                ),
-                "track_reconnections": int(
-                    reconnection_count
-                ),
-                "fragmented_identities": int(
-                    sum(
-                        len(identity.track_ids) > 1
-                        for identity in identities
-                    )
-                ),
-                **{k: int(v) for k, v in self._audit_counters.items()},
-            },
+            audit,
         )

@@ -197,18 +197,6 @@ class TrafficCountingEngine:
             "min_pre_crossing_observations": (
                 self._counting_value("min_pre_crossing_observations", 2)
             ),
-            "identity_same_side_near_line_block": (
-                self._counting_value("identity_same_side_near_line_block", True)
-            ),
-            "identity_prediction_gate_max_px": (
-                self._counting_value("identity_prediction_gate_max_px", 220.0)
-            ),
-            "identity_min_velocity_cosine": (
-                self._counting_value("identity_min_velocity_cosine", 0.35)
-            ),
-            "identity_min_normal_velocity_px_per_frame": (
-                self._counting_value("identity_min_normal_velocity_px_per_frame", 1.0)
-            ),
 
             # Robust crossing geometry.
             "crossing_corridor_px": (
@@ -280,38 +268,47 @@ class TrafficCountingEngine:
             "candidate_duplicate_require_non_overlapping_tracks": (
                 self._counting_value("candidate_duplicate_require_non_overlapping_tracks", True)
             ),
-            "multi_crossing_max_candidates_per_track": (
-                self._counting_value("multi_crossing_max_candidates_per_track", 32)
-            ),
-            "multi_crossing_min_separation_frames": (
-                self._counting_value("multi_crossing_min_separation_frames", 2)
-            ),
 
-            # Phase 3 state machine.
-            "state_min_confirmed_observations": (
-                self._counting_value("state_min_confirmed_observations", 2)
+            # Concurrent duplicate tracker resolver / physical class resolver.
+            "concurrent_duplicate_enabled": (
+                self._counting_value("concurrent_duplicate_enabled", True)
             ),
-            "state_min_direction_confidence": (
-                self._counting_value("state_min_direction_confidence", 0.45)
+            "concurrent_duplicate_min_overlap_frames": (
+                self._counting_value("concurrent_duplicate_min_overlap_frames", 3)
             ),
-            "state_count_threshold": (
-                self._counting_value("state_count_threshold", 0.62)
+            "concurrent_duplicate_min_overlap_ratio": (
+                self._counting_value("concurrent_duplicate_min_overlap_ratio", 0.50)
             ),
-            "state_review_threshold": (
-                self._counting_value("state_review_threshold", 0.45)
+            "concurrent_duplicate_min_mean_iou": (
+                self._counting_value("concurrent_duplicate_min_mean_iou", 0.65)
             ),
-            "state_weight_geometry": self._counting_value("state_weight_geometry", 0.32),
-            "state_weight_direction": self._counting_value("state_weight_direction", 0.16),
-            "state_weight_continuity": self._counting_value("state_weight_continuity", 0.14),
-            "state_weight_class": self._counting_value("state_weight_class", 0.12),
-            "state_weight_pre": self._counting_value("state_weight_pre", 0.08),
-            "state_weight_corridor": self._counting_value("state_weight_corridor", 0.05),
-            "state_weight_post": self._counting_value("state_weight_post", 0.07),
-            "state_weight_fast_sparse": self._counting_value("state_weight_fast_sparse", 0.06),
-            "state_fast_crossing_floor": self._counting_value("state_fast_crossing_floor", 0.55),
-            "state_short_crossing_floor": self._counting_value("state_short_crossing_floor", 0.52),
-            "state_person_count_threshold": self._counting_value("state_person_count_threshold", 0.55),
-            "state_person_review_threshold": self._counting_value("state_person_review_threshold", 0.42),
+            "concurrent_duplicate_min_max_iou": (
+                self._counting_value("concurrent_duplicate_min_max_iou", 0.80)
+            ),
+            "concurrent_duplicate_max_center_distance_px": (
+                self._counting_value("concurrent_duplicate_max_center_distance_px", 25.0)
+            ),
+            "concurrent_duplicate_min_motion_cosine": (
+                self._counting_value("concurrent_duplicate_min_motion_cosine", 0.80)
+            ),
+            "concurrent_duplicate_max_motion_speed_ratio": (
+                self._counting_value("concurrent_duplicate_max_motion_speed_ratio", 2.50)
+            ),
+            "concurrent_duplicate_allow_class_mismatch": (
+                self._counting_value("concurrent_duplicate_allow_class_mismatch", True)
+            ),
+            "identity_class_min_confidence": (
+                self._counting_value("identity_class_min_confidence", 0.45)
+            ),
+            "identity_class_stable_track_ratio": (
+                self._counting_value("identity_class_stable_track_ratio", 0.70)
+            ),
+            "identity_class_ambiguous_penalty": (
+                self._counting_value("identity_class_ambiguous_penalty", 0.55)
+            ),
+            "identity_class_alias_bonus": (
+                self._counting_value("identity_class_alias_bonus", 1.20)
+            ),
         }
 
         signature = inspect.signature(
@@ -367,12 +364,6 @@ class TrafficCountingEngine:
             "crossing_corridor_px",
             "min_direction_displacement_px",
             "direction_window",
-            "identity_same_side_near_line_block",
-            "identity_prediction_gate_max_px",
-            "identity_min_velocity_cosine",
-            "identity_min_normal_velocity_px_per_frame",
-            "multi_crossing_max_candidates_per_track",
-            "multi_crossing_min_separation_frames",
         }
 
         missing_robust = (
