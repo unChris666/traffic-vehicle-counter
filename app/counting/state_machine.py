@@ -48,6 +48,22 @@ class StateMachineConfig:
 
     min_vehicle_class_confidence: float = 0.45
 
+    # Backward-compatible person gates. These are kept because counter.py
+    # passes them from the existing CountingConfig. Person tracks are never
+    # eligible for vehicle COUNTED decisions, but the thresholds remain part
+    # of the public StateMachineConfig contract.
+    person_count_threshold: float = 0.55
+    person_review_threshold: float = 0.42
+
+    # Backward-compatible evidence controls used by earlier Phase 3 wiring.
+    weight_fast_sparse: float = 0.06
+    fast_crossing_floor: float = 0.55
+    short_crossing_floor: float = 0.52
+
+    # Keep the vehicle class set in the state-machine config for compatibility
+    # with the counter wiring.
+    vehicle_classes: tuple[str, ...] = tuple(sorted(VEHICLE_CLASSES))
+
     # Phase 3.1 class arbitration gates.
     identity_class_confidence_floor: float = 0.65
     identity_class_margin_floor: float = 0.15
