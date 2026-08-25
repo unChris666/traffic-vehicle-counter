@@ -7,7 +7,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class DetectionConfig:
     # Production model: TensorRT FP16 engine exported from YOLO26m at imgsz=512.
-    model_name: str = "models/yolo26m_512_fp16.engine"
+    model_name: str = "models/yolo26m.pt"
     tracker: str = "botsort.yaml"
 
     # Smaller inference size for speed.
