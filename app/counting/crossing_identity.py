@@ -119,6 +119,15 @@ class CrossingIdentity:
     concurrent_duplicate_confidence: float = 0.0
     concurrent_duplicate_reason: str = ""
 
+    # Phase 3.1 — class identity arbitration
+    identity_class_margin: float = 0.0
+    identity_class_ambiguous: bool = False
+    identity_class_evidence: str = ""
+    identity_class_pre_score: float = 0.0
+    identity_class_crossing_score: float = 0.0
+    identity_class_post_score: float = 0.0
+    identity_class_stable_score: float = 0.0
+
 class CrossingIdentityEngine:
     """
     Phase 1:
@@ -181,6 +190,14 @@ class CrossingIdentityEngine:
         identity_class_stable_track_ratio: float = 0.70,
         identity_class_ambiguous_penalty: float = 0.55,
         identity_class_alias_bonus: float = 1.20,
+        # Phase 3.1 class arbitration
+        identity_class_pre_weight: float = 1.00,
+        identity_class_crossing_weight: float = 0.55,
+        identity_class_post_weight: float = 0.80,
+        identity_class_confidence_floor: float = 0.65,
+        identity_class_margin_floor: float = 0.15,
+        identity_class_min_evidence_frames: int = 2,
+        identity_class_ambiguous_confidence: float = 0.65,
     ) -> None:
 
         if fps <= 0:
@@ -269,6 +286,13 @@ class CrossingIdentityEngine:
         self.identity_class_stable_track_ratio = float(identity_class_stable_track_ratio)
         self.identity_class_ambiguous_penalty = float(identity_class_ambiguous_penalty)
         self.identity_class_alias_bonus = float(identity_class_alias_bonus)
+        self.identity_class_pre_weight = float(identity_class_pre_weight)
+        self.identity_class_crossing_weight = float(identity_class_crossing_weight)
+        self.identity_class_post_weight = float(identity_class_post_weight)
+        self.identity_class_confidence_floor = float(identity_class_confidence_floor)
+        self.identity_class_margin_floor = float(identity_class_margin_floor)
+        self.identity_class_min_evidence_frames = max(1, int(identity_class_min_evidence_frames))
+        self.identity_class_ambiguous_confidence = float(identity_class_ambiguous_confidence)
 
     # =========================================================
     # GEOMETRY
@@ -742,16 +766,19 @@ class CrossingIdentityEngine:
             return -1.0
 
         # -----------------------------------------------------
-        # Class gate
+        # Class compatibility
+        #
+        # Phase 3.1: class mismatch is NOT a hard identity rejection.
+        # Detector class may flip during occlusion / motion blur. It is
+        # therefore a soft penalty only.
         # -----------------------------------------------------
 
-        if (
-            identity.vehicle_class
-            != "unknown"
-            and fragment.class_name
-            != identity.vehicle_class
-        ):
-            return -1.0
+        if identity.vehicle_class == "unknown":
+            class_compatibility = 0.75
+        elif fragment.class_name == identity.vehicle_class:
+            class_compatibility = 1.0
+        else:
+            class_compatibility = 0.55
 
         # -----------------------------------------------------
         # Spatial score
@@ -876,13 +903,15 @@ class CrossingIdentityEngine:
         # -----------------------------------------------------
 
         score = (
-            0.45 * spatial_score
+            0.40 * spatial_score
             +
-            0.20 * temporal_score
+            0.18 * temporal_score
             +
             0.20 * velocity_score
             +
-            0.15 * side_score
+            0.14 * side_score
+            +
+            0.08 * class_compatibility
         )
 
         return float(score)
@@ -1336,35 +1365,254 @@ class CrossingIdentityEngine:
             "class_a":class_a, "class_b":class_b,
         }
 
-    def _resolve_identity_class(self, rows: pd.DataFrame, track_ids: list[int]) -> tuple[str,float,str,dict]:
+    def _resolve_identity_class(
+        self,
+        rows: pd.DataFrame,
+        track_ids: list[int],
+        crossing_frame: int | None = None,
+    ) -> tuple[str, float, str, dict]:
+        """
+        Phase 3.1 — physical class arbitration.
+
+        Class is resolved at PHYSICAL-IDENTITY level, not raw-track level.
+
+        Evidence priority:
+            stable fragment reliability
+            × detector confidence
+            × temporal persistence
+            × phase weight
+
+        Phase weights:
+            PRE      = strongest
+            CROSSING = medium
+            POST     = medium-high
+
+        A short-lived class flip around the counting line therefore cannot
+        automatically replace a stable class observed before the crossing.
+
+        Returns:
+            class_name,
+            confidence,
+            source_track_id,
+            diagnostics
+        """
         if rows.empty:
-            return "unknown",0.0,"",{}
-        df=rows.copy()
-        df["class_name"]=df.get("class_name",df.get("track_class","unknown")).astype(str).str.lower().str.strip()
-        df["confidence"]=pd.to_numeric(df.get("confidence",1.0),errors="coerce").fillna(1.0).clip(0,1)
-        scores={}
-        source_weights={}
-        for tid,g in df.groupby("track_id",sort=False):
-            ratio=float(g.get("track_class_ratio",pd.Series([1.0])).iloc[0])
-            ambiguous=bool(g.get("class_ambiguous",pd.Series([False])).iloc[0])
-            reliability=max(0.25,min(1.0,ratio))
+            return "unknown", 0.0, "", {}
+
+        df = rows.copy()
+
+        def _series(name, default):
+            if name in df.columns:
+                return df[name]
+            return pd.Series(default, index=df.index)
+
+        df["class_name"] = (
+            _series("class_name", _series("track_class", "unknown"))
+            .astype(str).str.lower().str.strip()
+        )
+        df["confidence"] = pd.to_numeric(
+            _series("confidence", 1.0), errors="coerce"
+        ).fillna(1.0).clip(0.0, 1.0)
+        df["frame_id"] = pd.to_numeric(
+            _series("frame_id", 0), errors="coerce"
+        ).fillna(0).astype(int)
+        df["track_id"] = pd.to_numeric(
+            _series("track_id", -1), errors="coerce"
+        ).fillna(-1).astype(int)
+
+        # Resolve the crossing frame from the physical identity when possible.
+        if crossing_frame is None:
+            crossing_candidates = []
+            if "crossing_frame" in df.columns:
+                crossing_candidates = pd.to_numeric(
+                    df["crossing_frame"], errors="coerce"
+                ).dropna().astype(int).tolist()
+            crossing_frame = crossing_candidates[0] if crossing_candidates else None
+
+        frame_min = int(df["frame_id"].min())
+        frame_max = int(df["frame_id"].max())
+
+        def phase_weight(frame: int) -> tuple[float, str]:
+            if crossing_frame is None:
+                # No event yet: all observations are pre-event evidence.
+                return self.identity_class_pre_weight, "pre"
+
+            distance = frame - int(crossing_frame)
+            # Keep a small crossing neighborhood so a single noisy frame does
+            # not dominate the class decision.
+            if distance <= -1:
+                return self.identity_class_pre_weight, "pre"
+            if abs(distance) <= 1:
+                return self.identity_class_crossing_weight, "crossing"
+            return self.identity_class_post_weight, "post"
+
+        scores: dict[str, float] = {}
+        phase_scores = {"pre": 0.0, "crossing": 0.0, "post": 0.0}
+        source_scores: dict[tuple[int, str], float] = {}
+        stable_track_scores: dict[tuple[int, str], float] = {}
+
+        # Fragment-level reliability prevents an ambiguous raw track from
+        # overpowering a stable alias fragment.
+        fragment_meta = {}
+        for tid, g in df.groupby("track_id", sort=False):
+            ratio = float(
+                pd.to_numeric(
+                    g.get("track_class_ratio", pd.Series([1.0])),
+                    errors="coerce",
+                ).iloc[0]
+            )
+            ambiguous = bool(
+                g.get("class_ambiguous", pd.Series([False])).iloc[0]
+            )
+            reliability = float(np.clip(ratio, 0.25, 1.0))
             if ambiguous:
-                reliability*=self.identity_class_ambiguous_penalty
-            # A stable fragment is stronger evidence than an ambiguous fragment.
-            if ratio >= self.identity_class_stable_track_ratio and not ambiguous:
-                reliability*=self.identity_class_alias_bonus
-            weights=np.exp(-0.10*(float(g["frame_id"].max())-g["frame_id"].astype(float))) * g["confidence"] * reliability
-            by_class=weights.groupby(g["class_name"]).sum()
-            for cls,val in by_class.items():
-                scores[cls]=scores.get(cls,0.0)+float(val)
-                source_weights[(int(tid),str(cls))]=source_weights.get((int(tid),str(cls)),0.0)+float(val)
+                reliability *= self.identity_class_ambiguous_penalty
+            if (
+                ratio >= self.identity_class_stable_track_ratio
+                and not ambiguous
+            ):
+                reliability *= self.identity_class_alias_bonus
+            fragment_meta[int(tid)] = {
+                "ratio": ratio,
+                "ambiguous": ambiguous,
+                "reliability": reliability,
+                "observations": int(len(g)),
+            }
+
+        # Temporal weighting is deliberately mild. We want persistence, not
+        # "last frame wins".
+        for _, row in df.iterrows():
+            cls = str(row["class_name"])
+            if cls in {"", "nan", "none", "unknown"}:
+                continue
+
+            frame = int(row["frame_id"])
+            tid = int(row["track_id"])
+            phase_w, phase = phase_weight(frame)
+
+            age = max(0, frame_max - frame)
+            temporal_w = math.exp(-0.035 * age)
+
+            meta = fragment_meta.get(
+                tid,
+                {
+                    "reliability": 1.0,
+                    "ratio": 1.0,
+                    "ambiguous": False,
+                    "observations": 1,
+                },
+            )
+
+            # A fragment with enough observations is itself evidence of class
+            # persistence. Single-frame class flips remain weak.
+            persistence_w = min(
+                1.0,
+                max(
+                    0.35,
+                    meta["observations"]
+                    / max(self.identity_class_min_evidence_frames, 1),
+                ),
+            )
+
+            weight = (
+                float(row["confidence"])
+                * float(meta["reliability"])
+                * temporal_w
+                * persistence_w
+                * phase_w
+            )
+
+            scores[cls] = scores.get(cls, 0.0) + weight
+            phase_scores[phase] += weight
+            source_scores[(tid, cls)] = (
+                source_scores.get((tid, cls), 0.0) + weight
+            )
+
         if not scores:
-            return "unknown",0.0,"",{}
-        ordered=sorted(scores.items(),key=lambda x:x[1],reverse=True)
-        top,top_score=ordered[0]; total=sum(scores.values()); conf=float(top_score/max(total,1e-9))
-        source_tid=max(track_ids,key=lambda tid: source_weights.get((int(tid),top),0.0)) if track_ids else -1
-        evidence=" | ".join(f"{k}:{v:.3f}" for k,v in ordered)
-        return str(top),conf,str(source_tid),{"scores":scores,"evidence":evidence}
+            return "unknown", 0.0, "", {
+                "scores": {},
+                "margin": 0.0,
+                "pre_score": 0.0,
+                "crossing_score": 0.0,
+                "post_score": 0.0,
+                "stable_score": 0.0,
+                "ambiguous": True,
+                "evidence": "",
+            }
+
+        ordered = sorted(
+            scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        top_cls, top_score = ordered[0]
+        second_score = ordered[1][1] if len(ordered) > 1 else 0.0
+        total = sum(scores.values())
+
+        confidence = float(top_score / max(total, 1e-9))
+        margin = float(
+            (top_score - second_score)
+            / max(top_score, 1e-9)
+        )
+
+        # Stable-source score: how much of the winning class comes from
+        # non-ambiguous fragments with strong track-level class ratio.
+        stable_score = 0.0
+        for (tid, cls), value in source_scores.items():
+            if cls != top_cls:
+                continue
+            meta = fragment_meta.get(tid, {})
+            if (
+                not meta.get("ambiguous", False)
+                and meta.get("ratio", 0.0)
+                >= self.identity_class_stable_track_ratio
+            ):
+                stable_score += value
+
+        stable_fraction = float(
+            stable_score / max(top_score, 1e-9)
+        )
+
+        ambiguous = bool(
+            confidence < self.identity_class_ambiguous_confidence
+            or margin < self.identity_class_margin_floor
+            or (
+                confidence < self.identity_class_confidence_floor
+                and stable_fraction < 0.50
+            )
+        )
+
+        source_tid = max(
+            track_ids,
+            key=lambda tid: source_scores.get(
+                (int(tid), top_cls),
+                0.0,
+            ),
+        ) if track_ids else -1
+
+        evidence = " | ".join(
+            f"{cls}:{score:.3f}"
+            for cls, score in ordered
+        )
+
+        diagnostics = {
+            "scores": scores,
+            "margin": margin,
+            "pre_score": phase_scores["pre"],
+            "crossing_score": phase_scores["crossing"],
+            "post_score": phase_scores["post"],
+            "stable_score": stable_fraction,
+            "ambiguous": ambiguous,
+            "evidence": evidence,
+        }
+
+        return (
+            str(top_cls),
+            confidence,
+            str(source_tid),
+            diagnostics,
+        )
 
     def _merge_concurrent_aliases(self, trajectory, identities, track_to_identity):
         if not self.concurrent_duplicate_enabled or len(identities) < 2:
@@ -1445,11 +1693,18 @@ class CrossingIdentityEngine:
             primary=min(idents,key=lambda x:(x.first_frame if x.first_frame is not None else 10**12,x.crossing_id))
             all_ids=list(dict.fromkeys(tids))
             rows=trajectory[trajectory["track_id"].isin(all_ids)].copy()
-            cls,conf,source,_=self._resolve_identity_class(rows,all_ids)
+            cls,conf,source,diag=self._resolve_identity_class(rows,all_ids, primary.crossing_frame)
             primary.track_ids=all_ids; primary.canonical_track_id=int(all_ids[0])
             primary.alias_track_ids=[int(t) for t in all_ids[1:]]
             primary.identity_class=cls; primary.identity_class_confidence=conf; primary.identity_class_source=source
-            primary.vehicle_class=cls; primary.class_ratio=conf; primary.class_ambiguous=conf < self.identity_class_min_confidence
+            primary.identity_class_margin=float(diag.get("margin", 0.0))
+            primary.identity_class_ambiguous=bool(diag.get("ambiguous", False))
+            primary.identity_class_evidence=str(diag.get("evidence", ""))
+            primary.identity_class_pre_score=float(diag.get("pre_score", 0.0))
+            primary.identity_class_crossing_score=float(diag.get("crossing_score", 0.0))
+            primary.identity_class_post_score=float(diag.get("post_score", 0.0))
+            primary.identity_class_stable_score=float(diag.get("stable_score", 0.0))
+            primary.vehicle_class=cls; primary.class_ratio=conf; primary.class_ambiguous=primary.identity_class_ambiguous
             edges=[e for e in edge_info if e[0] in all_ids and e[1] in all_ids]
             primary.concurrent_duplicate_resolved=True
             primary.concurrent_duplicate_confidence=max([float(e[2]) for e in edges] or [0.0])
@@ -1477,11 +1732,25 @@ class CrossingIdentityEngine:
         trajectory["crossing_id"]=trajectory["track_id"].map(track_to_identity)
         for ident in identities:
             rows=trajectory[trajectory["track_id"].isin(ident.track_ids)]
-            cls,conf,source,_=self._resolve_identity_class(rows,ident.track_ids)
+            cls,conf,source,diag=self._resolve_identity_class(rows,ident.track_ids, ident.crossing_frame)
             ident.identity_class=cls; ident.identity_class_confidence=conf; ident.identity_class_source=source
-            ident.vehicle_class=cls; ident.class_ratio=conf; ident.class_ambiguous=conf < self.identity_class_min_confidence
+            ident.identity_class_margin=float(diag.get("margin", 0.0))
+            ident.identity_class_ambiguous=bool(diag.get("ambiguous", False))
+            ident.identity_class_evidence=str(diag.get("evidence", ""))
+            ident.identity_class_pre_score=float(diag.get("pre_score", 0.0))
+            ident.identity_class_crossing_score=float(diag.get("crossing_score", 0.0))
+            ident.identity_class_post_score=float(diag.get("post_score", 0.0))
+            ident.identity_class_stable_score=float(diag.get("stable_score", 0.0))
+            ident.vehicle_class=cls; ident.class_ratio=conf; ident.class_ambiguous=ident.identity_class_ambiguous
         trajectory["identity_class"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class if pd.notna(v) and int(v) in identity_by_id else "unknown")
         trajectory["identity_class_confidence"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_confidence if pd.notna(v) and int(v) in identity_by_id else 0.0).astype(float)
+        trajectory["identity_class_margin"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_margin if pd.notna(v) and int(v) in identity_by_id else 0.0).astype(float)
+        trajectory["identity_class_ambiguous"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_ambiguous if pd.notna(v) and int(v) in identity_by_id else True)
+        trajectory["identity_class_evidence"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_evidence if pd.notna(v) and int(v) in identity_by_id else "")
+        trajectory["identity_class_pre_score"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_pre_score if pd.notna(v) and int(v) in identity_by_id else 0.0).astype(float)
+        trajectory["identity_class_crossing_score"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_crossing_score if pd.notna(v) and int(v) in identity_by_id else 0.0).astype(float)
+        trajectory["identity_class_post_score"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_post_score if pd.notna(v) and int(v) in identity_by_id else 0.0).astype(float)
+        trajectory["identity_class_stable_score"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_stable_score if pd.notna(v) and int(v) in identity_by_id else 0.0).astype(float)
         trajectory["identity_class_source"]=trajectory["crossing_id"].map(lambda v: identity_by_id.get(int(v)).identity_class_source if pd.notna(v) and int(v) in identity_by_id else "")
         trajectory["alias_track_ids"]=trajectory["crossing_id"].map(lambda v: ",".join(map(str,identity_by_id.get(int(v)).alias_track_ids)) if pd.notna(v) and int(v) in identity_by_id else "")
         trajectory["concurrent_duplicate_resolved"]=trajectory["crossing_id"].map(lambda v: bool(identity_by_id.get(int(v)).concurrent_duplicate_resolved) if pd.notna(v) and int(v) in identity_by_id else False)
@@ -1769,7 +2038,14 @@ class CrossingIdentityEngine:
                 "detector_track_class": str(identity.vehicle_class),
                 "identity_class": identity.identity_class,
                 "identity_class_confidence": identity.identity_class_confidence,
+                "identity_class_margin": identity.identity_class_margin,
+                "identity_class_ambiguous": identity.identity_class_ambiguous,
                 "identity_class_source": identity.identity_class_source,
+                "identity_class_evidence": identity.identity_class_evidence,
+                "identity_class_pre_score": identity.identity_class_pre_score,
+                "identity_class_crossing_score": identity.identity_class_crossing_score,
+                "identity_class_post_score": identity.identity_class_post_score,
+                "identity_class_stable_score": identity.identity_class_stable_score,
                 "alias_track_ids": ",".join(map(str, identity.alias_track_ids)),
                 "concurrent_duplicate_resolved": identity.concurrent_duplicate_resolved,
                 "concurrent_duplicate_confidence": identity.concurrent_duplicate_confidence,
@@ -1870,7 +2146,8 @@ class CrossingIdentityEngine:
 
             "concurrent_duplicate_track_aliases": int(concurrent_aliases),
             "concurrent_duplicate_identity_merges": int(concurrent_merges),
-            "identity_class_conflict_identities": int(sum(identity.class_ambiguous for identity in identities)),
+            "identity_class_conflict_identities": int(sum(identity.identity_class_ambiguous for identity in identities)),
+            "identity_class_ambiguous_identities": int(sum(identity.identity_class_ambiguous for identity in identities)),
         }
 
         identity_map = {

@@ -98,6 +98,34 @@ class TrafficCounter:
         identity_match_margin: float = 0.08,
         velocity_gate_px_per_frame: float = 30.0,
         min_pre_crossing_observations: int = 2,
+        identity_same_side_near_line_block: bool = True,
+        identity_prediction_gate_max_px: float = 220.0,
+        identity_min_velocity_cosine: float = 0.35,
+        identity_min_normal_velocity_px_per_frame: float = 1.0,
+
+        # Concurrent duplicate-track resolver
+        concurrent_duplicate_enabled: bool = True,
+        concurrent_duplicate_min_overlap_frames: int = 3,
+        concurrent_duplicate_min_overlap_ratio: float = 0.50,
+        concurrent_duplicate_min_mean_iou: float = 0.65,
+        concurrent_duplicate_min_max_iou: float = 0.80,
+        concurrent_duplicate_max_center_distance_px: float = 25.0,
+        concurrent_duplicate_min_motion_cosine: float = 0.80,
+        concurrent_duplicate_max_motion_speed_ratio: float = 2.50,
+        concurrent_duplicate_allow_class_mismatch: bool = True,
+
+        # Phase 3.1 class arbitration
+        identity_class_min_confidence: float = 0.45,
+        identity_class_stable_track_ratio: float = 0.70,
+        identity_class_ambiguous_penalty: float = 0.55,
+        identity_class_alias_bonus: float = 1.20,
+        identity_class_pre_weight: float = 1.00,
+        identity_class_crossing_weight: float = 0.55,
+        identity_class_post_weight: float = 0.80,
+        identity_class_confidence_floor: float = 0.65,
+        identity_class_margin_floor: float = 0.15,
+        identity_class_min_evidence_frames: int = 2,
+        identity_class_ambiguous_confidence: float = 0.65,
 
         # Robust geometry parameters
         crossing_corridor_px: float = 45.0,
@@ -137,21 +165,8 @@ class TrafficCounter:
         candidate_duplicate_max_crossing_distance_px: float = 55.0,
         candidate_duplicate_min_direction_cosine: float = 0.75,
         candidate_duplicate_require_non_overlapping_tracks: bool = True,
-
-        # Concurrent duplicate tracker resolver / physical class resolver.
-        concurrent_duplicate_enabled: bool = True,
-        concurrent_duplicate_min_overlap_frames: int = 3,
-        concurrent_duplicate_min_overlap_ratio: float = 0.50,
-        concurrent_duplicate_min_mean_iou: float = 0.65,
-        concurrent_duplicate_min_max_iou: float = 0.80,
-        concurrent_duplicate_max_center_distance_px: float = 25.0,
-        concurrent_duplicate_min_motion_cosine: float = 0.80,
-        concurrent_duplicate_max_motion_speed_ratio: float = 2.50,
-        concurrent_duplicate_allow_class_mismatch: bool = True,
-        identity_class_min_confidence: float = 0.45,
-        identity_class_stable_track_ratio: float = 0.70,
-        identity_class_ambiguous_penalty: float = 0.55,
-        identity_class_alias_bonus: float = 1.20,
+        multi_crossing_max_candidates_per_track: int = 32,
+        multi_crossing_min_separation_frames: int = 2,
 
         # Phase 3 state-machine controls
         state_min_confirmed_observations: int = 2,
@@ -170,6 +185,14 @@ class TrafficCounter:
         state_short_crossing_floor: float = 0.52,
         state_person_count_threshold: float = 0.55,
         state_person_review_threshold: float = 0.42,
+        state_identity_class_confidence_floor: float = 0.65,
+        state_identity_class_margin_floor: float = 0.15,
+        state_identity_class_ambiguous_review: bool = True,
+        state_identity_class_allow_strong_rescue: bool = True,
+        state_fast_crossing_min_score: float = 0.58,
+        state_fast_crossing_min_direction_confidence: float = 0.50,
+        state_fast_crossing_min_normal_displacement_px: float = 8.0,
+        state_fast_crossing_min_continuity: float = 0.50,
 
     ) -> None:
 
@@ -237,6 +260,15 @@ class TrafficCounter:
                 weight_fast_sparse=float(state_weight_fast_sparse),
                 fast_crossing_floor=float(state_fast_crossing_floor),
                 short_crossing_floor=float(state_short_crossing_floor),
+                identity_class_confidence_floor=float(state_identity_class_confidence_floor),
+                identity_class_margin_floor=float(state_identity_class_margin_floor),
+                identity_class_ambiguous_review=bool(state_identity_class_ambiguous_review),
+                identity_class_allow_strong_rescue=bool(state_identity_class_allow_strong_rescue),
+                fast_crossing_min_score=float(state_fast_crossing_min_score),
+                fast_crossing_min_direction_confidence=float(state_fast_crossing_min_direction_confidence),
+                fast_crossing_min_normal_displacement_px=float(state_fast_crossing_min_normal_displacement_px),
+                fast_crossing_min_continuity=float(state_fast_crossing_min_continuity),
+                vehicle_classes=tuple(sorted(self.vehicle_classes)),
             )
         )
 
@@ -277,8 +309,17 @@ class TrafficCounter:
                 min_pre_crossing_observations=(
                     min_pre_crossing_observations
                 ),
-                max_crossing_gap_sec=(
-                    max_trajectory_gap_sec
+                identity_same_side_near_line_block=(
+                    identity_same_side_near_line_block
+                ),
+                identity_prediction_gate_max_px=(
+                    identity_prediction_gate_max_px
+                ),
+                identity_min_velocity_cosine=(
+                    identity_min_velocity_cosine
+                ),
+                identity_min_normal_velocity_px_per_frame=(
+                    identity_min_normal_velocity_px_per_frame
                 ),
                 concurrent_duplicate_enabled=concurrent_duplicate_enabled,
                 concurrent_duplicate_min_overlap_frames=concurrent_duplicate_min_overlap_frames,
@@ -293,6 +334,16 @@ class TrafficCounter:
                 identity_class_stable_track_ratio=identity_class_stable_track_ratio,
                 identity_class_ambiguous_penalty=identity_class_ambiguous_penalty,
                 identity_class_alias_bonus=identity_class_alias_bonus,
+                identity_class_pre_weight=identity_class_pre_weight,
+                identity_class_crossing_weight=identity_class_crossing_weight,
+                identity_class_post_weight=identity_class_post_weight,
+                identity_class_confidence_floor=identity_class_confidence_floor,
+                identity_class_margin_floor=identity_class_margin_floor,
+                identity_class_min_evidence_frames=identity_class_min_evidence_frames,
+                identity_class_ambiguous_confidence=identity_class_ambiguous_confidence,
+                max_crossing_gap_sec=(
+                    max_trajectory_gap_sec
+                ),
             )
         )
 
@@ -372,16 +423,6 @@ class TrafficCounter:
                     vehicle_classes=tuple(
                         sorted(self.vehicle_classes)
                     ),
-                    concurrent_duplicate_enabled=concurrent_duplicate_enabled,
-                    concurrent_duplicate_min_overlap_frames=concurrent_duplicate_min_overlap_frames,
-                    concurrent_duplicate_min_overlap_ratio=concurrent_duplicate_min_overlap_ratio,
-                    concurrent_duplicate_min_mean_iou=concurrent_duplicate_min_mean_iou,
-                    concurrent_duplicate_min_max_iou=concurrent_duplicate_min_max_iou,
-                    concurrent_duplicate_max_center_distance_px=concurrent_duplicate_max_center_distance_px,
-                    concurrent_duplicate_min_motion_cosine=concurrent_duplicate_min_motion_cosine,
-                    concurrent_duplicate_max_motion_speed_ratio=concurrent_duplicate_max_motion_speed_ratio,
-                    concurrent_duplicate_allow_class_mismatch=concurrent_duplicate_allow_class_mismatch,
-                    identity_class_min_confidence=identity_class_min_confidence,
                 ),
             )
         )
@@ -615,6 +656,15 @@ class TrafficCounter:
                         "track_class": (
                             identity.vehicle_class
                         ),
+                        "identity_class": identity.identity_class,
+                        "identity_class_confidence": float(identity.identity_class_confidence),
+                        "identity_class_margin": float(identity.identity_class_margin),
+                        "identity_class_ambiguous": bool(identity.identity_class_ambiguous),
+                        "identity_class_source": identity.identity_class_source,
+                        "identity_class_evidence": identity.identity_class_evidence,
+                        "alias_track_ids": ",".join(map(str, identity.alias_track_ids)),
+                        "concurrent_duplicate_resolved": bool(identity.concurrent_duplicate_resolved),
+                        "concurrent_duplicate_confidence": float(identity.concurrent_duplicate_confidence),
                         "first_frame": first_frame,
                         "last_frame": last_frame,
                         "crossing_frame": pd.NA,
@@ -644,6 +694,15 @@ class TrafficCounter:
                                 "track_class"
                             ]
                         ),
+                        "identity_class": event.get("identity_class", identity.identity_class),
+                        "identity_class_confidence": float(event.get("identity_class_confidence", identity.identity_class_confidence)),
+                        "identity_class_margin": float(event.get("identity_class_margin", identity.identity_class_margin)),
+                        "identity_class_ambiguous": bool(event.get("identity_class_ambiguous", identity.identity_class_ambiguous)),
+                        "identity_class_source": event.get("identity_class_source", identity.identity_class_source),
+                        "identity_class_evidence": event.get("identity_class_evidence", identity.identity_class_evidence),
+                        "alias_track_ids": event.get("alias_track_ids", ",".join(map(str, identity.alias_track_ids))),
+                        "concurrent_duplicate_resolved": bool(event.get("concurrent_duplicate_resolved", identity.concurrent_duplicate_resolved)),
+                        "concurrent_duplicate_confidence": float(event.get("concurrent_duplicate_confidence", identity.concurrent_duplicate_confidence)),
                         "counting_class": event.get("counting_class", event.get("track_class", "unknown")),
                         "counting_class_confidence": float(event.get("counting_class_confidence", 1.0)),
                         "class_transition": event.get("class_transition", ""),
@@ -747,6 +806,18 @@ class TrafficCounter:
                     "final_vehicle_crossings": 0,
                     "final_vehicle_count": 0,
                     "same_frame_max_crossings": 0,
+                    "fast_crossing_candidates": 0,
+                    "fast_crossing_counted": 0,
+                    "fast_crossing_review": 0,
+                    "fast_crossing_rejected": 0,
+                    "fast_crossing_gap_bridge": 0,
+                    "near_line_tracks": 0,
+                    "near_line_not_crossed": 0,
+                    "identity_class_ambiguous_identities": 0,
+                    "identity_class_low_confidence_identities": 0,
+                    "identity_class_low_margin_identities": 0,
+                    "concurrent_duplicate_aliases": 0,
+                    "concurrent_duplicate_identity_merges": 0,
                 },
                 track_audit=self._empty_track_audit(),
             )
@@ -766,7 +837,7 @@ class TrafficCounter:
         candidates_df, phase12_audit, prepared = (
             self.crossing_engine.process(
                 trajectory,
-                identity_column=("canonical_track_id" if "canonical_track_id" in trajectory.columns else "track_id"),
+                identity_column="track_id",
                 physical_identity_column="crossing_id",
                 return_diagnostics=True,
             )
@@ -818,17 +889,11 @@ class TrafficCounter:
             .reset_index(drop=True)
         )
 
-        if "identity_class" in eligible.columns:
-            identity_class = eligible["identity_class"].astype(str).str.lower().str.strip()
-            identity_conf = pd.to_numeric(eligible.get("identity_class_confidence", 0.0), errors="coerce").fillna(0.0)
-            existing = eligible.get("counting_class", pd.Series("unknown", index=eligible.index)).astype(str).str.lower().str.strip()
-            eligible["counting_class"] = np.where(
-                identity_class.ne("unknown") & identity_class.ne("") & identity_conf.ge(0.45),
-                identity_class,
-                existing,
-            )
-        elif "counting_class" not in eligible.columns:
-            eligible["counting_class"] = eligible["track_class"]
+        if "counting_class" not in eligible.columns:
+            if "identity_class" in eligible.columns:
+                eligible["counting_class"] = eligible["identity_class"]
+            else:
+                eligible["counting_class"] = eligible["track_class"]
 
         eligible["counting_class"] = (
             eligible["counting_class"]
@@ -912,6 +977,11 @@ class TrafficCounter:
             "track_reconnections": int(identity_audit.get("track_reconnections", 0)),
             "class_conflict_rejections": int(identity_audit.get("class_conflict_rejections", 0)),
             "direction_conflict_rejections": int(identity_audit.get("direction_conflict_rejections", 0)),
+            "same_side_near_line_blocks": int(identity_audit.get("same_side_near_line_blocks", 0)),
+            "prediction_gate_used": int(identity_audit.get("prediction_gate_used", 0)),
+            "prediction_gate_rejections": int(identity_audit.get("prediction_gate_rejections", 0)),
+            "velocity_conflict_rejections": int(identity_audit.get("velocity_conflict_rejections", 0)),
+            "ambiguous_identity_matches": int(identity_audit.get("ambiguous_identity_matches", 0)),
             "canonical_crossing_candidates": int(len(crossing_events)),
             "phase3_counted_candidates": int(
                 phase3_candidates["counted"].astype(bool).sum()
@@ -927,6 +997,7 @@ class TrafficCounter:
             ),
             "count_eligible_candidates": int(len(eligible)),
             "person_crossings": int(len(crossing_person)),
+            "person_counted": int((crossing_person.get("counted", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()) if not crossing_person.empty else 0),
             "vehicle_crossings_before_filter": int(len(eligible)),
             "final_vehicle_crossings": int(len(final_crossings)),
             "final_vehicle_count": int(total),
@@ -949,9 +1020,81 @@ class TrafficCounter:
                     pd.Series(False, index=crossing_events.index),
                 ).fillna(False).astype(bool).sum()
             ),
-            "concurrent_duplicate_aliases": int(identity_audit.get("concurrent_duplicate_track_aliases", 0)),
-            "concurrent_duplicate_identity_merges": int(identity_audit.get("concurrent_duplicate_identity_merges", 0)),
-            "identity_class_conflict_identities": int(identity_audit.get("identity_class_conflict_identities", 0)),
+            # ------------------------------------------------------
+            # Phase 3.1 — Fast crossing audit
+            # ------------------------------------------------------
+            "fast_crossing_candidates": int(
+                crossing_events.get(
+                    "fast_crossing",
+                    pd.Series(False, index=crossing_events.index),
+                ).fillna(False).astype(bool).sum()
+            ),
+            "fast_crossing_counted": int(
+                final_crossings.get(
+                    "fast_crossing",
+                    pd.Series(False, index=final_crossings.index),
+                ).fillna(False).astype(bool).sum()
+            ),
+            "fast_crossing_review": int(
+                phase3_candidates.loc[
+                    phase3_candidates.get("fast_crossing", pd.Series(False, index=phase3_candidates.index)).fillna(False).astype(bool),
+                    "phase3_state",
+                ].eq("REVIEW").sum()
+                if not phase3_candidates.empty else 0
+            ),
+            "fast_crossing_rejected": int(
+                phase3_candidates.loc[
+                    phase3_candidates.get("fast_crossing", pd.Series(False, index=phase3_candidates.index)).fillna(False).astype(bool),
+                    "phase3_state",
+                ].eq("REJECTED").sum()
+                if not phase3_candidates.empty else 0
+            ),
+            "fast_crossing_gap_bridge": int(
+                crossing_events.get(
+                    "gap_bridge_used",
+                    pd.Series(False, index=crossing_events.index),
+                ).fillna(False).astype(bool).sum()
+            ),
+            "near_line_tracks": int(
+                phase12_audit.get(
+                    "crossing_candidate_class",
+                    pd.Series(dtype=object),
+                ).eq("NEAR_LINE").sum()
+                if not phase12_audit.empty else 0
+            ),
+            "near_line_not_crossed": int(
+                phase12_audit.get(
+                    "crossing_candidate_class",
+                    pd.Series(dtype=object),
+                ).eq("NEAR_LINE").sum()
+                if not phase12_audit.empty else 0
+            ),
+            # ------------------------------------------------------
+            # Phase 3.1 — Class arbitration audit
+            # ------------------------------------------------------
+            "identity_class_ambiguous_identities": int(
+                identity_audit.get("identity_class_ambiguous_identities", 0)
+            ),
+            "identity_class_low_confidence_identities": int(
+                sum(
+                    float(getattr(identity, "identity_class_confidence", 0.0))
+                    < self.state_machine.config.identity_class_confidence_floor
+                    for identity in identity_map.values()
+                )
+            ),
+            "identity_class_low_margin_identities": int(
+                sum(
+                    float(getattr(identity, "identity_class_margin", 0.0))
+                    < self.state_machine.config.identity_class_margin_floor
+                    for identity in identity_map.values()
+                )
+            ),
+            "concurrent_duplicate_aliases": int(
+                identity_audit.get("concurrent_duplicate_track_aliases", 0)
+            ),
+            "concurrent_duplicate_identity_merges": int(
+                identity_audit.get("concurrent_duplicate_identity_merges", 0)
+            ),
         }
 
         return CountingResult(

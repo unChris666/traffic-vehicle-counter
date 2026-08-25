@@ -114,11 +114,6 @@ class TrafficCountingEngine:
         track_audit.to_csv(path, index=False)
         return path
 
-    def _counting_value(self, name: str, default):
-        """Safely read a CountingConfig value with backward-compatible fallback."""
-        counting = self.config.counting
-        return getattr(counting, name, default)
-
     def _build_counter(
         self,
         *,
@@ -135,22 +130,22 @@ class TrafficCountingEngine:
 
         line_x1 = (
             metadata.width
-            * self._counting_value("line_x1_ratio", 0.95)
+            * self.config.counting.line_x1_ratio
         )
 
         line_y1 = (
             metadata.height
-            * self._counting_value("line_y1_ratio", 0.20)
+            * self.config.counting.line_y1_ratio
         )
 
         line_x2 = (
             metadata.width
-            * self._counting_value("line_x2_ratio", 0.05)
+            * self.config.counting.line_x2_ratio
         )
 
         line_y2 = (
             metadata.height
-            * self._counting_value("line_y2_ratio", 0.95)
+            * self.config.counting.line_y2_ratio
         )
 
         candidate_kwargs = {
@@ -159,16 +154,16 @@ class TrafficCountingEngine:
             "line_x2": line_x2,
             "line_y2": line_y2,
             "line_deadband_px": (
-                self._counting_value("line_deadband_px", 8.0)
+                self.config.counting.line_deadband_px
             ),
             "max_trajectory_gap_sec": (
-                self._counting_value("max_trajectory_gap_sec", 1.50)
+                self.config.counting.max_trajectory_gap_sec
             ),
             "moto_dedup_time_sec": (
-                self._counting_value("moto_dedup_time_sec", 0.25)
+                self.config.counting.moto_dedup_time_sec
             ),
             "moto_dedup_distance_px": (
-                self._counting_value("moto_dedup_distance_px", 30.0)
+                self.config.counting.moto_dedup_distance_px
             ),
             "vehicle_classes": set(
                 self.config.vehicle_classes
@@ -177,137 +172,78 @@ class TrafficCountingEngine:
 
             # Crossing identity / fragmentation.
             "pre_crossing_distance_px": (
-                self._counting_value("pre_crossing_distance_px", 100.0)
+                self.config.counting.pre_crossing_distance_px
             ),
             "max_identity_reconnect_gap_sec": (
-                self._counting_value("max_identity_reconnect_gap_sec", 1.0)
+                self.config.counting.max_identity_reconnect_gap_sec
             ),
             "max_identity_reconnect_distance_px": (
-                self._counting_value("max_identity_reconnect_distance_px", 100.0)
+                self.config.counting.max_identity_reconnect_distance_px
             ),
             "identity_match_threshold": (
-                self._counting_value("identity_match_threshold", 0.82)
+                self.config.counting.identity_match_threshold
             ),
             "identity_match_margin": (
-                self._counting_value("identity_match_margin", 0.08)
+                self.config.counting.identity_match_margin
             ),
             "velocity_gate_px_per_frame": (
-                self._counting_value("velocity_gate_px_per_frame", 30.0)
+                self.config.counting.velocity_gate_px_per_frame
             ),
             "min_pre_crossing_observations": (
-                self._counting_value("min_pre_crossing_observations", 2)
+                self.config.counting.min_pre_crossing_observations
             ),
+
+            # Concurrent duplicate-track resolver
+            "concurrent_duplicate_enabled": self.config.counting.concurrent_duplicate_enabled,
+            "concurrent_duplicate_min_overlap_frames": self.config.counting.concurrent_duplicate_min_overlap_frames,
+            "concurrent_duplicate_min_overlap_ratio": self.config.counting.concurrent_duplicate_min_overlap_ratio,
+            "concurrent_duplicate_min_mean_iou": self.config.counting.concurrent_duplicate_min_mean_iou,
+            "concurrent_duplicate_min_max_iou": self.config.counting.concurrent_duplicate_min_max_iou,
+            "concurrent_duplicate_max_center_distance_px": self.config.counting.concurrent_duplicate_max_center_distance_px,
+            "concurrent_duplicate_min_motion_cosine": self.config.counting.concurrent_duplicate_min_motion_cosine,
+            "concurrent_duplicate_max_motion_speed_ratio": self.config.counting.concurrent_duplicate_max_motion_speed_ratio,
+            "concurrent_duplicate_allow_class_mismatch": self.config.counting.concurrent_duplicate_allow_class_mismatch,
+
+            # Phase 3.1 class arbitration
+            "identity_class_min_confidence": self.config.counting.identity_class_min_confidence,
+            "identity_class_stable_track_ratio": self.config.counting.identity_class_stable_track_ratio,
+            "identity_class_ambiguous_penalty": self.config.counting.identity_class_ambiguous_penalty,
+            "identity_class_alias_bonus": self.config.counting.identity_class_alias_bonus,
+            "identity_class_pre_weight": self.config.counting.identity_class_pre_weight,
+            "identity_class_crossing_weight": self.config.counting.identity_class_crossing_weight,
+            "identity_class_post_weight": self.config.counting.identity_class_post_weight,
+            "identity_class_confidence_floor": self.config.counting.identity_class_confidence_floor,
+            "identity_class_margin_floor": self.config.counting.identity_class_margin_floor,
+            "identity_class_min_evidence_frames": self.config.counting.identity_class_min_evidence_frames,
+            "identity_class_ambiguous_confidence": self.config.counting.identity_class_ambiguous_confidence,
+
+            # Phase 3.1 state-machine gates
+            "state_identity_class_confidence_floor": self.config.counting.state_identity_class_confidence_floor,
+            "state_identity_class_margin_floor": self.config.counting.state_identity_class_margin_floor,
+            "state_identity_class_ambiguous_review": self.config.counting.state_identity_class_ambiguous_review,
+            "state_identity_class_allow_strong_rescue": self.config.counting.state_identity_class_allow_strong_rescue,
+            "state_fast_crossing_min_score": self.config.counting.state_fast_crossing_min_score,
+            "state_fast_crossing_min_direction_confidence": self.config.counting.state_fast_crossing_min_direction_confidence,
+            "state_fast_crossing_min_normal_displacement_px": self.config.counting.state_fast_crossing_min_normal_displacement_px,
+            "state_fast_crossing_min_continuity": self.config.counting.state_fast_crossing_min_continuity,
 
             # Robust crossing geometry.
             "crossing_corridor_px": (
-                self._counting_value("crossing_corridor_px", 45.0)
+                self.config.counting.crossing_corridor_px
             ),
             "min_direction_displacement_px": (
-                self._counting_value("min_direction_displacement_px", 8.0)
+                self.config.counting.min_direction_displacement_px
             ),
             "direction_window": (
-                self._counting_value("direction_window", 3)
-            ),
-
-            # Phase 1 — trajectory engine.
-            "trajectory_smoothing_alpha": (
-                self._counting_value("trajectory_smoothing_alpha", 0.35)
-            ),
-            "trajectory_velocity_window": (
-                self._counting_value("trajectory_velocity_window", 5)
-            ),
-            "max_velocity_px_per_frame": (
-                self._counting_value("max_velocity_px_per_frame", 80.0)
-            ),
-
-            # Phase 2 — crossing corridor.
-            "min_pre_zone_observations": (
-                self._counting_value("min_pre_zone_observations", 2)
-            ),
-            "min_corridor_observations": (
-                self._counting_value("min_corridor_observations", 1)
-            ),
-            "min_post_zone_observations": (
-                self._counting_value("min_post_zone_observations", 1)
-            ),
-            "require_post_zone": (
-                self._counting_value("require_post_zone", True)
+                self.config.counting.direction_window
             ),
 
             # Conservative final duplicate suppression.
             "duplicate_time_sec": (
-                self._counting_value("duplicate_time_sec", 0.30)
+                self.config.counting.duplicate_time_sec
             ),
             "duplicate_distance_px": (
-                self._counting_value("duplicate_distance_px", 25.0)
-            ),
-            "identity_gap_crossing_enabled": (
-                self._counting_value("identity_gap_crossing_enabled", True)
-            ),
-            "identity_gap_max_frames": (
-                self._counting_value("identity_gap_max_frames", 8)
-            ),
-            "identity_gap_max_endpoint_distance_px": (
-                self._counting_value("identity_gap_max_endpoint_distance_px", 140.0)
-            ),
-            "identity_gap_min_side_displacement_px": (
-                self._counting_value("identity_gap_min_side_displacement_px", 12.0)
-            ),
-            "candidate_duplicate_max_frame_gap": (
-                self._counting_value("candidate_duplicate_max_frame_gap", 8)
-            ),
-            "candidate_duplicate_max_endpoint_distance_px": (
-                self._counting_value("candidate_duplicate_max_endpoint_distance_px", 55.0)
-            ),
-            "candidate_duplicate_max_crossing_distance_px": (
-                self._counting_value("candidate_duplicate_max_crossing_distance_px", 55.0)
-            ),
-            "candidate_duplicate_min_direction_cosine": (
-                self._counting_value("candidate_duplicate_min_direction_cosine", 0.75)
-            ),
-            "candidate_duplicate_require_non_overlapping_tracks": (
-                self._counting_value("candidate_duplicate_require_non_overlapping_tracks", True)
-            ),
-
-            # Concurrent duplicate tracker resolver / physical class resolver.
-            "concurrent_duplicate_enabled": (
-                self._counting_value("concurrent_duplicate_enabled", True)
-            ),
-            "concurrent_duplicate_min_overlap_frames": (
-                self._counting_value("concurrent_duplicate_min_overlap_frames", 3)
-            ),
-            "concurrent_duplicate_min_overlap_ratio": (
-                self._counting_value("concurrent_duplicate_min_overlap_ratio", 0.50)
-            ),
-            "concurrent_duplicate_min_mean_iou": (
-                self._counting_value("concurrent_duplicate_min_mean_iou", 0.65)
-            ),
-            "concurrent_duplicate_min_max_iou": (
-                self._counting_value("concurrent_duplicate_min_max_iou", 0.80)
-            ),
-            "concurrent_duplicate_max_center_distance_px": (
-                self._counting_value("concurrent_duplicate_max_center_distance_px", 25.0)
-            ),
-            "concurrent_duplicate_min_motion_cosine": (
-                self._counting_value("concurrent_duplicate_min_motion_cosine", 0.80)
-            ),
-            "concurrent_duplicate_max_motion_speed_ratio": (
-                self._counting_value("concurrent_duplicate_max_motion_speed_ratio", 2.50)
-            ),
-            "concurrent_duplicate_allow_class_mismatch": (
-                self._counting_value("concurrent_duplicate_allow_class_mismatch", True)
-            ),
-            "identity_class_min_confidence": (
-                self._counting_value("identity_class_min_confidence", 0.45)
-            ),
-            "identity_class_stable_track_ratio": (
-                self._counting_value("identity_class_stable_track_ratio", 0.70)
-            ),
-            "identity_class_ambiguous_penalty": (
-                self._counting_value("identity_class_ambiguous_penalty", 0.55)
-            ),
-            "identity_class_alias_bonus": (
-                self._counting_value("identity_class_alias_bonus", 1.20)
+                self.config.counting.duplicate_distance_px
             ),
         }
 
@@ -364,6 +300,10 @@ class TrafficCountingEngine:
             "crossing_corridor_px",
             "min_direction_displacement_px",
             "direction_window",
+            "concurrent_duplicate_enabled",
+            "identity_class_confidence_floor",
+            "identity_class_margin_floor",
+            "state_fast_crossing_min_score",
         }
 
         missing_robust = (
@@ -568,13 +508,13 @@ class TrafficCountingEngine:
         self._report(
             progress_callback,
             0.83,
-            "Building canonical crossing candidates...",
+            "Running robust vehicle crossing engine...",
         )
 
-        line_x1 = metadata.width * self._counting_value("line_x1_ratio", 0.95)
-        line_y1 = metadata.height * self._counting_value("line_y1_ratio", 0.20)
-        line_x2 = metadata.width * self._counting_value("line_x2_ratio", 0.05)
-        line_y2 = metadata.height * self._counting_value("line_y2_ratio", 0.95)
+        line_x1 = metadata.width * self.config.counting.line_x1_ratio
+        line_y1 = metadata.height * self.config.counting.line_y1_ratio
+        line_x2 = metadata.width * self.config.counting.line_x2_ratio
+        line_y2 = metadata.height * self.config.counting.line_y2_ratio
 
         # These are the parameters supported by the current
         # robust TrafficCounter implementation.
@@ -611,63 +551,6 @@ class TrafficCountingEngine:
             output_dir / "final_vehicle_crossings.csv",
             index=False,
         )
-        counting_result.crossing_candidates.to_csv(
-            output_dir / "crossing_candidates_canonical.csv",
-            index=False,
-        )
-
-        # Dedicated identity-duplicate audit. The canonical candidate CSV
-        # remains the source of truth; this file is a convenient filtered view
-        # for debugging duplicate physical identities.
-        canonical = counting_result.crossing_candidates
-        duplicate_path = output_dir / "trajectory_duplicate_identity_audit.csv"
-        if (
-            isinstance(canonical, pd.DataFrame)
-            and not canonical.empty
-            and "candidate_duplicate_of" in canonical.columns
-        ):
-            canonical[
-                canonical["candidate_duplicate_of"].notna()
-                | canonical.get(
-                    "candidate_duplicate_suppressed",
-                    pd.Series(False, index=canonical.index),
-                ).fillna(False).astype(bool)
-            ].to_csv(duplicate_path, index=False)
-        else:
-            pd.DataFrame().to_csv(duplicate_path, index=False)
-
-        # =====================================================
-        # PHASE 1/2 DIAGNOSTIC ARTIFACTS
-        # =====================================================
-        phase12_trajectory_path = output_dir / "phase12_trajectory.csv"
-        phase12_audit_path = output_dir / "phase12_crossing_corridor_audit.csv"
-
-        phase12_trajectory = getattr(
-            counting_result,
-            "phase12_trajectory",
-            None,
-        )
-        phase12_audit = getattr(
-            counting_result,
-            "phase12_audit",
-            None,
-        )
-
-        if isinstance(phase12_trajectory, pd.DataFrame):
-            phase12_trajectory.to_csv(
-                phase12_trajectory_path,
-                index=False,
-            )
-        else:
-            phase12_trajectory_path = None
-
-        if isinstance(phase12_audit, pd.DataFrame):
-            phase12_audit.to_csv(
-                phase12_audit_path,
-                index=False,
-            )
-        else:
-            phase12_audit_path = None
 
         direction_counts_df = self._safe_direction_counts(
             counting_result.final_crossings
@@ -828,16 +711,6 @@ class TrafficCountingEngine:
             "final_crossings_csv": str(
                 output_dir / "final_vehicle_crossings.csv"
             ),
-            "phase12_trajectory_csv": (
-                str(phase12_trajectory_path)
-                if phase12_trajectory_path is not None
-                else None
-            ),
-            "phase12_crossing_corridor_audit_csv": (
-                str(phase12_audit_path)
-                if phase12_audit_path is not None
-                else None
-            ),
             "track_crossing_audit_csv": (
                 str(track_audit_path)
                 if track_audit_path is not None
@@ -864,10 +737,10 @@ class TrafficCountingEngine:
             "configured_vid_stride": self.config.detection.vid_stride,
             "configured_conf_threshold": self.config.detection.conf_threshold,
             "configured_iou_threshold": self.config.detection.iou_threshold,
-            "crossing_corridor_px": self._counting_value("crossing_corridor_px", 45.0),
-            "line_deadband_px": self._counting_value("line_deadband_px", 8.0),
-            "duplicate_time_sec": self._counting_value("duplicate_time_sec", 0.30),
-            "duplicate_distance_px": self._counting_value("duplicate_distance_px", 25.0),
+            "crossing_corridor_px": self.config.counting.crossing_corridor_px,
+            "line_deadband_px": self.config.counting.line_deadband_px,
+            "duplicate_time_sec": self.config.counting.duplicate_time_sec,
+            "duplicate_distance_px": self.config.counting.duplicate_distance_px,
         }
 
         direction_counts = [
@@ -914,57 +787,8 @@ class TrafficCountingEngine:
         # =====================================================
         # CONSOLE REPORT
         # =====================================================
-        if isinstance(phase12_trajectory, pd.DataFrame) and isinstance(phase12_audit, pd.DataFrame):
-            print("\n" + "=" * 70)
-            print("PHASE 1/2 TRAJECTORY + CROSSING CORRIDOR AUDIT")
-            print("=" * 70)
-            print(
-                f"Tracks analyzed      : {len(phase12_audit):,}"
-            )
-            print(
-                f"Phase 1 PASS         : {int((phase12_audit['phase1_status'] == 'PASS').sum()):,}"
-            )
-            print(
-                f"Phase 1 REVIEW       : {int((phase12_audit['phase1_status'] == 'REVIEW').sum()):,}"
-            )
-            print(
-                f"Phase 1 FAIL         : {int((phase12_audit['phase1_status'] == 'FAIL').sum()):,}"
-            )
-            print(
-                f"Phase 2 PASS         : {int((phase12_audit['phase2_status'] == 'PASS').sum()):,}"
-            )
-            print(
-                f"Phase 2 REVIEW       : {int((phase12_audit['phase2_status'] == 'REVIEW').sum()):,}"
-            )
-            print(
-                f"Phase 2 FAIL         : {int((phase12_audit['phase2_status'] == 'FAIL').sum()):,}"
-            )
-            print(
-                f"P1 + P2 PASS         : {int(phase12_audit['counted'].sum()):,}"
-            )
-            print("\nZone path examples:")
-            print(
-                phase12_audit["zone_path"]
-                .value_counts()
-                .head(10)
-                .to_string()
-            )
-            print(
-                f"\nPhase 1/2 audit: {phase12_audit_path}"
-            )
-            if isinstance(canonical, pd.DataFrame) and not canonical.empty:
-                duplicate_flags = canonical.get(
-                    "candidate_duplicate_suppressed",
-                    pd.Series(False, index=canonical.index),
-                ).fillna(False).astype(bool)
-                print(
-                    "Canonical duplicate identities : "
-                    f"{int(duplicate_flags.sum()):,}"
-                )
-            print(f"Trajectory duplicate audit: {duplicate_path}")
-
         print("\n" + "=" * 70)
-        print("FINAL VEHICLE COUNT (CANONICAL CANDIDATES)")
+        print("FINAL VEHICLE COUNT")
         print("=" * 70)
 
         for class_name, count in counting_result.counts.items():
